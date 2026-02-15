@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Melitta Coffee Machine",
+        "description": "Add your Melitta coffee machine. If no devices are found, you can enter the Bluetooth MAC address manually.",
+        "data": {
+          "mac_address": "MAC address",
+          "device_name": "Device name",
+          "model": "Model"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Melitta found",
+        "description": "Melitta device found: {name} ({address}). Would you like to add this device?",
+        "data": {
+          "name": "Name",
+          "model": "Model"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "status": { "name": "Status" },
+      "water_level": { "name": "Water Level" },
+      "bean_level": { "name": "Bean Level" },
+      "error": { "name": "Error" },
+      "beverage": { "name": "Current Beverage" },
+      "total_brews": { "name": "Total Brews" }
+    },
+    "binary_sensor": {
+      "connected": { "name": "Connected" },
+      "brewing": { "name": "Brewing" }
+    },
+    "button": {
+      "brew_espresso": { "name": "Brew Espresso" },
+      "brew_coffee": { "name": "Brew Coffee" },
+      "brew_cappuccino": { "name": "Brew Cappuccino" },
+      "brew_latte_macchiato": { "name": "Brew Latte Macchiato" },
+      "brew_lungo": { "name": "Brew Lungo" },
+      "brew_hot_water": { "name": "Hot Water" },
+      "brew_steam": { "name": "Steam" },
+      "stop": { "name": "Stop" },
+      "clean": { "name": "Clean" },
+      "rinse": { "name": "Rinse" },
+      "standby": { "name": "Standby" },
+      "wake_up": { "name": "Wake Up" }
+    },
+    "select": {
+      "strength": { "name": "Coffee Strength" },
+      "cups": { "name": "Number of Cups" }
+    }
+  }
+}

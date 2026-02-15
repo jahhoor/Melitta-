@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Melitta Koffiezetapparaat",
+        "description": "Voeg je Melitta koffiezetapparaat toe. Als er geen apparaten gevonden zijn, kun je het Bluetooth MAC-adres handmatig invoeren.",
+        "data": {
+          "mac_address": "MAC-adres",
+          "device_name": "Naam apparaat",
+          "model": "Model"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Melitta gevonden",
+        "description": "Melitta apparaat gevonden: {name} ({address}). Wil je dit apparaat toevoegen?",
+        "data": {
+          "name": "Naam",
+          "model": "Model"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Dit apparaat is al geconfigureerd."
+    }
+  }
+}
