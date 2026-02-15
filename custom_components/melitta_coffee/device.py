@@ -416,6 +416,7 @@ class MelittaDevice:
                     self._status = "ready"
                     self._start_keepalive()
                     _LOGGER.info("Connected and authenticated with Melitta at %s", self._address)
+                    await self._request_initial_status()
                 else:
                     self._status = "auth_failed"
                     _LOGGER.warning("Connected but authentication failed for %s", self._address)
@@ -449,15 +450,28 @@ class MelittaDevice:
         async with self._lock:
             if self._client:
                 try:
-                    await self._client.disconnect()
-                except (BleakError, OSError):
-                    pass
+                    if self._read_char and self._client.is_connected:
+                        await self._client.stop_notify(self._read_char)
+                        _LOGGER.debug("Unsubscribed from notifications on %s", self._read_char)
+                except (BleakError, OSError) as err:
+                    _LOGGER.debug("Failed to unsubscribe notifications: %s", err)
+
+                try:
+                    if self._client.is_connected:
+                        await self._client.disconnect()
+                        _LOGGER.info("Disconnected BLE client from %s", self._address)
+                except (BleakError, OSError) as err:
+                    _LOGGER.debug("BLE disconnect error: %s", err)
+
                 self._client = None
             self._is_connected = False
             self._authenticated = False
             self._session_key = None
+            self._read_char = None
+            self._write_char = None
             self._status = "offline"
             self._notify_callbacks()
+            _LOGGER.info("Melitta device %s fully cleaned up", self._address)
 
     def _on_disconnect(self, client: BleakClient) -> None:
         _LOGGER.info("Disconnected from Melitta at %s", self._address)
@@ -465,6 +479,7 @@ class MelittaDevice:
         self._authenticated = False
         self._session_key = None
         self._client = None
+        self._status = "offline"
         self._stop_keepalive()
         self._notify_callbacks()
 
@@ -511,6 +526,14 @@ class MelittaDevice:
             _LOGGER.debug("Reconnect failed for %s: %s", self._address, err)
             if not self._shutting_down:
                 self._schedule_reconnect()
+
+    async def _request_initial_status(self) -> None:
+        try:
+            frame = _build_frame(CMD_STATUS, b"")
+            await self._send_raw(frame)
+            _LOGGER.debug("Initial status request sent")
+        except Exception as err:
+            _LOGGER.debug("Initial status request failed: %s", err)
 
     async def _ensure_connected(self) -> bool:
         if self._is_connected and self._authenticated and self._client:
@@ -953,6 +976,19 @@ class MelittaDevice:
     async def update(self) -> None:
         if not self._is_connected:
             await self.connect()
+        elif self._authenticated:
+            try:
+                frame = _build_frame(CMD_STATUS, b"")
+                await self._send_raw(frame)
+            except Exception as err:
+                _LOGGER.debug("Status poll failed: %s", err)
+                self._is_connected = False
+                self._authenticated = False
+                self._client = None
+                self._stop_keepalive()
+                self._notify_callbacks()
+                if not self._shutting_down:
+                    self._schedule_reconnect()
 
 
 async def discover_all_ble_devices(timeout: float = 10.0) -> list:

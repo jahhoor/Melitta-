@@ -7,11 +7,28 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, CONF_MODEL, SUPPORTED_MODELS, MELITTA_SERVICE_UUID
+from .const import (
+    DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, CONF_MODEL, SUPPORTED_MODELS,
+    MELITTA_SERVICE_UUID, detect_model_from_name, is_melitta_machine_code,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 MELITTA_KEYWORDS = ["melitta", "caffeo", "barista"]
+
+
+def _is_melitta_device(name: str, service_uuids: list[str] | None = None) -> bool:
+    if service_uuids and MELITTA_SERVICE_UUID.lower() in [
+        u.lower() for u in service_uuids
+    ]:
+        return True
+    if name and any(kw in name.lower() for kw in MELITTA_KEYWORDS):
+        return True
+    if is_melitta_machine_code(name):
+        return True
+    return False
+
+
 MAC_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$")
 
 
@@ -44,19 +61,23 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._discovery_info is None:
             return await self.async_step_user()
 
+        ble_name = self._discovery_info.name or ""
+        auto_model = detect_model_from_name(ble_name) or "Barista Smart"
+        default_name = auto_model if auto_model != "Barista Smart" else (ble_name or "Melitta Koffiezetapparaat")
+
         if user_input is not None:
             return self.async_create_entry(
-                title=user_input.get(CONF_DEVICE_NAME, self._discovery_info.name),
+                title=user_input.get(CONF_DEVICE_NAME, default_name),
                 data={
                     CONF_MAC_ADDRESS: self._discovery_info.address,
-                    CONF_DEVICE_NAME: user_input.get(CONF_DEVICE_NAME, self._discovery_info.name),
-                    CONF_MODEL: user_input.get(CONF_MODEL, "Barista Smart"),
+                    CONF_DEVICE_NAME: user_input.get(CONF_DEVICE_NAME, default_name),
+                    CONF_MODEL: user_input.get(CONF_MODEL, auto_model),
                 },
             )
 
         self._set_confirm_only()
         placeholders = {
-            "name": self._discovery_info.name or "Melitta",
+            "name": ble_name or "Melitta",
             "address": self._discovery_info.address,
         }
         self.context["title_placeholders"] = placeholders
@@ -67,9 +88,9 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Optional(
                         CONF_DEVICE_NAME,
-                        default=self._discovery_info.name or "Melitta Koffiezetapparaat",
+                        default=default_name,
                     ): str,
-                    vol.Optional(CONF_MODEL, default="Barista Smart"): vol.In(
+                    vol.Optional(CONF_MODEL, default=auto_model): vol.In(
                         SUPPORTED_MODELS
                     ),
                 }
@@ -98,15 +119,17 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(address, raise_on_progress=False)
                 self._abort_if_unique_id_configured()
 
-                device_name = self._discovered_devices.get(address, "Melitta Koffiezetapparaat")
+                device_label = self._discovered_devices.get(address, "")
+                device_name = device_label.lstrip("* ") if device_label else "Melitta Koffiezetapparaat"
                 display_name = user_input.get(CONF_DEVICE_NAME, device_name)
+                auto_model = detect_model_from_name(device_name) or "Barista Smart"
 
                 return self.async_create_entry(
                     title=display_name,
                     data={
                         CONF_MAC_ADDRESS: address,
                         CONF_DEVICE_NAME: display_name,
-                        CONF_MODEL: user_input.get(CONF_MODEL, "Barista Smart"),
+                        CONF_MODEL: user_input.get(CONF_MODEL, auto_model),
                     },
                 )
 
@@ -119,13 +142,11 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if discovery_info.address in current_addresses:
                     continue
                 name = discovery_info.name or ""
-                has_service_uuid = MELITTA_SERVICE_UUID.lower() in [
-                    u.lower() for u in (discovery_info.service_uuids or [])
-                ]
-                is_melitta = has_service_uuid or (
-                    name and any(kw in name.lower() for kw in MELITTA_KEYWORDS)
-                )
+                is_melitta = _is_melitta_device(name, discovery_info.service_uuids)
+                detected_model = detect_model_from_name(name) if name else None
                 display_name = name or discovery_info.address
+                if is_melitta and detected_model:
+                    display_name = f"{detected_model} ({name})"
                 label = f"{'* ' if is_melitta else ''}{display_name}"
                 if is_melitta or name:
                     self._discovered_devices[discovery_info.address] = label
@@ -139,8 +160,13 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for device in bleak_devices:
                     if device.address not in current_addresses:
                         name = device.name or "Onbekend apparaat"
-                        is_melitta = any(kw in name.lower() for kw in MELITTA_KEYWORDS)
-                        label = f"{'* ' if is_melitta else ''}{name}"
+                        is_melitta = _is_melitta_device(name)
+                        detected_model = detect_model_from_name(name) if name else None
+                        if is_melitta and detected_model:
+                            display_name = f"{detected_model} ({name})"
+                        else:
+                            display_name = name
+                        label = f"{'* ' if is_melitta else ''}{display_name}"
                         self._discovered_devices[device.address] = label
             except Exception as err:
                 _LOGGER.warning("BLE scan failed: %s", err)
@@ -152,7 +178,7 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         melitta_first = dict(
             sorted(
                 self._discovered_devices.items(),
-                key=lambda x: (0 if any(kw in x[1].lower() for kw in MELITTA_KEYWORDS) else 1, x[1]),
+                key=lambda x: (0 if x[1].startswith("* ") else 1, x[1]),
             )
         )
 

@@ -13,6 +13,15 @@ SUPPORTED_MACHINE_CODES_T = {"8301", "8311", "8401"}
 SUPPORTED_MACHINE_CODES_TS = {"8501", "8601", "8604"}
 SUPPORTED_MACHINE_CODES = SUPPORTED_MACHINE_CODES_T | SUPPORTED_MACHINE_CODES_TS
 
+MACHINE_CODE_TO_MODEL = {
+    "8301": "Caffeo Barista T",
+    "8311": "Caffeo Barista T",
+    "8401": "Barista T Smart",
+    "8501": "Caffeo Barista TS",
+    "8601": "Barista TS Smart",
+    "8604": "Barista TS Smart",
+}
+
 SUPPORTED_MODELS = [
     "Barista Smart",
     "Barista T Smart",
@@ -20,6 +29,19 @@ SUPPORTED_MODELS = [
     "Caffeo Barista T",
     "Caffeo Barista TS",
 ]
+
+
+def detect_model_from_name(ble_name: str) -> str | None:
+    if ble_name and len(ble_name) >= 4:
+        prefix = ble_name[:4]
+        return MACHINE_CODE_TO_MODEL.get(prefix)
+    return None
+
+
+def is_melitta_machine_code(name: str) -> bool:
+    if name and len(name) >= 4:
+        return name[:4] in SUPPORTED_MACHINE_CODES
+    return False
 
 FRAME_START = 0x53
 FRAME_END = 0x45

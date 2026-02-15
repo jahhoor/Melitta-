@@ -4,6 +4,7 @@ from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, BEVERAGE_MAP, STRENGTH_MAP
@@ -79,4 +80,33 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as err:
                 _LOGGER.debug("Disconnect failed: %s", err)
 
+        if not hass.data[DOMAIN]:
+            if hass.services.has_service(DOMAIN, "brew_coffee"):
+                hass.services.async_remove(DOMAIN, "brew_coffee")
+
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    device: MelittaDevice = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    if device:
+        try:
+            await device.disconnect()
+        except Exception as err:
+            _LOGGER.debug("Disconnect on remove failed: %s", err)
+
+    dev_reg = dr.async_get(hass)
+    address = entry.data.get(CONF_MAC_ADDRESS, "")
+    devices = dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+    for dev_entry in devices:
+        _LOGGER.info(
+            "Removing device %s (%s) from device registry",
+            dev_entry.name, address,
+        )
+        dev_reg.async_remove_device(dev_entry.id)
+
+    if not hass.data.get(DOMAIN):
+        if hass.services.has_service(DOMAIN, "brew_coffee"):
+            hass.services.async_remove(DOMAIN, "brew_coffee")
+
+    _LOGGER.info("Melitta Coffee integration removed for %s", address)
