@@ -70,16 +70,20 @@ class MelittaBaseSensor(SensorEntity):
 class MelittaStatusSensor(MelittaBaseSensor):
 
     STATUS_TRANSLATIONS = {
-        "standby": "Standby",
-        "idle": "Klaar",
+        "ready": "Klaar",
         "brewing": "Koffie zetten",
-        "grinding": "Malen",
-        "heating": "Opwarmen",
         "cleaning": "Reinigen",
-        "error": "Fout",
         "descaling": "Ontkalken",
-        "rinsing": "Spoelen",
+        "filter_insert": "Filter plaatsen",
+        "filter_replace": "Filter vervangen",
+        "filter_remove": "Filter verwijderen",
+        "switch_off": "Uitschakelen",
+        "easy_clean": "Snel reinigen",
+        "intensive_clean": "Intensief reinigen",
+        "evaporating": "Stoom",
+        "busy": "Bezig",
         "offline": "Offline",
+        "auth_failed": "Authenticatie mislukt",
     }
 
     def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
@@ -96,11 +100,16 @@ class MelittaStatusSensor(MelittaBaseSensor):
     def extra_state_attributes(self) -> dict:
         attrs = {
             "status_intern": self._device.status,
+            "process": self._device.process_state,
+            "subprocess": self._device.subprocess_state,
+            "progress": self._device.progress,
         }
         if self._device.status_raw:
             attrs["ruwe_data"] = self._device.status_raw
         if self._device.last_raw_status_hex:
             attrs["laatste_hex"] = self._device.last_raw_status_hex
+        if self._device.version:
+            attrs["firmware_versie"] = self._device.version
         return attrs
 
 
@@ -109,6 +118,7 @@ class MelittaWaterLevelSensor(MelittaBaseSensor):
     LEVEL_TRANSLATIONS = {
         "empty": "Leeg",
         "low": "Laag",
+        "ok": "OK",
         "medium": "Gemiddeld",
         "full": "Vol",
         "unknown": "Onbekend",
@@ -134,6 +144,7 @@ class MelittaBeanLevelSensor(MelittaBaseSensor):
     LEVEL_TRANSLATIONS = {
         "empty": "Leeg",
         "low": "Laag",
+        "ok": "OK",
         "medium": "Gemiddeld",
         "full": "Vol",
         "unknown": "Onbekend",
@@ -157,13 +168,12 @@ class MelittaBeanLevelSensor(MelittaBaseSensor):
 class MelittaErrorSensor(MelittaBaseSensor):
 
     ERROR_TRANSLATIONS = {
-        "water_tank_empty": "Watertank leeg",
-        "bean_container_empty": "Bonenhouder leeg",
-        "drip_tray_full": "Lekbak vol",
-        "waste_container_full": "Afvalbak vol",
-        "descaling_needed": "Ontkalken nodig",
-        "brewing_unit_missing": "Zetgroep ontbreekt",
-        "general_error": "Algemene fout",
+        "brewing_unit_removed": "Zetgroep verwijderd",
+        "drip_tray_missing": "Lekbak ontbreekt",
+        "empty_drip_tray": "Lekbak legen",
+        "fill_water": "Water bijvullen",
+        "close_powder_lid": "Poederdeksel sluiten",
+        "fill_powder": "Poeder bijvullen",
     }
 
     def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
@@ -185,12 +195,30 @@ class MelittaBeverageSensor(MelittaBaseSensor):
 
     BEVERAGE_TRANSLATIONS = {
         "espresso": "Espresso",
-        "coffee": "Koffie",
-        "cappuccino": "Cappuccino",
-        "latte_macchiato": "Latte Macchiato",
+        "ristretto": "Ristretto",
         "lungo": "Lungo",
+        "espresso_doppio": "Dubbele Espresso",
+        "ristretto_doppio": "Dubbele Ristretto",
+        "cafe_creme": "Caf\u00e9 Cr\u00e8me",
+        "cafe_creme_doppio": "Dubbele Caf\u00e9 Cr\u00e8me",
+        "americano": "Americano",
+        "americano_extra": "Americano Extra",
+        "long_black": "Long Black",
+        "red_eye": "Red Eye",
+        "black_eye": "Black Eye",
+        "dead_eye": "Dead Eye",
+        "cappuccino": "Cappuccino",
+        "espresso_macchiato": "Espresso Macchiato",
+        "caffe_latte": "Caff\u00e8 Latte",
+        "cafe_au_lait": "Caf\u00e9 au Lait",
+        "flat_white": "Flat White",
+        "latte_macchiato": "Latte Macchiato",
+        "latte_macchiato_extra": "Latte Macchiato Extra",
+        "latte_macchiato_triple": "Latte Macchiato Triple",
+        "milk": "Warme Melk",
+        "milk_froth": "Melkschuim",
         "hot_water": "Heet Water",
-        "steam": "Stoom",
+        "freestyle": "Freestyle",
     }
 
     def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
@@ -283,29 +311,17 @@ class MelittaBleDiscoverySensor(MelittaBaseSensor):
             "volledige_info": self._device.discovered_services_info,
             "services_gevonden": self._device.services_discovered,
             "mac_adres": self._device.address,
+            "geauthenticeerd": self._device.is_authenticated,
+            "ble_verbonden": self._device.is_ble_connected,
         }
-
-        raw_data = self._device.raw_char_data
-        if raw_data:
-            attrs["ruwe_kenmerk_data"] = raw_data
-            for uuid, hex_val in raw_data.items():
-                short_uuid = uuid.split("-")[0] if "-" in uuid else uuid
-                attrs[f"char_{short_uuid}"] = hex_val
 
         notifications = self._device.raw_notifications
         if notifications:
             attrs["aantal_notificaties"] = len(notifications)
-            recent = notifications[-10:] if len(notifications) > 10 else notifications
+            recent = notifications[-5:] if len(notifications) > 5 else notifications
             for i, notif in enumerate(recent):
                 idx = len(notifications) - len(recent) + i
-                attrs[f"notificatie_{idx}"] = f"{notif['time']} {notif['sender']}: {notif['hex']}"
-
-            if notifications:
-                last = notifications[-1]
-                attrs["laatste_notificatie_hex"] = last["hex"]
-                attrs["laatste_notificatie_bytes"] = last["bytes"]
-                attrs["laatste_notificatie_tijd"] = last["time"]
-                attrs["laatste_notificatie_bron"] = last["sender"]
+                attrs[f"notificatie_{idx}"] = f"{notif['time']}: {notif['hex']}"
 
         if self._device.last_write_result:
             attrs["laatste_schrijfresultaat"] = self._device.last_write_result

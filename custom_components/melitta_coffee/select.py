@@ -62,10 +62,11 @@ class MelittaBaseSelect(SelectEntity):
 class MelittaStrengthSelect(MelittaBaseSelect):
 
     STRENGTH_OPTIONS = {
+        "very_mild": "Heel Mild",
         "mild": "Mild",
         "medium": "Normaal",
         "strong": "Sterk",
-        "extra_strong": "Extra Sterk",
+        "very_strong": "Extra Sterk",
     }
 
     def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:

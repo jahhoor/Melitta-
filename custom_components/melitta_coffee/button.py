@@ -6,10 +6,52 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, CONF_DEVICE_NAME, CONF_MODEL, CONF_MAC_ADDRESS, BEVERAGE_MAP
+from .const import DOMAIN, CONF_DEVICE_NAME, CONF_MODEL, CONF_MAC_ADDRESS
 from .device import MelittaDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+BUTTON_BEVERAGES = [
+    "espresso",
+    "ristretto",
+    "lungo",
+    "espresso_doppio",
+    "cafe_creme",
+    "cappuccino",
+    "caffe_latte",
+    "latte_macchiato",
+    "flat_white",
+    "americano",
+    "espresso_macchiato",
+    "cafe_au_lait",
+    "milk",
+    "milk_froth",
+    "hot_water",
+]
+
+BEVERAGE_NAMES_NL = {
+    "espresso": "Espresso",
+    "ristretto": "Ristretto",
+    "lungo": "Lungo",
+    "espresso_doppio": "Dubbele Espresso",
+    "ristretto_doppio": "Dubbele Ristretto",
+    "cafe_creme": "Caf\u00e9 Cr\u00e8me",
+    "cafe_creme_doppio": "Dubbele Caf\u00e9 Cr\u00e8me",
+    "americano": "Americano",
+    "americano_extra": "Americano Extra",
+    "long_black": "Long Black",
+    "cappuccino": "Cappuccino",
+    "espresso_macchiato": "Espresso Macchiato",
+    "caffe_latte": "Caff\u00e8 Latte",
+    "cafe_au_lait": "Caf\u00e9 au Lait",
+    "flat_white": "Flat White",
+    "latte_macchiato": "Latte Macchiato",
+    "latte_macchiato_extra": "Latte Macchiato Extra",
+    "latte_macchiato_triple": "Latte Macchiato Triple",
+    "milk": "Warme Melk",
+    "milk_froth": "Melkschuim",
+    "hot_water": "Heet Water",
+}
 
 
 async def async_setup_entry(
@@ -21,14 +63,13 @@ async def async_setup_entry(
 
     entities = [
         MelittaBrewButton(device, entry, beverage)
-        for beverage in BEVERAGE_MAP
+        for beverage in BUTTON_BEVERAGES
     ]
     entities.extend([
         MelittaStopButton(device, entry),
         MelittaCleanButton(device, entry),
         MelittaRinseButton(device, entry),
         MelittaStandbyButton(device, entry),
-        MelittaWakeUpButton(device, entry),
     ])
 
     async_add_entities(entities)
@@ -58,23 +99,13 @@ class MelittaBaseButton(ButtonEntity):
 
 class MelittaBrewButton(MelittaBaseButton):
 
-    BEVERAGE_NAMES = {
-        "espresso": "Espresso",
-        "coffee": "Koffie",
-        "cappuccino": "Cappuccino",
-        "latte_macchiato": "Latte Macchiato",
-        "lungo": "Lungo",
-        "hot_water": "Heet Water",
-        "steam": "Stoom",
-    }
-
     def __init__(
         self, device: MelittaDevice, entry: ConfigEntry, beverage: str
     ) -> None:
         super().__init__(device, entry)
         self._beverage = beverage
         self._attr_unique_id = f"{entry.data[CONF_MAC_ADDRESS]}_brew_{beverage}"
-        self._attr_name = f"Zet {self.BEVERAGE_NAMES.get(beverage, beverage)}"
+        self._attr_name = f"Zet {BEVERAGE_NAMES_NL.get(beverage, beverage)}"
         self._attr_icon = "mdi:coffee"
 
     async def async_press(self) -> None:
@@ -131,15 +162,3 @@ class MelittaStandbyButton(MelittaBaseButton):
 
     async def async_press(self) -> None:
         await self._device.standby()
-
-
-class MelittaWakeUpButton(MelittaBaseButton):
-
-    def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
-        super().__init__(device, entry)
-        self._attr_unique_id = f"{entry.data[CONF_MAC_ADDRESS]}_wake_up"
-        self._attr_name = "Inschakelen"
-        self._attr_icon = "mdi:power"
-
-    async def async_press(self) -> None:
-        await self._device.wake_up()
