@@ -86,6 +86,8 @@ class MelittaStatusSensor(MelittaBaseSensor):
         "connecting": "Verbinden...",
         "authenticating": "Authenticeren...",
         "auth_failed": "Authenticatie mislukt",
+        "connected_not_auth": "Verbonden, wacht op koppeling",
+        "auth_dropped": "Verbinding verbroken bij authenticatie",
     }
 
     def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:

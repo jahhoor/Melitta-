@@ -138,6 +138,27 @@ class EfComParser:
         else:
             self._known_commands[cmd_id] = [payload_length]
 
+    def _try_decode_frame(self, cmd_id: str, cmd_len: int, expected_len: int, use_encryption: bool) -> bool:
+        work_buf = bytearray(self._buffer[:self._pos])
+
+        if use_encryption:
+            decrypt_start = cmd_len + 1
+            decrypt_len = self._pos - cmd_len - 2
+            if decrypt_len > 0:
+                _rc4_crypt(work_buf, decrypt_start, decrypt_len)
+
+        checksum_pos = self._pos - 2
+        expected_checksum = _compute_checksum(work_buf, checksum_pos)
+        if work_buf[checksum_pos] == expected_checksum:
+            payload_start = cmd_len + 1
+            payload = bytes(work_buf[payload_start:payload_start + expected_len])
+            enc_label = "encrypted" if use_encryption else "plaintext"
+            _LOGGER.debug("Decoded %s frame for %s (len=%d)", enc_label, cmd_id, expected_len)
+            self._on_frame(cmd_id, payload)
+            self._reset()
+            return True
+        return False
+
     def feed(self, byte_val: int) -> None:
         if self._pos <= 0:
             if byte_val == FRAME_START:
@@ -172,36 +193,28 @@ class EfComParser:
                     total = len(cmd_id) + 1 + expected_len + 2
                     if total == self._pos:
                         cmd_len = len(cmd_id)
-                        work_buf = bytearray(self._buffer[:self._pos])
+
+                        if self._try_decode_frame(cmd_id, cmd_len, expected_len, False):
+                            return
 
                         if self._encrypted:
-                            decrypt_start = cmd_len + 1
-                            decrypt_len = self._pos - cmd_len - 2
-                            if decrypt_len > 0:
-                                _rc4_crypt(work_buf, decrypt_start, decrypt_len)
-
-                        checksum_pos = self._pos - 2
-                        expected_checksum = _compute_checksum(work_buf, checksum_pos)
-                        if work_buf[checksum_pos] == expected_checksum:
-                            payload_start = cmd_len + 1
-                            payload = bytes(work_buf[payload_start:payload_start + expected_len])
-                            self._on_frame(cmd_id, payload)
-                            self._reset()
-                            return
-                        else:
-                            if self._encrypted:
-                                _LOGGER.debug(
-                                    "Encrypted frame checksum mismatch for %s (false end marker?) - continuing",
-                                    cmd_id,
-                                )
-                                self._buffer[self._pos - 1] = byte_val
+                            if self._try_decode_frame(cmd_id, cmd_len, expected_len, True):
                                 return
+
                             _LOGGER.debug(
-                                "Checksum mismatch for %s: expected 0x%02x got 0x%02x",
-                                cmd_id, expected_checksum, work_buf[checksum_pos],
+                                "Frame checksum mismatch for %s (both plaintext and encrypted failed, "
+                                "possible false end marker) - continuing accumulation",
+                                cmd_id,
                             )
-                            self._reset()
+                            self._buffer[self._pos - 1] = byte_val
                             return
+
+                        _LOGGER.debug(
+                            "Checksum mismatch for %s (plaintext only)",
+                            cmd_id,
+                        )
+                        self._reset()
+                        return
                     if total > self._pos:
                         matched = True
 
@@ -475,6 +488,13 @@ class MelittaDevice:
                 if not self._shutting_down:
                     await self._authenticate()
 
+                if not self._is_connected:
+                    _LOGGER.warning(
+                        "BLE connection lost during auth for %s - machine may have dropped connection",
+                        self._address,
+                    )
+                    return False
+
                 if self._authenticated:
                     self._status = "ready"
                     self._start_keepalive()
@@ -558,13 +578,34 @@ class MelittaDevice:
                 self._lock.release()
 
     def _on_disconnect(self, client: BleakClient) -> None:
-        _LOGGER.info("Disconnected from Melitta at %s", self._address)
+        was_authenticating = self._status == "authenticating"
+        _LOGGER.info(
+            "Disconnected from Melitta at %s (was_authenticating=%s)",
+            self._address, was_authenticating,
+        )
         self._is_connected = False
         self._authenticated = False
         self._session_key = None
         self._client = None
-        self._status = "offline"
         self._stop_keepalive()
+
+        if was_authenticating:
+            self._status = "auth_dropped"
+            self._last_error_message = (
+                "Machine verbreekt verbinding tijdens authenticatie. "
+                "Druk op 'Verbinden' op het display van de machine."
+            )
+            _LOGGER.warning(
+                "Machine at %s dropped BLE during authentication. "
+                "User must press 'Verbinden' on the machine display.",
+                self._address,
+            )
+        else:
+            self._status = "offline"
+
+        if self._auth_event:
+            self._auth_event.set()
+
         self._notify_callbacks()
 
         if not self._shutting_down:
@@ -741,10 +782,10 @@ class MelittaDevice:
             challenge_hash.hex(),
         )
 
-        frame = _build_frame(CMD_AUTH, auth_payload, encrypt=True)
+        frame = _build_frame(CMD_AUTH, auth_payload, encrypt=False)
         try:
             await self._send_raw(frame)
-            _LOGGER.debug("Auth challenge sent (RC4 encrypted), frame: %s", frame.hex())
+            _LOGGER.debug("Auth challenge sent (plaintext), frame: %s", frame.hex())
         except (BleakError, OSError) as err:
             _LOGGER.warning("Failed to send auth challenge: %s", err)
             self._authenticated = False
@@ -767,6 +808,10 @@ class MelittaDevice:
             self._last_error_message = (
                 "Authenticatie timeout - druk op 'Verbinden' op het koffiezetapparaat"
             )
+
+        if not self._is_connected:
+            _LOGGER.warning("BLE connection lost during auth for %s", self._address)
+            self._authenticated = False
 
     def _handle_auth_response(self, payload: bytes) -> None:
         _LOGGER.debug(
