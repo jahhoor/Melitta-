@@ -4,6 +4,7 @@ from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, BEVERAGE_MAP, STRENGTH_MAP
 from .device import MelittaDevice
@@ -29,13 +30,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     address = entry.data[CONF_MAC_ADDRESS]
     name = entry.data.get(CONF_DEVICE_NAME, "Melitta Koffiezetapparaat")
 
-    device = MelittaDevice(address, name)
+    device = MelittaDevice(address, name, hass=hass)
     hass.data[DOMAIN][entry.entry_id] = device
-
-    try:
-        await device.connect()
-    except Exception as err:
-        _LOGGER.warning("Initial connection to %s failed: %s. Will retry.", address, err)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -46,11 +42,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug("Update failed for %s: %s", address, err)
 
     entry.async_on_unload(
-        hass.helpers.event.async_track_time_interval(
+        async_track_time_interval(
+            hass,
             _update_device,
             timedelta(seconds=30),
         )
     )
+
+    hass.async_create_task(_update_device())
 
     async def handle_brew_service(call: ServiceCall) -> None:
         beverage = call.data.get("beverage", "coffee")
@@ -62,8 +61,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await dev.brew(beverage, strength, cups)
                 break
 
-    hass.services.async_register(DOMAIN, "brew_coffee", handle_brew_service)
+    if not hass.services.has_service(DOMAIN, "brew_coffee"):
+        hass.services.async_register(DOMAIN, "brew_coffee", handle_brew_service)
 
+    _LOGGER.info("Melitta Coffee integration setup complete for %s (%s)", name, address)
     return True
 
 
@@ -71,10 +72,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
-        device: MelittaDevice = hass.data[DOMAIN].pop(entry.entry_id)
-        try:
-            await device.disconnect()
-        except Exception as err:
-            _LOGGER.debug("Disconnect failed: %s", err)
+        device: MelittaDevice = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if device:
+            try:
+                await device.disconnect()
+            except Exception as err:
+                _LOGGER.debug("Disconnect failed: %s", err)
 
     return unload_ok

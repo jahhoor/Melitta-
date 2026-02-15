@@ -6,8 +6,8 @@
   "dependencies": ["bluetooth"],
   "documentation": "https://github.com/jahhoor/Melitta-",
   "integration_type": "device",
-  "iot_class": "local_push",
-  "requirements": ["bleak>=0.21.0"],
+  "iot_class": "local_polling",
+  "requirements": [],
   "version": "1.0.0",
   "bluetooth": [
     {
@@ -18,6 +18,9 @@
     },
     {
       "local_name": "Barista*"
+    },
+    {
+      "local_name": "Caffeo*"
     }
   ]
 }

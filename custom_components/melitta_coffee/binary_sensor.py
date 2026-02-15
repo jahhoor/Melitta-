@@ -47,6 +47,10 @@ class MelittaBaseBinarySensor(BinarySensorEntity):
             model=self._entry.data.get(CONF_MODEL, "Barista Smart"),
         )
 
+    @property
+    def available(self) -> bool:
+        return True
+
     async def async_added_to_hass(self) -> None:
         self._device.register_callback(self._handle_update)
 
@@ -92,4 +96,4 @@ class MelittaBrewingSensor(MelittaBaseBinarySensor):
 
     @property
     def available(self) -> bool:
-        return self._device.is_connected
+        return True

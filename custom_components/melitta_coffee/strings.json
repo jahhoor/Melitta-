@@ -10,8 +10,8 @@
         }
       },
       "scan": {
-        "title": "Melitta scannen",
-        "description": "Selecteer je Melitta koffiezetapparaat uit de gevonden apparaten.",
+        "title": "Bluetooth apparaten gevonden",
+        "description": "Selecteer je Melitta koffiezetapparaat uit de lijst. Apparaten met een * ervoor zijn waarschijnlijk Melitta-apparaten.",
         "data": {
           "mac_address": "Gevonden apparaat",
           "device_name": "Naam apparaat",
@@ -31,13 +31,13 @@
         "title": "Melitta gevonden",
         "description": "Melitta apparaat gevonden: {name} ({address}). Wil je dit apparaat toevoegen?",
         "data": {
-          "name": "Naam",
+          "device_name": "Naam",
           "model": "Model"
         }
       }
     },
     "error": {
-      "no_devices_found": "Geen Melitta apparaten gevonden. Zorg dat je koffiezetapparaat aan staat en Bluetooth actief is.",
+      "no_devices_found": "Geen Bluetooth-apparaten gevonden. Zorg dat je koffiezetapparaat aan staat en de Melitta Connect app gesloten is.",
       "invalid_mac": "Ongeldig MAC-adres. Gebruik het formaat AA:BB:CC:DD:EE:FF."
     },
     "abort": {

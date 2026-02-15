@@ -2,6 +2,7 @@ import logging
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -26,6 +27,9 @@ async def async_setup_entry(
         MelittaErrorSensor(device, entry),
         MelittaBeverageSensor(device, entry),
         MelittaTotalBrewsSensor(device, entry),
+        MelittaLastConnectSensor(device, entry),
+        MelittaLastErrorSensor(device, entry),
+        MelittaBleDiscoverySensor(device, entry),
     ]
 
     async_add_entities(entities)
@@ -50,7 +54,7 @@ class MelittaBaseSensor(SensorEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.is_connected
+        return True
 
     async def async_added_to_hass(self) -> None:
         self._device.register_callback(self._handle_update)
@@ -200,3 +204,61 @@ class MelittaTotalBrewsSensor(MelittaBaseSensor):
     @property
     def native_value(self) -> int:
         return self._device.total_brews
+
+
+class MelittaLastConnectSensor(MelittaBaseSensor):
+
+    def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
+        super().__init__(device, entry)
+        self._attr_unique_id = f"{entry.data[CONF_MAC_ADDRESS]}_last_connect"
+        self._attr_name = "Laatste verbinding"
+        self._attr_icon = "mdi:clock-check-outline"
+
+    @property
+    def native_value(self) -> str | None:
+        return self._device.last_connect_time or "Nooit verbonden"
+
+
+class MelittaLastErrorSensor(MelittaBaseSensor):
+
+    def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
+        super().__init__(device, entry)
+        self._attr_unique_id = f"{entry.data[CONF_MAC_ADDRESS]}_last_error"
+        self._attr_name = "Laatste fout"
+        self._attr_icon = "mdi:alert-outline"
+
+    @property
+    def native_value(self) -> str | None:
+        return self._device.last_error_message or "Geen"
+
+
+class MelittaBleDiscoverySensor(MelittaBaseSensor):
+
+    def __init__(self, device: MelittaDevice, entry: ConfigEntry) -> None:
+        super().__init__(device, entry)
+        self._attr_unique_id = f"{entry.data[CONF_MAC_ADDRESS]}_ble_discovery"
+        self._attr_name = "BLE Diagnostiek"
+        self._attr_icon = "mdi:bluetooth-settings"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def native_value(self) -> str:
+        info = self._device.discovered_services_info
+        if len(info) > 255:
+            lines = info.split("\n")
+            summary_parts = []
+            for line in lines:
+                if line.startswith("Geselecteerd") or line.startswith("Schrijfbare") or line.startswith("Leesbare") or line.startswith("Notificatie"):
+                    summary_parts.append(line)
+            if summary_parts:
+                return " | ".join(summary_parts)
+            return info[:255]
+        return info
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "volledige_info": self._device.discovered_services_info,
+            "services_gevonden": self._device.services_discovered,
+            "mac_adres": self._device.address,
+        }

@@ -46,7 +46,7 @@ class MelittaBaseSelect(SelectEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.is_connected
+        return True
 
     async def async_added_to_hass(self) -> None:
         self._device.register_callback(self._handle_update)

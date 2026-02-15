@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Callable
 
 from bleak import BleakClient, BleakScanner
@@ -22,14 +23,19 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+MELITTA_KEYWORDS = ["melitta", "caffeo", "barista"]
+RECONNECT_INTERVALS = [5, 10, 30, 60, 120]
+
 
 class MelittaDevice:
 
-    def __init__(self, address: str, name: str = "Melitta") -> None:
+    def __init__(self, address: str, name: str = "Melitta", hass=None) -> None:
         self._address = address
         self._name = name
+        self._hass = hass
         self._client: BleakClient | None = None
         self._is_connected = False
+        self._has_ever_connected = False
         self._status = "offline"
         self._water_level = "unknown"
         self._bean_level = "unknown"
@@ -46,7 +52,13 @@ class MelittaDevice:
         self._status_char: str | None = None
         self._notify_char: str | None = None
         self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 3
+        self._max_reconnect_attempts = 5
+        self._reconnect_task: asyncio.Task | None = None
+        self._shutting_down = False
+        self._last_connect_time: str | None = None
+        self._last_error_message: str | None = None
+        self._services_discovered = False
+        self._discovered_services_info: str = "Nog niet verbonden"
 
     @property
     def address(self) -> str:
@@ -100,6 +112,22 @@ class MelittaDevice:
     def total_brews(self) -> int:
         return self._total_brews
 
+    @property
+    def last_connect_time(self) -> str | None:
+        return self._last_connect_time
+
+    @property
+    def last_error_message(self) -> str | None:
+        return self._last_error_message
+
+    @property
+    def services_discovered(self) -> bool:
+        return self._services_discovered
+
+    @property
+    def discovered_services_info(self) -> str:
+        return self._discovered_services_info
+
     def set_strength(self, strength: str) -> None:
         if strength in STRENGTH_MAP:
             self._strength = strength
@@ -127,7 +155,13 @@ class MelittaDevice:
     async def connect(self) -> bool:
         async with self._lock:
             if self._is_connected and self._client:
-                return True
+                try:
+                    if self._client.is_connected:
+                        return True
+                except Exception:
+                    pass
+                self._is_connected = False
+                self._client = None
 
             try:
                 _LOGGER.debug("Connecting to Melitta at %s", self._address)
@@ -138,8 +172,11 @@ class MelittaDevice:
                 )
                 await self._client.connect()
                 self._is_connected = True
+                self._has_ever_connected = True
                 self._status = "idle"
                 self._reconnect_attempts = 0
+                self._last_connect_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._last_error_message = None
 
                 await self._discover_services()
                 await self._subscribe_notifications()
@@ -150,14 +187,26 @@ class MelittaDevice:
                 return True
 
             except (BleakError, asyncio.TimeoutError, OSError) as err:
-                _LOGGER.warning("Failed to connect to Melitta at %s: %s", self._address, err)
+                error_msg = str(err)
+                _LOGGER.warning("Failed to connect to Melitta at %s: %s", self._address, error_msg)
                 self._is_connected = False
-                self._status = "offline"
                 self._client = None
+                self._last_error_message = error_msg
+                if not self._has_ever_connected:
+                    self._status = "offline"
                 self._notify_callbacks()
                 return False
 
     async def disconnect(self) -> None:
+        self._shutting_down = True
+
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+
         async with self._lock:
             if self._client:
                 try:
@@ -172,20 +221,64 @@ class MelittaDevice:
     def _on_disconnect(self, client: BleakClient) -> None:
         _LOGGER.info("Disconnected from Melitta at %s", self._address)
         self._is_connected = False
-        self._status = "offline"
         self._client = None
         self._notify_callbacks()
 
-    async def _ensure_connected(self) -> bool:
-        if self._is_connected and self._client:
-            return True
+        if not self._shutting_down:
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
 
         if self._reconnect_attempts >= self._max_reconnect_attempts:
-            _LOGGER.debug("Max reconnect attempts reached for %s", self._address)
+            _LOGGER.info(
+                "Max reconnect attempts (%d) reached for %s, will retry on next update cycle",
+                self._max_reconnect_attempts,
+                self._address,
+            )
             self._reconnect_attempts = 0
-            return False
+            return
 
+        delay = RECONNECT_INTERVALS[
+            min(self._reconnect_attempts, len(RECONNECT_INTERVALS) - 1)
+        ]
         self._reconnect_attempts += 1
+        _LOGGER.debug(
+            "Scheduling reconnect attempt %d in %ds for %s",
+            self._reconnect_attempts,
+            delay,
+            self._address,
+        )
+
+        loop = asyncio.get_event_loop()
+        self._reconnect_task = loop.create_task(self._reconnect_after_delay(delay))
+
+    async def _reconnect_after_delay(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            if not self._shutting_down and not self._is_connected:
+                _LOGGER.debug("Attempting reconnect to %s", self._address)
+                connected = await self.connect()
+                if not connected and not self._shutting_down:
+                    self._schedule_reconnect()
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:
+            _LOGGER.debug("Reconnect failed for %s: %s", self._address, err)
+            if not self._shutting_down:
+                self._schedule_reconnect()
+
+    async def _ensure_connected(self) -> bool:
+        if self._is_connected and self._client:
+            try:
+                if self._client.is_connected:
+                    return True
+            except Exception:
+                pass
+            self._is_connected = False
+            self._client = None
+
         return await self.connect()
 
     async def _discover_services(self) -> None:
@@ -194,11 +287,28 @@ class MelittaDevice:
 
         try:
             services = self._client.services
+            info_lines = []
+            all_write_chars = []
+            all_read_chars = []
+            all_notify_chars = []
 
             for service in services:
-                _LOGGER.debug("Service: %s", service.uuid)
+                svc_desc = service.description or "Onbekend"
+                info_lines.append(f"Service: {service.uuid} ({svc_desc})")
+                _LOGGER.info("=== BLE Service: %s (%s) ===", service.uuid, svc_desc)
+
                 for char in service.characteristics:
-                    _LOGGER.debug("  Char: %s props=%s", char.uuid, char.properties)
+                    props = ", ".join(char.properties)
+                    char_desc = char.description or ""
+                    info_lines.append(f"  Kenmerk: {char.uuid} [{props}] {char_desc}")
+                    _LOGGER.info(
+                        "  Characteristic: %s props=[%s] desc=%s handle=%s",
+                        char.uuid, props, char_desc, char.handle,
+                    )
+
+                    for desc in char.descriptors:
+                        info_lines.append(f"    Descriptor: {desc.uuid}")
+                        _LOGGER.info("    Descriptor: %s handle=%s", desc.uuid, desc.handle)
 
                     uuid_lower = char.uuid.lower()
                     if uuid_lower == MELITTA_CONTROL_CHAR_UUID.lower():
@@ -208,49 +318,72 @@ class MelittaDevice:
                     elif uuid_lower == MELITTA_NOTIFY_CHAR_UUID.lower():
                         self._notify_char = char.uuid
 
-            if not self._control_char:
-                for service in services:
-                    for char in service.characteristics:
-                        if "write" in char.properties:
-                            self._control_char = char.uuid
-                            break
-                    if self._control_char:
+                    if "write" in char.properties or "write-without-response" in char.properties:
+                        all_write_chars.append(char.uuid)
+                    if "read" in char.properties:
+                        all_read_chars.append(char.uuid)
+                    if "notify" in char.properties or "indicate" in char.properties:
+                        all_notify_chars.append(char.uuid)
+
+            info_lines.append("")
+            info_lines.append(f"Schrijfbare kenmerken: {', '.join(all_write_chars) or 'Geen'}")
+            info_lines.append(f"Leesbare kenmerken: {', '.join(all_read_chars) or 'Geen'}")
+            info_lines.append(f"Notificatie kenmerken: {', '.join(all_notify_chars) or 'Geen'}")
+
+            if not self._control_char and all_write_chars:
+                self._control_char = all_write_chars[0]
+                _LOGGER.info("Fallback control char: %s", self._control_char)
+
+            if not self._status_char and all_read_chars:
+                for rc in all_read_chars:
+                    if rc != self._control_char:
+                        self._status_char = rc
+                        _LOGGER.info("Fallback status char: %s", self._status_char)
                         break
 
-            if not self._status_char:
-                for service in services:
-                    for char in service.characteristics:
-                        if "read" in char.properties and char.uuid != self._control_char:
-                            self._status_char = char.uuid
-                            break
-                    if self._status_char:
-                        break
+            if not self._notify_char and all_notify_chars:
+                self._notify_char = all_notify_chars[0]
+                _LOGGER.info("Fallback notify char: %s", self._notify_char)
 
-            if not self._notify_char:
-                for service in services:
-                    for char in service.characteristics:
-                        if "notify" in char.properties:
-                            self._notify_char = char.uuid
-                            break
-                    if self._notify_char:
-                        break
+            info_lines.append("")
+            info_lines.append(f"Geselecteerd - Schrijven: {self._control_char or 'Geen'}")
+            info_lines.append(f"Geselecteerd - Lezen: {self._status_char or 'Geen'}")
+            info_lines.append(f"Geselecteerd - Notificaties: {self._notify_char or 'Geen'}")
 
-            _LOGGER.debug(
-                "Discovered chars - control: %s, status: %s, notify: %s",
+            self._discovered_services_info = "\n".join(info_lines)
+
+            self._services_discovered = bool(self._control_char or self._status_char or self._notify_char)
+
+            if not self._services_discovered:
+                _LOGGER.warning(
+                    "No usable GATT characteristics found on %s. "
+                    "The device may use a different BLE protocol than expected.",
+                    self._address,
+                )
+                self._last_error_message = "Geen bruikbare Bluetooth-kenmerken gevonden"
+                self._discovered_services_info = "Geen bruikbare kenmerken gevonden op dit apparaat"
+
+            _LOGGER.info(
+                "Discovery complete - control: %s, status: %s, notify: %s (discovered=%s)",
                 self._control_char, self._status_char, self._notify_char,
+                self._services_discovered,
             )
 
         except (BleakError, OSError) as err:
             _LOGGER.error("Failed to discover services: %s", err)
+            self._last_error_message = f"Service discovery mislukt: {err}"
+            self._discovered_services_info = f"Discovery mislukt: {err}"
 
     async def _subscribe_notifications(self) -> None:
         if not self._client or not self._notify_char:
+            _LOGGER.debug("Cannot subscribe: client=%s, notify_char=%s", bool(self._client), self._notify_char)
             return
 
         try:
             await self._client.start_notify(
                 self._notify_char, self._handle_notification
             )
+            _LOGGER.debug("Subscribed to notifications on %s", self._notify_char)
         except (BleakError, OSError) as err:
             _LOGGER.warning("Failed to subscribe to notifications: %s", err)
 
@@ -315,6 +448,11 @@ class MelittaDevice:
             return True
         except (BleakError, OSError) as err:
             _LOGGER.error("Failed to send command: %s", err)
+            self._last_error_message = f"Commando mislukt: {err}"
+            self._is_connected = False
+            self._client = None
+            self._notify_callbacks()
+            self._schedule_reconnect()
             return False
 
     async def brew(
@@ -387,8 +525,19 @@ class MelittaDevice:
             if not connected:
                 return
 
-        await self._request_status()
-        self._notify_callbacks()
+        try:
+            if self._client and self._client.is_connected:
+                await self._request_status()
+                self._notify_callbacks()
+            else:
+                self._is_connected = False
+                self._client = None
+                self._schedule_reconnect()
+        except (BleakError, OSError) as err:
+            _LOGGER.debug("Update failed for %s: %s", self._address, err)
+            self._is_connected = False
+            self._client = None
+            self._schedule_reconnect()
 
 
 async def discover_melitta_devices(timeout: float = 10.0) -> list[BLEDevice]:
@@ -398,8 +547,22 @@ async def discover_melitta_devices(timeout: float = 10.0) -> list[BLEDevice]:
     melitta_devices = []
     for device in devices:
         name = device.name or ""
-        if any(kw in name.lower() for kw in ["melitta", "caffeo", "barista"]):
+        if any(kw in name.lower() for kw in MELITTA_KEYWORDS):
             _LOGGER.info("Found Melitta device: %s (%s)", device.name, device.address)
             melitta_devices.append(device)
 
     return melitta_devices
+
+
+async def discover_all_ble_devices(timeout: float = 10.0) -> list[BLEDevice]:
+    _LOGGER.debug("Scanning for all BLE devices...")
+    devices = await BleakScanner.discover(timeout=timeout)
+
+    named_devices = []
+    for device in devices:
+        if device.name:
+            _LOGGER.debug("Found BLE device: %s (%s)", device.name, device.address)
+            named_devices.append(device)
+
+    _LOGGER.info("Found %d named BLE devices", len(named_devices))
+    return named_devices

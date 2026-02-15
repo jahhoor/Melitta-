@@ -5,14 +5,9 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.components.bluetooth import (
-    BluetoothServiceInfoBleak,
-    async_discovered_service_info,
-)
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, CONF_MODEL, SUPPORTED_MODELS
-from .device import discover_melitta_devices
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,21 +24,25 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     def __init__(self) -> None:
-        self._discovery_info: BluetoothServiceInfoBleak | None = None
+        self._discovery_info = None
         self._discovered_devices: dict[str, str] = {}
+        self._scan_failed = False
 
-    async def async_step_bluetooth(
-        self, discovery_info: BluetoothServiceInfoBleak
-    ) -> FlowResult:
-        await self.async_set_unique_id(discovery_info.address)
-        self._abort_if_unique_id_configured()
-        self._discovery_info = discovery_info
-        return await self.async_step_bluetooth_confirm()
+    async def async_step_bluetooth(self, discovery_info) -> FlowResult:
+        try:
+            await self.async_set_unique_id(discovery_info.address)
+            self._abort_if_unique_id_configured()
+            self._discovery_info = discovery_info
+            return await self.async_step_bluetooth_confirm()
+        except Exception as err:
+            _LOGGER.warning("Bluetooth discovery step failed: %s", err)
+            return await self.async_step_user()
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        assert self._discovery_info is not None
+        if self._discovery_info is None:
+            return await self.async_step_user()
 
         if user_input is not None:
             return self.async_create_entry(
@@ -57,7 +56,7 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         self._set_confirm_only()
         placeholders = {
-            "name": self._discovery_info.name,
+            "name": self._discovery_info.name or "Melitta",
             "address": self._discovery_info.address,
         }
         self.context["title_placeholders"] = placeholders
@@ -92,61 +91,66 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            address = user_input[CONF_MAC_ADDRESS]
-            await self.async_set_unique_id(address, raise_on_progress=False)
-            self._abort_if_unique_id_configured()
+            address = user_input.get(CONF_MAC_ADDRESS, "")
+            if not address:
+                errors["base"] = "no_devices_found"
+            else:
+                await self.async_set_unique_id(address, raise_on_progress=False)
+                self._abort_if_unique_id_configured()
 
-            device_name = self._discovered_devices.get(address, "Melitta Koffiezetapparaat")
-            display_name = user_input.get(CONF_DEVICE_NAME, device_name)
+                device_name = self._discovered_devices.get(address, "Melitta Koffiezetapparaat")
+                display_name = user_input.get(CONF_DEVICE_NAME, device_name)
 
-            return self.async_create_entry(
-                title=display_name,
-                data={
-                    CONF_MAC_ADDRESS: address,
-                    CONF_DEVICE_NAME: display_name,
-                    CONF_MODEL: user_input.get(CONF_MODEL, "Barista Smart"),
-                },
-            )
+                return self.async_create_entry(
+                    title=display_name,
+                    data={
+                        CONF_MAC_ADDRESS: address,
+                        CONF_DEVICE_NAME: display_name,
+                        CONF_MODEL: user_input.get(CONF_MODEL, "Barista Smart"),
+                    },
+                )
 
         current_addresses = self._async_current_ids()
         self._discovered_devices = {}
 
-        for discovery_info in async_discovered_service_info(self.hass, connectable=True):
-            name = discovery_info.name or ""
-            if any(kw in name.lower() for kw in MELITTA_KEYWORDS):
-                if discovery_info.address not in current_addresses:
-                    self._discovered_devices[discovery_info.address] = name
+        try:
+            from homeassistant.components.bluetooth import async_discovered_service_info
+            for discovery_info in async_discovered_service_info(self.hass, connectable=True):
+                name = discovery_info.name or ""
+                if name and discovery_info.address not in current_addresses:
+                    is_melitta = any(kw in name.lower() for kw in MELITTA_KEYWORDS)
+                    label = f"{'* ' if is_melitta else ''}{name}"
+                    self._discovered_devices[discovery_info.address] = label
+        except Exception as err:
+            _LOGGER.warning("HA Bluetooth scan failed: %s", err)
 
         if not self._discovered_devices:
             try:
-                bleak_devices = await discover_melitta_devices(timeout=15.0)
+                from .device import discover_all_ble_devices
+                bleak_devices = await discover_all_ble_devices(timeout=15.0)
                 for device in bleak_devices:
                     if device.address not in current_addresses:
-                        self._discovered_devices[device.address] = device.name or "Melitta"
+                        name = device.name or "Onbekend apparaat"
+                        is_melitta = any(kw in name.lower() for kw in MELITTA_KEYWORDS)
+                        label = f"{'* ' if is_melitta else ''}{name}"
+                        self._discovered_devices[device.address] = label
             except Exception as err:
                 _LOGGER.warning("BLE scan failed: %s", err)
 
         if not self._discovered_devices:
-            errors["base"] = "no_devices_found"
-            return self.async_show_form(
-                step_id="manual",
-                data_schema=vol.Schema(
-                    {
-                        vol.Required(CONF_MAC_ADDRESS): str,
-                        vol.Optional(
-                            CONF_DEVICE_NAME, default="Melitta Koffiezetapparaat"
-                        ): str,
-                        vol.Optional(CONF_MODEL, default="Barista Smart"): vol.In(
-                            SUPPORTED_MODELS
-                        ),
-                    }
-                ),
-                errors=errors,
+            self._scan_failed = True
+            return await self.async_step_manual()
+
+        melitta_first = dict(
+            sorted(
+                self._discovered_devices.items(),
+                key=lambda x: (0 if any(kw in x[1].lower() for kw in MELITTA_KEYWORDS) else 1, x[1]),
             )
+        )
 
         device_options = {
             address: f"{name} ({address})"
-            for address, name in self._discovered_devices.items()
+            for address, name in melitta_first.items()
         }
 
         return self.async_show_form(
@@ -169,6 +173,10 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         errors: dict[str, str] = {}
+
+        if self._scan_failed:
+            errors["base"] = "no_devices_found"
+            self._scan_failed = False
 
         if user_input is not None and CONF_MAC_ADDRESS in user_input:
             address = normalize_mac(user_input[CONF_MAC_ADDRESS])

@@ -10,8 +10,8 @@
         }
       },
       "scan": {
-        "title": "Scan for Melitta",
-        "description": "Select your Melitta coffee machine from the discovered devices.",
+        "title": "Bluetooth devices found",
+        "description": "Select your Melitta coffee machine from the list. Devices marked with * are likely Melitta devices.",
         "data": {
           "mac_address": "Discovered device",
           "device_name": "Device name",
@@ -31,13 +31,13 @@
         "title": "Melitta found",
         "description": "Melitta device found: {name} ({address}). Would you like to add this device?",
         "data": {
-          "name": "Name",
+          "device_name": "Name",
           "model": "Model"
         }
       }
     },
     "error": {
-      "no_devices_found": "No Melitta devices found. Make sure your coffee machine is on and Bluetooth is active.",
+      "no_devices_found": "No Bluetooth devices found. Make sure your coffee machine is on and the Melitta Connect app is closed.",
       "invalid_mac": "Invalid MAC address. Use the format AA:BB:CC:DD:EE:FF."
     },
     "abort": {
@@ -51,7 +51,10 @@
       "bean_level": { "name": "Bean Level" },
       "error": { "name": "Error" },
       "beverage": { "name": "Current Beverage" },
-      "total_brews": { "name": "Total Brews" }
+      "total_brews": { "name": "Total Brews" },
+      "last_connect": { "name": "Last Connection" },
+      "last_error": { "name": "Last Error" },
+      "ble_discovery": { "name": "BLE Diagnostics" }
     },
     "binary_sensor": {
       "connected": { "name": "Connected" },

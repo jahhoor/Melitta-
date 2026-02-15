@@ -53,7 +53,7 @@ class MelittaBaseButton(ButtonEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.is_connected
+        return True
 
 
 class MelittaBrewButton(MelittaBaseButton):
@@ -80,7 +80,9 @@ class MelittaBrewButton(MelittaBaseButton):
     async def async_press(self) -> None:
         strength = self._device.strength
         cups = self._device.cups
-        await self._device.brew(self._beverage, strength, cups)
+        success = await self._device.brew(self._beverage, strength, cups)
+        if not success:
+            _LOGGER.warning("Failed to brew %s - machine may not be connected", self._beverage)
 
 
 class MelittaStopButton(MelittaBaseButton):
