@@ -1,0 +1,79 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Melitta Koffiezetapparaat",
+        "description": "Kies hoe je je Melitta koffiezetapparaat wilt toevoegen.",
+        "menu_options": {
+          "scan": "Automatisch scannen naar apparaten",
+          "manual": "MAC-adres handmatig invoeren"
+        }
+      },
+      "scan": {
+        "title": "Melitta scannen",
+        "description": "Selecteer je Melitta koffiezetapparaat uit de gevonden apparaten.",
+        "data": {
+          "mac_address": "Gevonden apparaat",
+          "device_name": "Naam apparaat",
+          "model": "Model"
+        }
+      },
+      "manual": {
+        "title": "Handmatig toevoegen",
+        "description": "Voer het Bluetooth MAC-adres van je Melitta koffiezetapparaat in. Je vindt dit in de Melitta Connect app bij de apparaatinstellingen.",
+        "data": {
+          "mac_address": "MAC-adres (bijv. AA:BB:CC:DD:EE:FF)",
+          "device_name": "Naam apparaat",
+          "model": "Model"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Melitta gevonden",
+        "description": "Melitta apparaat gevonden: {name} ({address}). Wil je dit apparaat toevoegen?",
+        "data": {
+          "name": "Naam",
+          "model": "Model"
+        }
+      }
+    },
+    "error": {
+      "no_devices_found": "Geen Melitta apparaten gevonden. Zorg dat je koffiezetapparaat aan staat en Bluetooth actief is.",
+      "invalid_mac": "Ongeldig MAC-adres. Gebruik het formaat AA:BB:CC:DD:EE:FF."
+    },
+    "abort": {
+      "already_configured": "Dit apparaat is al geconfigureerd."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "status": { "name": "Status" },
+      "water_level": { "name": "Waterstand" },
+      "bean_level": { "name": "Bonenvoorraad" },
+      "error": { "name": "Foutmelding" },
+      "beverage": { "name": "Huidig drankje" },
+      "total_brews": { "name": "Totaal gezet" }
+    },
+    "binary_sensor": {
+      "connected": { "name": "Verbonden" },
+      "brewing": { "name": "Bezig met zetten" }
+    },
+    "button": {
+      "brew_espresso": { "name": "Zet Espresso" },
+      "brew_coffee": { "name": "Zet Koffie" },
+      "brew_cappuccino": { "name": "Zet Cappuccino" },
+      "brew_latte_macchiato": { "name": "Zet Latte Macchiato" },
+      "brew_lungo": { "name": "Zet Lungo" },
+      "brew_hot_water": { "name": "Heet Water" },
+      "brew_steam": { "name": "Stoom" },
+      "stop": { "name": "Stop" },
+      "clean": { "name": "Reinigen" },
+      "rinse": { "name": "Spoelen" },
+      "standby": { "name": "Standby" },
+      "wake_up": { "name": "Inschakelen" }
+    },
+    "select": {
+      "strength": { "name": "Koffiesterkte" },
+      "cups": { "name": "Aantal kopjes" }
+    }
+  }
+}

@@ -1,0 +1,59 @@
+brew_coffee:
+  name: Koffie zetten
+  description: Zet een drankje met je Melitta koffiezetapparaat
+  fields:
+    entity_id:
+      name: Apparaat
+      description: Het koffiezetapparaat entity ID
+      required: true
+      selector:
+        entity:
+          integration: melitta_coffee
+    beverage:
+      name: Drankje
+      description: Het type drankje om te zetten
+      required: false
+      default: coffee
+      selector:
+        select:
+          options:
+            - label: Espresso
+              value: espresso
+            - label: Koffie
+              value: coffee
+            - label: Cappuccino
+              value: cappuccino
+            - label: Latte Macchiato
+              value: latte_macchiato
+            - label: Lungo
+              value: lungo
+            - label: Heet Water
+              value: hot_water
+            - label: Stoom
+              value: steam
+    strength:
+      name: Sterkte
+      description: De sterkte van de koffie
+      required: false
+      default: medium
+      selector:
+        select:
+          options:
+            - label: Mild
+              value: mild
+            - label: Normaal
+              value: medium
+            - label: Sterk
+              value: strong
+            - label: Extra Sterk
+              value: extra_strong
+    cups:
+      name: Kopjes
+      description: Aantal kopjes
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 4
+          step: 1
