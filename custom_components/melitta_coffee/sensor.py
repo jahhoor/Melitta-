@@ -83,6 +83,8 @@ class MelittaStatusSensor(MelittaBaseSensor):
         "evaporating": "Stoom",
         "busy": "Bezig",
         "offline": "Offline",
+        "connecting": "Verbinden...",
+        "authenticating": "Authenticeren...",
         "auth_failed": "Authenticatie mislukt",
     }
 
