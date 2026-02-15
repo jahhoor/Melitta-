@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -76,7 +77,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device: MelittaDevice = hass.data[DOMAIN].pop(entry.entry_id, None)
         if device:
             try:
-                await device.disconnect()
+                await asyncio.wait_for(device.disconnect(), timeout=15.0)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Disconnect timed out for %s, forcing cleanup", entry.entry_id)
             except Exception as err:
                 _LOGGER.debug("Disconnect failed: %s", err)
 
@@ -91,7 +94,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     device: MelittaDevice = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if device:
         try:
-            await device.disconnect()
+            await asyncio.wait_for(device.disconnect(), timeout=15.0)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Disconnect timed out during removal for %s, forcing cleanup", entry.entry_id)
         except Exception as err:
             _LOGGER.debug("Disconnect on remove failed: %s", err)
 

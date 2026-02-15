@@ -472,7 +472,8 @@ class MelittaDevice:
                 self._status = "authenticating"
                 self._notify_callbacks()
 
-                await self._authenticate()
+                if not self._shutting_down:
+                    await self._authenticate()
 
                 if self._authenticated:
                     self._status = "ready"
@@ -480,8 +481,12 @@ class MelittaDevice:
                     _LOGGER.info("Connected and authenticated with Melitta at %s", self._address)
                     await self._request_initial_status()
                 else:
-                    self._status = "auth_failed"
-                    _LOGGER.warning("Connected but authentication failed for %s", self._address)
+                    self._status = "connected_not_auth"
+                    _LOGGER.warning(
+                        "Connected to %s but not authenticated. "
+                        "Press 'Verbinden' on the machine and wait for the next retry.",
+                        self._address,
+                    )
 
                 self._notify_callbacks()
                 return self._authenticated
@@ -502,6 +507,9 @@ class MelittaDevice:
         self._shutting_down = True
         self._stop_keepalive()
 
+        if self._auth_event:
+            self._auth_event.set()
+
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             try:
@@ -509,20 +517,31 @@ class MelittaDevice:
             except asyncio.CancelledError:
                 pass
 
-        async with self._lock:
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=5.0)
+            lock_acquired = True
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Could not acquire lock for disconnect within 5s, forcing cleanup for %s", self._address)
+            lock_acquired = False
+
+        try:
             if self._client:
                 try:
                     if self._read_char and self._client.is_connected:
-                        await self._client.stop_notify(self._read_char)
+                        await asyncio.wait_for(
+                            self._client.stop_notify(self._read_char), timeout=3.0
+                        )
                         _LOGGER.debug("Unsubscribed from notifications on %s", self._read_char)
-                except (BleakError, OSError) as err:
+                except (BleakError, OSError, asyncio.TimeoutError) as err:
                     _LOGGER.debug("Failed to unsubscribe notifications: %s", err)
 
                 try:
                     if self._client.is_connected:
-                        await self._client.disconnect()
+                        await asyncio.wait_for(
+                            self._client.disconnect(), timeout=5.0
+                        )
                         _LOGGER.info("Disconnected BLE client from %s", self._address)
-                except (BleakError, OSError) as err:
+                except (BleakError, OSError, asyncio.TimeoutError) as err:
                     _LOGGER.debug("BLE disconnect error: %s", err)
 
                 self._client = None
@@ -534,6 +553,9 @@ class MelittaDevice:
             self._status = "offline"
             self._notify_callbacks()
             _LOGGER.info("Melitta device %s fully cleaned up", self._address)
+        finally:
+            if lock_acquired:
+                self._lock.release()
 
     def _on_disconnect(self, client: BleakClient) -> None:
         _LOGGER.info("Disconnected from Melitta at %s", self._address)
@@ -730,10 +752,14 @@ class MelittaDevice:
             return
 
         try:
-            await asyncio.wait_for(self._auth_event.wait(), timeout=10.0)
+            await asyncio.wait_for(self._auth_event.wait(), timeout=5.0)
         except asyncio.TimeoutError:
+            if self._shutting_down:
+                _LOGGER.debug("Auth cancelled due to shutdown")
+                self._authenticated = False
+                return
             _LOGGER.warning(
-                "Authentication timeout: no response within 10s from %s. "
+                "Authentication timeout: no response within 5s from %s. "
                 "Make sure the machine is in 'Verbinden' (connect) mode.",
                 self._address,
             )
@@ -1078,7 +1104,16 @@ class MelittaDevice:
     async def update(self) -> None:
         if not self._is_connected:
             await self.connect()
-        elif self._authenticated:
+        elif not self._authenticated:
+            _LOGGER.info("BLE connected but not authenticated, retrying auth for %s", self._address)
+            await self._authenticate()
+            if self._authenticated:
+                self._status = "ready"
+                self._start_keepalive()
+                _LOGGER.info("Authentication succeeded on retry for %s", self._address)
+                await self._request_initial_status()
+                self._notify_callbacks()
+        else:
             try:
                 frame = _build_frame(CMD_STATUS, b"", session_key=self._session_key, encrypt=True)
                 await self._send_raw(frame)

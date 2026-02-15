@@ -11,7 +11,7 @@
       },
       "scan": {
         "title": "Bluetooth devices found",
-        "description": "Select your Melitta coffee machine from the list. Devices marked with * are likely Melitta devices.",
+        "description": "Select your Melitta coffee machine from the list. Devices marked with * are likely Melitta devices.\n\nIMPORTANT: After adding the device, press the 'Verbinden' (Connect) button on your coffee machine's display to enable Bluetooth pairing. The integration will automatically retry authentication until the machine accepts the connection.",
         "data": {
           "mac_address": "Discovered device",
           "device_name": "Device name",
@@ -20,7 +20,7 @@
       },
       "manual": {
         "title": "Manual setup",
-        "description": "Enter the Bluetooth MAC address of your Melitta coffee machine. You can find this in the Melitta Connect app under device settings.",
+        "description": "Enter the Bluetooth MAC address of your Melitta coffee machine. You can find this in the Melitta Connect app under device settings.\n\nIMPORTANT: After adding the device, press the 'Verbinden' (Connect) button on your coffee machine's display to enable Bluetooth pairing.",
         "data": {
           "mac_address": "MAC address (e.g. AA:BB:CC:DD:EE:FF)",
           "device_name": "Device name",
@@ -29,7 +29,7 @@
       },
       "bluetooth_confirm": {
         "title": "Melitta found",
-        "description": "Melitta device found: {name} ({address}). Would you like to add this device?",
+        "description": "Melitta device found: {name} ({address}). Would you like to add this device?\n\nIMPORTANT: After confirming, press the 'Verbinden' (Connect) button on your coffee machine's display to complete the Bluetooth pairing.",
         "data": {
           "device_name": "Name",
           "model": "Model"

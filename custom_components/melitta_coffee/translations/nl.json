@@ -11,7 +11,7 @@
       },
       "scan": {
         "title": "Bluetooth apparaten gevonden",
-        "description": "Selecteer je Melitta koffiezetapparaat uit de lijst. Apparaten met een * ervoor zijn waarschijnlijk Melitta-apparaten.",
+        "description": "Selecteer je Melitta koffiezetapparaat uit de lijst. Apparaten met een * ervoor zijn waarschijnlijk Melitta-apparaten.\n\nBELANGRIJK: Druk na het toevoegen op de 'Verbinden'-knop op het display van je koffiezetapparaat om de Bluetooth-koppeling te activeren. De integratie probeert automatisch opnieuw te verbinden totdat het apparaat de verbinding accepteert.",
         "data": {
           "mac_address": "Gevonden apparaat",
           "device_name": "Naam apparaat",
@@ -20,7 +20,7 @@
       },
       "manual": {
         "title": "Handmatig toevoegen",
-        "description": "Voer het Bluetooth MAC-adres van je Melitta koffiezetapparaat in. Je vindt dit in de Melitta Connect app bij de apparaatinstellingen.",
+        "description": "Voer het Bluetooth MAC-adres van je Melitta koffiezetapparaat in. Je vindt dit in de Melitta Connect app bij de apparaatinstellingen.\n\nBELANGRIJK: Druk na het toevoegen op de 'Verbinden'-knop op het display van je koffiezetapparaat om de Bluetooth-koppeling te activeren.",
         "data": {
           "mac_address": "MAC-adres (bijv. AA:BB:CC:DD:EE:FF)",
           "device_name": "Naam apparaat",
@@ -29,7 +29,7 @@
       },
       "bluetooth_confirm": {
         "title": "Melitta gevonden",
-        "description": "Melitta apparaat gevonden: {name} ({address}). Wil je dit apparaat toevoegen?",
+        "description": "Melitta apparaat gevonden: {name} ({address}). Wil je dit apparaat toevoegen?\n\nBELANGRIJK: Druk na het bevestigen op de 'Verbinden'-knop op het display van je koffiezetapparaat om de Bluetooth-koppeling te voltooien.",
         "data": {
           "device_name": "Naam",
           "model": "Model"
