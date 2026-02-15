@@ -37,6 +37,7 @@ class MelittaDevice:
         self._is_connected = False
         self._has_ever_connected = False
         self._status = "offline"
+        self._status_raw: str | None = None
         self._water_level = "unknown"
         self._bean_level = "unknown"
         self._error: str | None = None
@@ -51,6 +52,9 @@ class MelittaDevice:
         self._control_char: str | None = None
         self._status_char: str | None = None
         self._notify_char: str | None = None
+        self._all_notify_chars: list[str] = []
+        self._all_write_chars: list[str] = []
+        self._all_read_chars: list[str] = []
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 5
         self._reconnect_task: asyncio.Task | None = None
@@ -59,6 +63,10 @@ class MelittaDevice:
         self._last_error_message: str | None = None
         self._services_discovered = False
         self._discovered_services_info: str = "Nog niet verbonden"
+        self._raw_char_data: dict[str, str] = {}
+        self._raw_notifications: list[dict[str, str]] = []
+        self._last_raw_status_hex: str | None = None
+        self._last_write_result: str | None = None
 
     @property
     def address(self) -> str:
@@ -75,6 +83,10 @@ class MelittaDevice:
     @property
     def status(self) -> str:
         return self._status
+
+    @property
+    def status_raw(self) -> str | None:
+        return self._status_raw
 
     @property
     def water_level(self) -> str:
@@ -128,6 +140,22 @@ class MelittaDevice:
     def discovered_services_info(self) -> str:
         return self._discovered_services_info
 
+    @property
+    def raw_char_data(self) -> dict[str, str]:
+        return self._raw_char_data
+
+    @property
+    def raw_notifications(self) -> list[dict[str, str]]:
+        return self._raw_notifications
+
+    @property
+    def last_raw_status_hex(self) -> str | None:
+        return self._last_raw_status_hex
+
+    @property
+    def last_write_result(self) -> str | None:
+        return self._last_write_result
+
     def set_strength(self, strength: str) -> None:
         if strength in STRENGTH_MAP:
             self._strength = strength
@@ -179,7 +207,8 @@ class MelittaDevice:
                 self._last_error_message = None
 
                 await self._discover_services()
-                await self._subscribe_notifications()
+                await self._read_all_characteristics()
+                await self._subscribe_all_notifications()
                 await self._request_status()
 
                 _LOGGER.info("Connected to Melitta at %s", self._address)
@@ -288,9 +317,9 @@ class MelittaDevice:
         try:
             services = self._client.services
             info_lines = []
-            all_write_chars = []
-            all_read_chars = []
-            all_notify_chars = []
+            self._all_write_chars = []
+            self._all_read_chars = []
+            self._all_notify_chars = []
 
             for service in services:
                 svc_desc = service.description or "Onbekend"
@@ -319,30 +348,30 @@ class MelittaDevice:
                         self._notify_char = char.uuid
 
                     if "write" in char.properties or "write-without-response" in char.properties:
-                        all_write_chars.append(char.uuid)
+                        self._all_write_chars.append(char.uuid)
                     if "read" in char.properties:
-                        all_read_chars.append(char.uuid)
+                        self._all_read_chars.append(char.uuid)
                     if "notify" in char.properties or "indicate" in char.properties:
-                        all_notify_chars.append(char.uuid)
+                        self._all_notify_chars.append(char.uuid)
 
             info_lines.append("")
-            info_lines.append(f"Schrijfbare kenmerken: {', '.join(all_write_chars) or 'Geen'}")
-            info_lines.append(f"Leesbare kenmerken: {', '.join(all_read_chars) or 'Geen'}")
-            info_lines.append(f"Notificatie kenmerken: {', '.join(all_notify_chars) or 'Geen'}")
+            info_lines.append(f"Schrijfbare kenmerken ({len(self._all_write_chars)}): {', '.join(self._all_write_chars) or 'Geen'}")
+            info_lines.append(f"Leesbare kenmerken ({len(self._all_read_chars)}): {', '.join(self._all_read_chars) or 'Geen'}")
+            info_lines.append(f"Notificatie kenmerken ({len(self._all_notify_chars)}): {', '.join(self._all_notify_chars) or 'Geen'}")
 
-            if not self._control_char and all_write_chars:
-                self._control_char = all_write_chars[0]
+            if not self._control_char and self._all_write_chars:
+                self._control_char = self._all_write_chars[0]
                 _LOGGER.info("Fallback control char: %s", self._control_char)
 
-            if not self._status_char and all_read_chars:
-                for rc in all_read_chars:
+            if not self._status_char and self._all_read_chars:
+                for rc in self._all_read_chars:
                     if rc != self._control_char:
                         self._status_char = rc
                         _LOGGER.info("Fallback status char: %s", self._status_char)
                         break
 
-            if not self._notify_char and all_notify_chars:
-                self._notify_char = all_notify_chars[0]
+            if not self._notify_char and self._all_notify_chars:
+                self._notify_char = self._all_notify_chars[0]
                 _LOGGER.info("Fallback notify char: %s", self._notify_char)
 
             info_lines.append("")
@@ -374,21 +403,71 @@ class MelittaDevice:
             self._last_error_message = f"Service discovery mislukt: {err}"
             self._discovered_services_info = f"Discovery mislukt: {err}"
 
-    async def _subscribe_notifications(self) -> None:
-        if not self._client or not self._notify_char:
-            _LOGGER.debug("Cannot subscribe: client=%s, notify_char=%s", bool(self._client), self._notify_char)
+    async def _read_all_characteristics(self) -> None:
+        if not self._client or not self._is_connected:
             return
 
-        try:
-            await self._client.start_notify(
-                self._notify_char, self._handle_notification
-            )
-            _LOGGER.debug("Subscribed to notifications on %s", self._notify_char)
-        except (BleakError, OSError) as err:
-            _LOGGER.warning("Failed to subscribe to notifications: %s", err)
+        self._raw_char_data = {}
 
-    def _handle_notification(self, sender: Any, data: bytearray) -> None:
-        _LOGGER.debug("Notification from %s: %s", sender, data.hex())
+        for char_uuid in self._all_read_chars:
+            try:
+                data = await self._client.read_gatt_char(char_uuid)
+                hex_str = data.hex()
+                byte_list = " ".join(f"0x{b:02x}" for b in data)
+                ascii_str = ""
+                for b in data:
+                    if 32 <= b <= 126:
+                        ascii_str += chr(b)
+                    else:
+                        ascii_str += "."
+
+                self._raw_char_data[char_uuid] = hex_str
+                _LOGGER.info(
+                    "READ %s: hex=%s bytes=[%s] ascii=%s len=%d",
+                    char_uuid, hex_str, byte_list, ascii_str, len(data),
+                )
+            except (BleakError, OSError) as err:
+                self._raw_char_data[char_uuid] = f"ERROR: {err}"
+                _LOGGER.warning("Failed to read characteristic %s: %s", char_uuid, err)
+
+    async def _subscribe_all_notifications(self) -> None:
+        if not self._client:
+            return
+
+        self._raw_notifications = []
+
+        for char_uuid in self._all_notify_chars:
+            try:
+                await self._client.start_notify(
+                    char_uuid, self._handle_any_notification
+                )
+                _LOGGER.info("Subscribed to notifications on %s", char_uuid)
+            except (BleakError, OSError) as err:
+                _LOGGER.warning("Failed to subscribe to %s: %s", char_uuid, err)
+
+    def _handle_any_notification(self, sender: Any, data: bytearray) -> None:
+        sender_str = str(sender)
+        hex_str = data.hex()
+        byte_list = " ".join(f"0x{b:02x}" for b in data)
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+        _LOGGER.info(
+            "NOTIFICATION from %s: hex=%s bytes=[%s] len=%d",
+            sender_str, hex_str, byte_list, len(data),
+        )
+
+        notification_entry = {
+            "time": timestamp,
+            "sender": sender_str,
+            "hex": hex_str,
+            "bytes": byte_list,
+            "length": str(len(data)),
+        }
+
+        self._raw_notifications.append(notification_entry)
+        if len(self._raw_notifications) > 50:
+            self._raw_notifications = self._raw_notifications[-50:]
+
         self._parse_status_data(data)
         self._notify_callbacks()
 
@@ -396,9 +475,19 @@ class MelittaDevice:
         if len(data) < 1:
             return
 
+        hex_str = data.hex()
+        byte_list = " ".join(f"0x{b:02x}" for b in data)
+        self._last_raw_status_hex = hex_str
+        self._status_raw = f"hex={hex_str} bytes=[{byte_list}] len={len(data)}"
+
         try:
             status_byte = data[0]
-            self._status = MACHINE_STATUS_MAP.get(status_byte, f"unknown_{status_byte:#x}")
+            mapped_status = MACHINE_STATUS_MAP.get(status_byte)
+
+            if mapped_status:
+                self._status = mapped_status
+            else:
+                self._status = f"unknown_0x{status_byte:02x}"
 
             if self._status == "brewing":
                 self._is_brewing = True
@@ -407,14 +496,27 @@ class MelittaDevice:
                 self._total_brews += 1
 
             if len(data) >= 2:
-                self._water_level = WATER_LEVEL_MAP.get(data[1], "unknown")
+                water_byte = data[1]
+                mapped_water = WATER_LEVEL_MAP.get(water_byte)
+                if mapped_water:
+                    self._water_level = mapped_water
+                else:
+                    self._water_level = f"raw_0x{water_byte:02x}"
 
             if len(data) >= 3:
-                self._bean_level = BEAN_LEVEL_MAP.get(data[2], "unknown")
+                bean_byte = data[2]
+                mapped_bean = BEAN_LEVEL_MAP.get(bean_byte)
+                if mapped_bean:
+                    self._bean_level = mapped_bean
+                else:
+                    self._bean_level = f"raw_0x{bean_byte:02x}"
 
             if len(data) >= 4:
                 error_byte = data[3]
-                self._error = ERROR_MAP.get(error_byte) if error_byte != 0 else None
+                if error_byte == 0:
+                    self._error = None
+                else:
+                    self._error = ERROR_MAP.get(error_byte, f"raw_error_0x{error_byte:02x}")
 
             if len(data) >= 5:
                 self._temperature = data[4]
@@ -423,30 +525,48 @@ class MelittaDevice:
             _LOGGER.debug("Error parsing status data: %s", err)
 
     async def _request_status(self) -> None:
-        if not self._client or not self._status_char:
+        if not self._client:
             return
 
-        try:
-            data = await self._client.read_gatt_char(self._status_char)
-            _LOGGER.debug("Status data: %s", data.hex())
-            self._parse_status_data(bytearray(data))
-        except (BleakError, OSError) as err:
-            _LOGGER.warning("Failed to read status: %s", err)
+        for char_uuid in self._all_read_chars:
+            try:
+                data = await self._client.read_gatt_char(char_uuid)
+                hex_str = data.hex()
+                byte_list = " ".join(f"0x{b:02x}" for b in data)
+                self._raw_char_data[char_uuid] = hex_str
+                _LOGGER.info(
+                    "STATUS READ %s: hex=%s bytes=[%s] len=%d",
+                    char_uuid, hex_str, byte_list, len(data),
+                )
+            except (BleakError, OSError) as err:
+                _LOGGER.debug("Failed to read %s: %s", char_uuid, err)
+
+        if self._status_char:
+            try:
+                data = await self._client.read_gatt_char(self._status_char)
+                self._parse_status_data(bytearray(data))
+            except (BleakError, OSError) as err:
+                _LOGGER.warning("Failed to read primary status: %s", err)
 
     async def _write_command(self, command: bytes) -> bool:
         if not await self._ensure_connected():
+            self._last_write_result = "Niet verbonden"
             _LOGGER.warning("Cannot send command: not connected")
             return False
 
         if not self._control_char:
+            self._last_write_result = "Geen schrijfbaar kenmerk gevonden"
             _LOGGER.warning("No control characteristic discovered")
             return False
 
         try:
             await self._client.write_gatt_char(self._control_char, command)
-            _LOGGER.debug("Sent command: %s", command.hex())
+            hex_str = command.hex()
+            self._last_write_result = f"OK: {hex_str} -> {self._control_char}"
+            _LOGGER.info("Sent command: %s to %s", hex_str, self._control_char)
             return True
         except (BleakError, OSError) as err:
+            self._last_write_result = f"FOUT: {err}"
             _LOGGER.error("Failed to send command: %s", err)
             self._last_error_message = f"Commando mislukt: {err}"
             self._is_connected = False

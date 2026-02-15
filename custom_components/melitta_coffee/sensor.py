@@ -92,6 +92,17 @@ class MelittaStatusSensor(MelittaBaseSensor):
     def native_value(self) -> str:
         return self.STATUS_TRANSLATIONS.get(self._device.status, self._device.status)
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        attrs = {
+            "status_intern": self._device.status,
+        }
+        if self._device.status_raw:
+            attrs["ruwe_data"] = self._device.status_raw
+        if self._device.last_raw_status_hex:
+            attrs["laatste_hex"] = self._device.last_raw_status_hex
+        return attrs
+
 
 class MelittaWaterLevelSensor(MelittaBaseSensor):
 
@@ -111,9 +122,11 @@ class MelittaWaterLevelSensor(MelittaBaseSensor):
 
     @property
     def native_value(self) -> str:
-        return self.LEVEL_TRANSLATIONS.get(
-            self._device.water_level, self._device.water_level
-        )
+        level = self._device.water_level
+        translated = self.LEVEL_TRANSLATIONS.get(level)
+        if translated:
+            return translated
+        return level
 
 
 class MelittaBeanLevelSensor(MelittaBaseSensor):
@@ -134,9 +147,11 @@ class MelittaBeanLevelSensor(MelittaBaseSensor):
 
     @property
     def native_value(self) -> str:
-        return self.LEVEL_TRANSLATIONS.get(
-            self._device.bean_level, self._device.bean_level
-        )
+        level = self._device.bean_level
+        translated = self.LEVEL_TRANSLATIONS.get(level)
+        if translated:
+            return translated
+        return level
 
 
 class MelittaErrorSensor(MelittaBaseSensor):
@@ -231,6 +246,13 @@ class MelittaLastErrorSensor(MelittaBaseSensor):
     def native_value(self) -> str | None:
         return self._device.last_error_message or "Geen"
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        attrs = {}
+        if self._device.last_write_result:
+            attrs["laatste_schrijfresultaat"] = self._device.last_write_result
+        return attrs
+
 
 class MelittaBleDiscoverySensor(MelittaBaseSensor):
 
@@ -257,8 +279,35 @@ class MelittaBleDiscoverySensor(MelittaBaseSensor):
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {
+        attrs = {
             "volledige_info": self._device.discovered_services_info,
             "services_gevonden": self._device.services_discovered,
             "mac_adres": self._device.address,
         }
+
+        raw_data = self._device.raw_char_data
+        if raw_data:
+            attrs["ruwe_kenmerk_data"] = raw_data
+            for uuid, hex_val in raw_data.items():
+                short_uuid = uuid.split("-")[0] if "-" in uuid else uuid
+                attrs[f"char_{short_uuid}"] = hex_val
+
+        notifications = self._device.raw_notifications
+        if notifications:
+            attrs["aantal_notificaties"] = len(notifications)
+            recent = notifications[-10:] if len(notifications) > 10 else notifications
+            for i, notif in enumerate(recent):
+                idx = len(notifications) - len(recent) + i
+                attrs[f"notificatie_{idx}"] = f"{notif['time']} {notif['sender']}: {notif['hex']}"
+
+            if notifications:
+                last = notifications[-1]
+                attrs["laatste_notificatie_hex"] = last["hex"]
+                attrs["laatste_notificatie_bytes"] = last["bytes"]
+                attrs["laatste_notificatie_tijd"] = last["time"]
+                attrs["laatste_notificatie_bron"] = last["sender"]
+
+        if self._device.last_write_result:
+            attrs["laatste_schrijfresultaat"] = self._device.last_write_result
+
+        return attrs
