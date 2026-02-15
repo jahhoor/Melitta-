@@ -3,9 +3,26 @@
     "step": {
       "user": {
         "title": "Melitta Coffee Machine",
-        "description": "Add your Melitta coffee machine. If no devices are found, you can enter the Bluetooth MAC address manually.",
+        "description": "Choose how to add your Melitta coffee machine.",
+        "menu_options": {
+          "scan": "Automatically scan for devices",
+          "manual": "Enter MAC address manually"
+        }
+      },
+      "scan": {
+        "title": "Scan for Melitta",
+        "description": "Select your Melitta coffee machine from the discovered devices.",
         "data": {
-          "mac_address": "MAC address",
+          "mac_address": "Discovered device",
+          "device_name": "Device name",
+          "model": "Model"
+        }
+      },
+      "manual": {
+        "title": "Manual setup",
+        "description": "Enter the Bluetooth MAC address of your Melitta coffee machine. You can find this in the Melitta Connect app under device settings.",
+        "data": {
+          "mac_address": "MAC address (e.g. AA:BB:CC:DD:EE:FF)",
           "device_name": "Device name",
           "model": "Model"
         }
@@ -18,6 +35,10 @@
           "model": "Model"
         }
       }
+    },
+    "error": {
+      "no_devices_found": "No Melitta devices found. Make sure your coffee machine is on and Bluetooth is active.",
+      "invalid_mac": "Invalid MAC address. Use the format AA:BB:CC:DD:EE:FF."
     },
     "abort": {
       "already_configured": "This device is already configured."

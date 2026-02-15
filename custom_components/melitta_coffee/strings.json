@@ -3,9 +3,26 @@
     "step": {
       "user": {
         "title": "Melitta Koffiezetapparaat",
-        "description": "Voeg je Melitta koffiezetapparaat toe. Als er geen apparaten gevonden zijn, kun je het Bluetooth MAC-adres handmatig invoeren.",
+        "description": "Kies hoe je je Melitta koffiezetapparaat wilt toevoegen.",
+        "menu_options": {
+          "scan": "Automatisch scannen naar apparaten",
+          "manual": "MAC-adres handmatig invoeren"
+        }
+      },
+      "scan": {
+        "title": "Melitta scannen",
+        "description": "Selecteer je Melitta koffiezetapparaat uit de gevonden apparaten.",
         "data": {
-          "mac_address": "MAC-adres",
+          "mac_address": "Gevonden apparaat",
+          "device_name": "Naam apparaat",
+          "model": "Model"
+        }
+      },
+      "manual": {
+        "title": "Handmatig toevoegen",
+        "description": "Voer het Bluetooth MAC-adres van je Melitta koffiezetapparaat in. Je vindt dit in de Melitta Connect app bij de apparaatinstellingen.",
+        "data": {
+          "mac_address": "MAC-adres (bijv. AA:BB:CC:DD:EE:FF)",
           "device_name": "Naam apparaat",
           "model": "Model"
         }
@@ -18,6 +35,10 @@
           "model": "Model"
         }
       }
+    },
+    "error": {
+      "no_devices_found": "Geen Melitta apparaten gevonden. Zorg dat je koffiezetapparaat aan staat en Bluetooth actief is.",
+      "invalid_mac": "Ongeldig MAC-adres. Gebruik het formaat AA:BB:CC:DD:EE:FF."
     },
     "abort": {
       "already_configured": "Dit apparaat is al geconfigureerd."
