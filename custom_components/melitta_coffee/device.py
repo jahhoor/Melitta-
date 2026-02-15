@@ -31,6 +31,7 @@ from .const import (
     CMD_NACK,
     KEEPALIVE_INTERVAL,
     SBOX,
+    RC4_KEY,
     PROCESS_MAP,
     SUBPROCESS_MAP,
     MANIPULATION_MAP,
@@ -80,26 +81,56 @@ def _compute_checksum(frame_bytes: bytes, length: int) -> int:
     return (~total) & 0xFF
 
 
-def _build_frame(cmd_id: str, payload: bytes = b"", require_auth: bool = False) -> bytes:
+def _rc4_crypt(data: bytearray, offset: int, length: int) -> None:
+    key = RC4_KEY
+    key_len = len(key)
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = ((j + s[i]) + key[i % key_len] + 256) % 256
+        s[i], s[j] = s[j], s[i]
+    i = 0
+    j = 0
+    for k in range(length):
+        i = (i + 1) % 256
+        si = s[i]
+        j = ((j + si) + 256) % 256
+        sj = s[j]
+        s[i] = sj
+        s[j] = si
+        data[offset + k] ^= s[((si + sj) + 256) % 256]
+
+
+def _build_frame(cmd_id: str, payload: bytes = b"", session_key: bytes | None = None, encrypt: bool = False) -> bytes:
     cmd_bytes = cmd_id.encode("latin-1")
+    cmd_len = len(cmd_bytes)
     frame = bytearray()
     frame.append(FRAME_START)
     frame.extend(cmd_bytes)
+    if session_key and len(session_key) == 2:
+        frame.extend(session_key)
     if payload:
         frame.extend(payload)
     checksum = _compute_checksum(frame, len(frame))
     frame.append(checksum)
     frame.append(FRAME_END)
+
+    if encrypt:
+        encrypt_start = cmd_len + 1
+        encrypt_len = len(frame) - cmd_len - 2
+        _rc4_crypt(frame, encrypt_start, encrypt_len)
+
     return bytes(frame)
 
 
 class EfComParser:
 
-    def __init__(self, on_frame: Callable):
+    def __init__(self, on_frame: Callable, encrypted: bool = False):
         self._buffer = bytearray(FRAME_MAX_SIZE)
         self._pos = 0
         self._on_frame = on_frame
         self._known_commands: dict[str, list[int]] = {}
+        self._encrypted = encrypted
 
     def register_command(self, cmd_id: str, payload_length: int | list[int]) -> None:
         if isinstance(payload_length, list):
@@ -140,19 +171,37 @@ class EfComParser:
                 for expected_len in expected_lens:
                     total = len(cmd_id) + 1 + expected_len + 2
                     if total == self._pos:
-                        payload_start = len(cmd_id) + 1
+                        cmd_len = len(cmd_id)
+                        work_buf = bytearray(self._buffer[:self._pos])
+
+                        if self._encrypted:
+                            decrypt_start = cmd_len + 1
+                            decrypt_len = self._pos - cmd_len - 2
+                            if decrypt_len > 0:
+                                _rc4_crypt(work_buf, decrypt_start, decrypt_len)
+
                         checksum_pos = self._pos - 2
-                        expected_checksum = _compute_checksum(self._buffer, checksum_pos)
-                        if self._buffer[checksum_pos] == expected_checksum:
-                            payload = bytes(self._buffer[payload_start:payload_start + expected_len])
+                        expected_checksum = _compute_checksum(work_buf, checksum_pos)
+                        if work_buf[checksum_pos] == expected_checksum:
+                            payload_start = cmd_len + 1
+                            payload = bytes(work_buf[payload_start:payload_start + expected_len])
                             self._on_frame(cmd_id, payload)
+                            self._reset()
+                            return
                         else:
+                            if self._encrypted:
+                                _LOGGER.debug(
+                                    "Encrypted frame checksum mismatch for %s (false end marker?) - continuing",
+                                    cmd_id,
+                                )
+                                self._buffer[self._pos - 1] = byte_val
+                                return
                             _LOGGER.debug(
                                 "Checksum mismatch for %s: expected 0x%02x got 0x%02x",
-                                cmd_id, expected_checksum, self._buffer[checksum_pos],
+                                cmd_id, expected_checksum, work_buf[checksum_pos],
                             )
-                        self._reset()
-                        return
+                            self._reset()
+                            return
                     if total > self._pos:
                         matched = True
 
@@ -226,7 +275,7 @@ class MelittaDevice:
         self._write_char: str | None = None
 
         self._rx_buffer = bytearray()
-        self._parser = EfComParser(self._on_efcom_frame)
+        self._parser = EfComParser(self._on_efcom_frame, encrypted=True)
         self._register_known_commands()
 
     def _register_known_commands(self) -> None:
@@ -542,7 +591,7 @@ class MelittaDevice:
 
     async def _request_initial_status(self) -> None:
         try:
-            frame = _build_frame(CMD_STATUS, b"")
+            frame = _build_frame(CMD_STATUS, b"", session_key=self._session_key, encrypt=True)
             await self._send_raw(frame)
             _LOGGER.debug("Initial status request sent")
         except Exception as err:
@@ -657,20 +706,34 @@ class MelittaDevice:
             return
 
         self._auth_event = asyncio.Event()
-        self._auth_challenge = None
-        self._machine_challenge = None
-        self._auth_phase = "waiting_machine_challenge"
+        self._auth_challenge = os.urandom(4)
+        self._auth_phase = "waiting_auth_response"
+
+        challenge_hash = _sbox_hash(self._auth_challenge)
+        auth_payload = self._auth_challenge + challenge_hash
 
         _LOGGER.info(
-            "Waiting for machine auth challenge from %s (up to 60s)...",
+            "Sending client auth challenge to %s: %s (hash: %s)",
             self._address,
+            self._auth_challenge.hex(),
+            challenge_hash.hex(),
         )
 
+        frame = _build_frame(CMD_AUTH, auth_payload, encrypt=True)
         try:
-            await asyncio.wait_for(self._auth_event.wait(), timeout=60.0)
+            await self._send_raw(frame)
+            _LOGGER.debug("Auth challenge sent (RC4 encrypted), frame: %s", frame.hex())
+        except (BleakError, OSError) as err:
+            _LOGGER.warning("Failed to send auth challenge: %s", err)
+            self._authenticated = False
+            self._last_error_message = f"Auth challenge verzenden mislukt: {err}"
+            return
+
+        try:
+            await asyncio.wait_for(self._auth_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             _LOGGER.warning(
-                "Authentication timeout: machine did not send challenge within 60s for %s. "
+                "Authentication timeout: no response within 10s from %s. "
                 "Make sure the machine is in 'Verbinden' (connect) mode.",
                 self._address,
             )
@@ -685,83 +748,28 @@ class MelittaDevice:
             self._auth_phase, len(payload), payload.hex(),
         )
 
-        if self._auth_phase == "waiting_machine_challenge":
-            self._handle_machine_challenge(payload)
-        elif self._auth_phase == "waiting_session_key":
-            self._handle_session_key_response(payload)
+        if self._auth_phase == "waiting_auth_response":
+            self._process_auth_response(payload)
         else:
-            _LOGGER.warning("Unexpected auth frame in phase %s — failing auth", self._auth_phase)
-            self._authenticated = False
-            if self._auth_event:
-                self._auth_event.set()
+            _LOGGER.debug("Auth frame in phase %s (len=%d) - ignoring", self._auth_phase, len(payload))
 
-    def _handle_machine_challenge(self, payload: bytes) -> None:
-        if len(payload) not in (4, 6):
+    def _process_auth_response(self, payload: bytes) -> None:
+        if len(payload) != 8:
             _LOGGER.warning(
-                "Unexpected machine challenge length: %d bytes (expected 4 or 6)",
+                "Unexpected auth response length: %d bytes (expected 8)",
                 len(payload),
             )
-            self._authenticated = False
-            if self._auth_event:
-                self._auth_event.set()
-            return
-
-        machine_challenge = payload[0:4]
-        self._machine_challenge = machine_challenge
-
-        if len(payload) == 6:
-            machine_hash = payload[4:6]
-            expected_hash = _sbox_hash(machine_challenge)
-            if machine_hash != expected_hash:
-                _LOGGER.warning(
-                    "Machine challenge hash mismatch: got %s expected %s — aborting auth",
-                    machine_hash.hex(), expected_hash.hex(),
-                )
-                self._authenticated = False
-                self._last_error_message = "Machine authenticatie hash ongeldig"
-                if self._auth_event:
-                    self._auth_event.set()
+            if len(payload) == 6:
+                _LOGGER.debug("Got 6-byte auth frame - may be machine's own challenge, retrying...")
                 return
-
-        _LOGGER.info("Received machine challenge: %s", machine_challenge.hex())
-
-        self._auth_challenge = os.urandom(4)
-        response_data = machine_challenge + self._auth_challenge
-        response_hash = _sbox_hash(response_data)
-        response_payload = response_data + response_hash
-
-        self._auth_phase = "waiting_session_key"
-
-        frame = _build_frame(CMD_AUTH, response_payload)
-
-        if self._hass:
-            self._hass.async_create_task(self._send_auth_response(frame))
-        else:
-            asyncio.ensure_future(self._send_auth_response(frame))
-
-    async def _send_auth_response(self, frame: bytes) -> None:
-        try:
-            await self._send_raw(frame)
-            _LOGGER.debug("Auth response sent, waiting for session key...")
-        except (BleakError, OSError) as err:
-            _LOGGER.warning("Failed to send auth response: %s", err)
-            self._authenticated = False
-            self._last_error_message = f"Auth antwoord verzenden mislukt: {err}"
-            if self._auth_event:
-                self._auth_event.set()
-
-    def _handle_session_key_response(self, payload: bytes) -> None:
-        if len(payload) not in (6, 8):
-            _LOGGER.warning(
-                "Unexpected session key response length: %d bytes (expected 6 or 8)",
-                len(payload),
-            )
             self._authenticated = False
             if self._auth_event:
                 self._auth_event.set()
             return
 
         echo = payload[0:4]
+        session_key = payload[4:6]
+        response_hash = payload[6:8]
 
         if self._auth_challenge and echo != self._auth_challenge:
             _LOGGER.warning(
@@ -773,23 +781,22 @@ class MelittaDevice:
                 self._auth_event.set()
             return
 
-        session_key = payload[4:6]
-
-        if len(payload) == 8:
-            response_hash = payload[6:8]
-            verify_data = payload[0:6]
-            expected_hash = _sbox_hash(verify_data)
-            if response_hash != expected_hash:
-                _LOGGER.warning("Session key hash verification failed")
-                self._authenticated = False
-                if self._auth_event:
-                    self._auth_event.set()
-                return
+        verify_data = payload[0:6]
+        expected_hash = _sbox_hash(verify_data)
+        if response_hash != expected_hash:
+            _LOGGER.warning(
+                "Auth response hash verification failed: got %s expected %s",
+                response_hash.hex(), expected_hash.hex(),
+            )
+            self._authenticated = False
+            if self._auth_event:
+                self._auth_event.set()
+            return
 
         self._session_key = session_key
         self._authenticated = True
         self._auth_phase = "authenticated"
-        _LOGGER.info("Authentication successful, session key: %s", session_key.hex())
+        _LOGGER.info("Authentication successful! Session key: %s", session_key.hex())
 
         if self._auth_event:
             self._auth_event.set()
@@ -893,7 +900,7 @@ class MelittaDevice:
                 await asyncio.sleep(KEEPALIVE_INTERVAL)
                 if self._is_connected and self._authenticated:
                     try:
-                        frame = _build_frame(CMD_KEEPALIVE)
+                        frame = _build_frame(CMD_KEEPALIVE, session_key=self._session_key, encrypt=True)
                         await self._send_raw(frame)
                         _LOGGER.debug("Keepalive sent")
                     except Exception as err:
@@ -915,7 +922,7 @@ class MelittaDevice:
             self._last_write_result = "Niet verbonden"
             return False
 
-        frame = _build_frame(cmd_id, payload)
+        frame = _build_frame(cmd_id, payload, session_key=self._session_key, encrypt=True)
         self._ack_event = asyncio.Event()
 
         try:
@@ -1073,7 +1080,7 @@ class MelittaDevice:
             await self.connect()
         elif self._authenticated:
             try:
-                frame = _build_frame(CMD_STATUS, b"")
+                frame = _build_frame(CMD_STATUS, b"", session_key=self._session_key, encrypt=True)
                 await self._send_raw(frame)
             except Exception as err:
                 _LOGGER.debug("Status poll failed: %s", err)
