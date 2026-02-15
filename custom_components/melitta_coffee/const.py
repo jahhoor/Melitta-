@@ -5,6 +5,7 @@ CONF_MODEL = "model"
 
 DEFAULT_NAME = "Melitta Koffiezetapparaat"
 
+MELITTA_SERVICE_UUID = "0000ad01-b35c-11e4-9813-0002a5d5c51b"
 MELITTA_READ_CHAR_UUID = "0000ad02-b35c-11e4-9813-0002a5d5c51b"
 MELITTA_WRITE_CHAR_UUID = "0000ad03-b35c-11e4-9813-0002a5d5c51b"
 
@@ -268,19 +269,31 @@ STRENGTH_MAP = {
 STRENGTH_NAMES = {v: k for k, v in STRENGTH_MAP.items()}
 
 DEFAULT_RECIPES = {
-    "espresso":          {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 40},
-    "ristretto":         {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.STRONG, "portion": 25},
-    "lungo":             {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 120},
-    "espresso_doppio":   {"process": RecipeProcess.COFFEE, "shots": Shots.TWO, "intensity": Intensity.MEDIUM, "portion": 80},
-    "cafe_creme":        {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 120},
-    "cappuccino":        {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 40},
-    "caffe_latte":       {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 40},
-    "latte_macchiato":   {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 40},
-    "flat_white":        {"process": RecipeProcess.COFFEE, "shots": Shots.TWO, "intensity": Intensity.STRONG, "portion": 40},
-    "americano":         {"process": RecipeProcess.COFFEE, "shots": Shots.ONE, "intensity": Intensity.MEDIUM, "portion": 40},
-    "hot_water":         {"process": RecipeProcess.WATER,  "shots": Shots.NONE, "intensity": Intensity.MEDIUM, "portion": 200},
-    "milk":              {"process": RecipeProcess.STEAM,  "shots": Shots.NONE, "intensity": Intensity.MEDIUM, "portion": 100},
-    "milk_froth":        {"process": RecipeProcess.STEAM,  "shots": Shots.NONE, "intensity": Intensity.MEDIUM, "portion": 100},
+    "espresso":               {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "ristretto":              {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.STRONG, "portion": 25},
+    "lungo":                  {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 120},
+    "espresso_doppio":        {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 80},
+    "ristretto_doppio":       {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.STRONG, "portion": 50},
+    "cafe_creme":             {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 120},
+    "cafe_creme_doppio":      {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 240},
+    "americano":              {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "americano_extra":        {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "long_black":             {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "red_eye":                {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.STRONG, "portion": 120},
+    "black_eye":              {"process": RecipeProcess.COFFEE, "shots": Shots.THREE, "intensity": Intensity.STRONG, "portion": 120},
+    "dead_eye":               {"process": RecipeProcess.COFFEE, "shots": Shots.THREE, "intensity": Intensity.VERY_STRONG, "portion": 120},
+    "cappuccino":             {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "espresso_macchiato":     {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "caffe_latte":            {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "cafe_au_lait":           {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MILD,   "portion": 60},
+    "flat_white":             {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.STRONG, "portion": 40},
+    "latte_macchiato":        {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "latte_macchiato_extra":  {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 40},
+    "latte_macchiato_triple": {"process": RecipeProcess.COFFEE, "shots": Shots.THREE, "intensity": Intensity.MEDIUM, "portion": 40},
+    "milk":                   {"process": RecipeProcess.STEAM,  "shots": Shots.NONE,  "intensity": Intensity.MEDIUM, "portion": 100},
+    "milk_froth":             {"process": RecipeProcess.STEAM,  "shots": Shots.NONE,  "intensity": Intensity.MEDIUM, "portion": 100},
+    "hot_water":              {"process": RecipeProcess.WATER,  "shots": Shots.NONE,  "intensity": Intensity.MEDIUM, "portion": 200},
+    "freestyle":              {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
 }
 
 SCAN_INTERVAL = 30

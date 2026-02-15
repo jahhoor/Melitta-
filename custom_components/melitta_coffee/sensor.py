@@ -298,7 +298,7 @@ class MelittaBleDiscoverySensor(MelittaBaseSensor):
             lines = info.split("\n")
             summary_parts = []
             for line in lines:
-                if line.startswith("Geselecteerd") or line.startswith("Schrijfbare") or line.startswith("Leesbare") or line.startswith("Notificatie"):
+                if line.startswith("Leesbare") or line.startswith("Schrijfbare"):
                     summary_parts.append(line)
             if summary_parts:
                 return " | ".join(summary_parts)

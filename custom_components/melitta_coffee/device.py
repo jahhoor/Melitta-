@@ -10,6 +10,7 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
 from .const import (
+    MELITTA_SERVICE_UUID,
     MELITTA_READ_CHAR_UUID,
     MELITTA_WRITE_CHAR_UUID,
     FRAME_START,
@@ -130,22 +131,41 @@ class EfComParser:
         except Exception:
             cmd1 = None
 
+        matched = False
         for cmd_id, expected_len in self._known_commands.items():
             if cmd_id == cmd2 or cmd_id == cmd1:
                 total = len(cmd_id) + 1 + expected_len + 2
                 if total == self._pos:
-                    check = _compute_checksum(self._buffer, self._pos - 2)
-                    if check == 0 or True:
-                        payload_start = len(cmd_id) + 1
+                    payload_start = len(cmd_id) + 1
+                    checksum_pos = self._pos - 2
+                    expected_checksum = _compute_checksum(self._buffer, checksum_pos)
+                    if self._buffer[checksum_pos] == expected_checksum:
                         payload = bytes(self._buffer[payload_start:payload_start + expected_len])
                         self._on_frame(cmd_id, payload)
+                    else:
+                        _LOGGER.debug(
+                            "Checksum mismatch for %s: expected 0x%02x got 0x%02x",
+                            cmd_id, expected_checksum, self._buffer[checksum_pos],
+                        )
                     self._reset()
                     return
+                if total > self._pos:
+                    matched = True
 
-        self._reset()
+        if not matched:
+            self._resync()
 
     def _reset(self) -> None:
         self._pos = 0
+
+    def _resync(self) -> None:
+        for i in range(1, self._pos):
+            if self._buffer[i] == FRAME_START:
+                remaining = self._pos - i
+                self._buffer[0:remaining] = self._buffer[i:self._pos]
+                self._pos = remaining
+                return
+        self._reset()
 
 
 class MelittaDevice:
@@ -516,12 +536,12 @@ class MelittaDevice:
             self._write_char = None
 
             for service in services:
-                svc_desc = service.description or "Unknown"
+                svc_desc = service.description or "Onbekend"
                 info_lines.append(f"Service: {service.uuid} ({svc_desc})")
 
                 for char in service.characteristics:
                     props = ", ".join(char.properties)
-                    info_lines.append(f"  Char: {char.uuid} [{props}]")
+                    info_lines.append(f"  Kenmerk: {char.uuid} [{props}]")
 
                     uuid_lower = char.uuid.lower()
                     if uuid_lower == MELITTA_READ_CHAR_UUID.lower():
@@ -529,8 +549,8 @@ class MelittaDevice:
                     elif uuid_lower == MELITTA_WRITE_CHAR_UUID.lower():
                         self._write_char = char.uuid
 
-            info_lines.append(f"Read char: {self._read_char or 'Not found'}")
-            info_lines.append(f"Write char: {self._write_char or 'Not found'}")
+            info_lines.append(f"Leesbare kenmerk: {self._read_char or 'Niet gevonden'}")
+            info_lines.append(f"Schrijfbare kenmerk: {self._write_char or 'Niet gevonden'}")
             self._discovered_services_info = "\n".join(info_lines)
             self._services_discovered = bool(self._read_char and self._write_char)
 

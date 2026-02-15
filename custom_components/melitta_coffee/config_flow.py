@@ -7,7 +7,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, CONF_MODEL, SUPPORTED_MODELS
+from .const import DOMAIN, CONF_MAC_ADDRESS, CONF_DEVICE_NAME, CONF_MODEL, SUPPORTED_MODELS, MELITTA_SERVICE_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -116,10 +116,18 @@ class MelittaCoffeeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         try:
             from homeassistant.components.bluetooth import async_discovered_service_info
             for discovery_info in async_discovered_service_info(self.hass, connectable=True):
+                if discovery_info.address in current_addresses:
+                    continue
                 name = discovery_info.name or ""
-                if name and discovery_info.address not in current_addresses:
-                    is_melitta = any(kw in name.lower() for kw in MELITTA_KEYWORDS)
-                    label = f"{'* ' if is_melitta else ''}{name}"
+                has_service_uuid = MELITTA_SERVICE_UUID.lower() in [
+                    u.lower() for u in (discovery_info.service_uuids or [])
+                ]
+                is_melitta = has_service_uuid or (
+                    name and any(kw in name.lower() for kw in MELITTA_KEYWORDS)
+                )
+                display_name = name or discovery_info.address
+                label = f"{'* ' if is_melitta else ''}{display_name}"
+                if is_melitta or name:
                     self._discovered_devices[discovery_info.address] = label
         except Exception as err:
             _LOGGER.warning("HA Bluetooth scan failed: %s", err)
