@@ -56,6 +56,7 @@ class MelittaDevice:
         self._disconnect_in_progress = False
         self._suppress_disconnect_callback = False
         self._notify_mode = "notifications"
+        self._notifications_active = False
         self._polling_task: asyncio.Task | None = None
         self._last_status_data: bytes | None = None
         self._strength: int = 2
@@ -471,6 +472,7 @@ class MelittaDevice:
         old_client = self._client
         self._client = None
         self._is_connected = False
+        self._notifications_active = False
         self._stop_polling()
         self._suppress_disconnect_callback = True
         try:
@@ -784,11 +786,11 @@ class MelittaDevice:
                 _LOGGER.warning("Connection lost during settle for %s", self._address)
                 return False
 
-            self._notify_mode = "polling"
             self._status = "authenticating"
             self._notify_callbacks()
 
-            await self._write_cccd_descriptor()
+            notifications_ok = await self._enable_notifications()
+            self._notify_mode = "notifications" if notifications_ok else "polling"
 
             if not self._shutting_down:
                 await self._authenticate()
@@ -799,6 +801,13 @@ class MelittaDevice:
 
             if self._authenticated:
                 self._status = "ready"
+                if self._notifications_active:
+                    _LOGGER.warning(
+                        "Auth succeeded with notifications. Switching to polling mode "
+                        "to avoid D-Bus stability issues.",
+                    )
+                    await self._stop_notifications()
+                self._notify_mode = "polling"
                 _LOGGER.info(
                     "Starting background polling on %s AFTER successful auth",
                     BLE_READ_UUID,
@@ -814,6 +823,9 @@ class MelittaDevice:
                     "machine may need pairing button press",
                     self._address,
                 )
+                if self._notifications_active:
+                    await self._stop_notifications()
+                self._notify_mode = "polling"
                 _LOGGER.info("Starting polling despite auth failure (for retry)")
                 self._polling_task = asyncio.ensure_future(self._start_polling())
 
@@ -905,52 +917,39 @@ class MelittaDevice:
         _LOGGER.warning("Device %s not rediscovered within %.0fs", self._address, timeout)
         return False
 
-    async def _write_cccd_descriptor(self):
+    async def _enable_notifications(self):
         if not self._client or not self._is_connected:
-            _LOGGER.warning("Cannot write CCCD: no client/connection")
-            return
-
-        CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
-        ENABLE_NOTIFICATIONS = bytes([0x01, 0x00])
+            _LOGGER.warning("Cannot enable notifications: no client/connection")
+            return False
 
         try:
-            services = self._client.services
-            read_char = None
-            for service in services:
-                for char in service.characteristics:
-                    if char.uuid.lower() == BLE_READ_UUID.lower():
-                        read_char = char
-                        break
-                if read_char:
-                    break
-
-            if read_char is None:
-                _LOGGER.warning("CCCD: read characteristic %s not found in services", BLE_READ_UUID)
-                return
-
-            cccd_desc = None
-            for desc in read_char.descriptors:
-                if desc.uuid.lower() == CCCD_UUID.lower():
-                    cccd_desc = desc
-                    break
-
-            if cccd_desc is None:
-                _LOGGER.warning("CCCD: descriptor 0x2902 not found on read characteristic")
-                return
-
-            await self._client.write_gatt_descriptor(cccd_desc.handle, ENABLE_NOTIFICATIONS)
+            await self._client.start_notify(BLE_READ_UUID, self._on_notification)
+            self._notifications_active = True
             _LOGGER.warning(
-                "CCCD: wrote 0x0100 to descriptor 0x2902 (handle=%d) on %s - "
-                "machine should now accept auth commands",
-                cccd_desc.handle, BLE_READ_UUID,
+                "NOTIFICATIONS ENABLED on %s via start_notify() - "
+                "CCCD 0x2902 written by BlueZ, machine should accept auth commands",
+                BLE_READ_UUID,
             )
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
+            return True
 
         except Exception as err:
             _LOGGER.warning(
-                "CCCD write failed (non-fatal, will try auth anyway): %s: %s",
+                "start_notify failed (will try auth with polling anyway): %s: %s",
                 type(err).__name__, err,
             )
+            self._notifications_active = False
+            return False
+
+    async def _stop_notifications(self):
+        if not self._notifications_active or not self._client:
+            return
+        try:
+            await self._client.stop_notify(BLE_READ_UUID)
+            _LOGGER.warning("NOTIFICATIONS STOPPED on %s", BLE_READ_UUID)
+        except Exception as err:
+            _LOGGER.debug("stop_notify failed (non-fatal): %s", err)
+        self._notifications_active = False
 
     async def _authenticate(self):
         self._auth_challenge = os.urandom(4)
@@ -1044,13 +1043,46 @@ class MelittaDevice:
         if client is None:
             return False
 
+        if self._notifications_active:
+            return await self._wait_for_auth_via_notifications(desc)
+        else:
+            return await self._wait_for_auth_via_polling(desc)
+
+    async def _wait_for_auth_via_notifications(self, desc: str) -> bool:
+        _LOGGER.warning(
+            "AUTH WAIT (notifications): waiting up to %.1fs for auth response on %s",
+            AUTH_TIMEOUT, BLE_READ_UUID,
+        )
+
+        try:
+            await asyncio.wait_for(self._auth_event.wait(), timeout=AUTH_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+
+        if self._authenticated or self._auth_event.is_set():
+            _LOGGER.warning("AUTH WAIT: auth response received via notification!")
+            return True
+
+        _LOGGER.warning(
+            "AUTH WAIT (notifications): no auth response within %.1fs, "
+            "trying polling fallback",
+            AUTH_TIMEOUT,
+        )
+        return await self._wait_for_auth_via_polling(desc, short=True)
+
+    async def _wait_for_auth_via_polling(self, desc: str, short: bool = False) -> bool:
+        client = self._client
+        if client is None:
+            return False
+
         poll_interval = 0.15
-        max_polls = int(AUTH_TIMEOUT / poll_interval)
+        timeout = 3.0 if short else AUTH_TIMEOUT
+        max_polls = int(timeout / poll_interval)
         last_data = None
 
         _LOGGER.warning(
             "AUTH POLL: reading %s every %.0fms for up to %.1fs (%d reads max)",
-            BLE_READ_UUID, poll_interval * 1000, AUTH_TIMEOUT, max_polls,
+            BLE_READ_UUID, poll_interval * 1000, timeout, max_polls,
         )
 
         for i in range(max_polls):
@@ -1095,7 +1127,7 @@ class MelittaDevice:
 
             await asyncio.sleep(poll_interval)
 
-        _LOGGER.warning("AUTH POLL: no auth response after %d reads (%.1fs)", max_polls, AUTH_TIMEOUT)
+        _LOGGER.warning("AUTH POLL: no auth response after %d reads (%.1fs)", max_polls, timeout)
         return False
 
     def _start_keepalive(self):
