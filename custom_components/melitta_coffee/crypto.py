@@ -3,14 +3,13 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.backends import default_backend
 from .const import (
-    AES_KEY, AES_ENCRYPTED_DATA, IV_INIT,
+    AES_ENCRYPTED_DATA, IV_INIT,
     RC4_KEY_PART_A, RC4_KEY_PART_B, SBOX,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 _RC4_KEY_CACHE = None
-_RC4_KEY_ALT_CACHE = None
 
 
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
@@ -48,44 +47,6 @@ def get_rc4_key() -> bytes:
     _RC4_KEY_CACHE = rc4_key
     _LOGGER.info("RC4 key derived (primary): %d bytes", len(rc4_key))
     _LOGGER.debug("RC4 primary key hex [SENSITIVE]: %s", rc4_key.hex())
-    return rc4_key
-
-
-def get_rc4_key_alt() -> bytes:
-    global _RC4_KEY_ALT_CACHE
-    if _RC4_KEY_ALT_CACHE is not None:
-        return _RC4_KEY_ALT_CACHE
-
-    compound_key = RC4_KEY_PART_B + RC4_KEY_PART_A
-
-    _LOGGER.debug(
-        "Deriving ALT RC4 key: AES_KEY=%d bytes, compound_key=%d bytes",
-        len(AES_KEY), len(compound_key),
-    )
-
-    try:
-        _LOGGER.debug("Alt key step 1: AES-CBC decrypt with AES_KEY")
-        intermediate = _aes_cbc_decrypt(AES_KEY, IV_INIT, AES_ENCRYPTED_DATA)
-        _LOGGER.debug("Alt key step 1 result: %d bytes, hex=%s", len(intermediate), intermediate.hex())
-
-        if len(intermediate) % 16 != 0:
-            _LOGGER.warning(
-                "Alt key step 1 produced %d bytes (not block-aligned), using raw 48-byte output",
-                len(intermediate),
-            )
-            cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(IV_INIT), backend=default_backend())
-            decryptor = cipher.decryptor()
-            intermediate = decryptor.update(AES_ENCRYPTED_DATA) + decryptor.finalize()
-
-        _LOGGER.debug("Alt key step 2: AES-CBC decrypt intermediate with compound_key")
-        rc4_key = _aes_cbc_decrypt(compound_key, IV_INIT, intermediate)
-    except Exception as err:
-        _LOGGER.error("Alt RC4 key derivation failed: %s, falling back to primary", err)
-        return get_rc4_key()
-
-    _RC4_KEY_ALT_CACHE = rc4_key
-    _LOGGER.info("RC4 key derived (alt): %d bytes", len(rc4_key))
-    _LOGGER.debug("RC4 alt key hex [SENSITIVE]: %s", rc4_key.hex())
     return rc4_key
 
 

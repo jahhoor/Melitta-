@@ -788,6 +788,8 @@ class MelittaDevice:
             self._status = "authenticating"
             self._notify_callbacks()
 
+            await self._write_cccd_descriptor()
+
             if not self._shutting_down:
                 await self._authenticate()
 
@@ -902,6 +904,53 @@ class MelittaDevice:
 
         _LOGGER.warning("Device %s not rediscovered within %.0fs", self._address, timeout)
         return False
+
+    async def _write_cccd_descriptor(self):
+        if not self._client or not self._is_connected:
+            _LOGGER.warning("Cannot write CCCD: no client/connection")
+            return
+
+        CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+        ENABLE_NOTIFICATIONS = bytes([0x01, 0x00])
+
+        try:
+            services = self._client.services
+            read_char = None
+            for service in services:
+                for char in service.characteristics:
+                    if char.uuid.lower() == BLE_READ_UUID.lower():
+                        read_char = char
+                        break
+                if read_char:
+                    break
+
+            if read_char is None:
+                _LOGGER.warning("CCCD: read characteristic %s not found in services", BLE_READ_UUID)
+                return
+
+            cccd_desc = None
+            for desc in read_char.descriptors:
+                if desc.uuid.lower() == CCCD_UUID.lower():
+                    cccd_desc = desc
+                    break
+
+            if cccd_desc is None:
+                _LOGGER.warning("CCCD: descriptor 0x2902 not found on read characteristic")
+                return
+
+            await self._client.write_gatt_descriptor(cccd_desc.handle, ENABLE_NOTIFICATIONS)
+            _LOGGER.warning(
+                "CCCD: wrote 0x0100 to descriptor 0x2902 (handle=%d) on %s - "
+                "machine should now accept auth commands",
+                cccd_desc.handle, BLE_READ_UUID,
+            )
+            await asyncio.sleep(0.2)
+
+        except Exception as err:
+            _LOGGER.warning(
+                "CCCD write failed (non-fatal, will try auth anyway): %s: %s",
+                type(err).__name__, err,
+            )
 
     async def _authenticate(self):
         self._auth_challenge = os.urandom(4)

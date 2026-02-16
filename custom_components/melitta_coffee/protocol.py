@@ -1,6 +1,6 @@
 import logging
 from .const import FRAME_START, FRAME_END, COMMAND_REGISTRY
-from .crypto import rc4_crypt, get_rc4_key, get_rc4_key_alt
+from .crypto import rc4_crypt, get_rc4_key
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,17 +53,21 @@ def build_frame(command: str, session_key: bytes | None, payload: bytes | None, 
     )
 
     if encrypt:
-        encrypt_start = len(cmd_bytes) + 1
-        encrypt_len = pos - len(cmd_bytes)
+        apk_offset = len(cmd_bytes) + 1
+        apk_count = pos - len(cmd_bytes)
+        actual_start = apk_offset + 1
+        actual_count = apk_count
         _LOGGER.debug(
-            "build_frame encrypt: start=%d, len=%d, plaintext_portion=%s",
-            encrypt_start, encrypt_len, bytes(frame[encrypt_start:encrypt_start + encrypt_len]).hex(),
+            "build_frame encrypt (APK off-by-one): apk_offset=%d, apk_count=%d, "
+            "actual_start=%d, actual_count=%d, plaintext_byte_at_%d=0x%02x",
+            apk_offset, apk_count, actual_start, actual_count,
+            apk_offset, frame[apk_offset],
         )
         rc4_key = get_rc4_key()
-        plaintext = bytes(frame[encrypt_start:encrypt_start + encrypt_len])
+        plaintext = bytes(frame[actual_start:actual_start + actual_count])
         encrypted = rc4_crypt(rc4_key, plaintext)
-        for i in range(encrypt_len):
-            frame[encrypt_start + i] = encrypted[i]
+        for i in range(actual_count):
+            frame[actual_start + i] = encrypted[i]
         _LOGGER.debug("build_frame final (encrypted): %s", bytes(frame).hex())
 
     return bytes(frame)
@@ -194,21 +198,41 @@ class EfComParser:
         return None
 
     def _try_decode(self, data: bytes, cmd_str: str, cmd_len: int, payload_len: int, try_encrypted: bool) -> EfComFrame | None:
-        keys_to_try = [get_rc4_key, get_rc4_key_alt] if try_encrypted else [None]
-
-        for key_fn in keys_to_try:
+        if not try_encrypted:
             work = bytearray(data)
-            key_name = "plaintext"
+            chk_pos = self._pos - 2
+            expected_chk = compute_checksum(chk_pos, work)
+            if expected_chk == work[chk_pos]:
+                payload_start = cmd_len + 1
+                payload = bytes(work[payload_start:payload_start + payload_len])
+                _LOGGER.warning("FRAME DECODED: cmd=%r, key=plaintext, payload=%s (%d bytes)", cmd_str, payload.hex(), len(payload))
+                return EfComFrame(cmd_str, payload, False)
+            return None
 
-            if key_fn is not None:
-                key_name = "primary" if key_fn == get_rc4_key else "alt"
-                rc4_key = key_fn()
+        rc4_key = get_rc4_key()
+
+        for mode in ("apk_offbyone", "standard"):
+            work = bytearray(data)
+
+            if mode == "apk_offbyone":
+                apk_offset = cmd_len + 1
+                apk_count = payload_len + 1
+                actual_start = apk_offset + 1
+                actual_count = apk_count
+                if actual_start + actual_count > len(work):
+                    _LOGGER.debug("try_decode %s: range exceeds frame, skipping", mode)
+                    continue
+                encrypted_portion = bytes(work[actual_start:actual_start + actual_count])
+                decrypted = rc4_crypt(rc4_key, encrypted_portion)
+                for i in range(actual_count):
+                    work[actual_start + i] = decrypted[i]
+            else:
                 enc_start = cmd_len + 1
                 enc_len = payload_len + 1
                 encrypted_portion = bytes(work[enc_start:enc_start + enc_len])
                 _LOGGER.debug(
-                    "try_decode cmd=%r %s: enc_start=%d, enc_len=%d, encrypted=%s",
-                    cmd_str, key_name, enc_start, enc_len, encrypted_portion.hex(),
+                    "try_decode cmd=%r standard: enc_start=%d, enc_len=%d",
+                    cmd_str, enc_start, enc_len,
                 )
                 decrypted = rc4_crypt(rc4_key, encrypted_portion)
                 for i in range(enc_len):
@@ -218,13 +242,12 @@ class EfComParser:
             expected_chk = compute_checksum(chk_pos, work)
             _LOGGER.debug(
                 "try_decode cmd=%r %s: checksum computed=0x%02x, in_frame=0x%02x, match=%s",
-                cmd_str, key_name, expected_chk, work[chk_pos], expected_chk == work[chk_pos],
+                cmd_str, mode, expected_chk, work[chk_pos], expected_chk == work[chk_pos],
             )
             if expected_chk == work[chk_pos]:
                 payload_start = cmd_len + 1
-                payload_end = payload_start + payload_len
-                payload = bytes(work[payload_start:payload_end])
-                _LOGGER.warning("FRAME DECODED: cmd=%r, key=%s, payload=%s (%d bytes)", cmd_str, key_name, payload.hex(), len(payload))
-                return EfComFrame(cmd_str, payload, key_fn is not None)
+                payload = bytes(work[payload_start:payload_start + payload_len])
+                _LOGGER.warning("FRAME DECODED: cmd=%r, mode=%s, payload=%s (%d bytes)", cmd_str, mode, payload.hex(), len(payload))
+                return EfComFrame(cmd_str, payload, True)
 
         return None
