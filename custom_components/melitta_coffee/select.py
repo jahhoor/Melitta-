@@ -2,6 +2,7 @@ import logging
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, CONF_MAC_ADDRESS
 from .device import MelittaDevice
@@ -35,12 +36,13 @@ class MelittaStrengthSelect(SelectEntity):
         self._attr_icon = "mdi:coffee"
         self._attr_options = STRENGTH_OPTIONS
         self._attr_current_option = STRENGTH_OPTIONS[device.strength]
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
-            "name": device.name,
-            "manufacturer": "Melitta",
-            "model": "Caffeo Barista",
-        }
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
+            name=device.name,
+            manufacturer="Melitta",
+            model="Caffeo Barista",
+            sw_version="2.0.0",
+        )
         self._remove_callback = None
 
     async def async_added_to_hass(self):
@@ -76,12 +78,13 @@ class MelittaCupsSelect(SelectEntity):
         self._attr_icon = "mdi:cup"
         self._attr_options = CUPS_OPTIONS
         self._attr_current_option = str(device.cups)
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
-            "name": device.name,
-            "manufacturer": "Melitta",
-            "model": "Caffeo Barista",
-        }
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
+            name=device.name,
+            manufacturer="Melitta",
+            model="Caffeo Barista",
+            sw_version="2.0.0",
+        )
         self._remove_callback = None
 
     async def async_added_to_hass(self):

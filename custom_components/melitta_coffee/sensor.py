@@ -2,6 +2,7 @@ import logging
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, CONF_MAC_ADDRESS
 from .device import MelittaDevice
@@ -30,12 +31,13 @@ class MelittaBaseSensor(SensorEntity):
     def __init__(self, device: MelittaDevice, entry: ConfigEntry):
         self._device = device
         self._entry = entry
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
-            "name": device.name,
-            "manufacturer": "Melitta",
-            "model": "Caffeo Barista",
-        }
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
+            name=device.name,
+            manufacturer="Melitta",
+            model="Caffeo Barista",
+            sw_version="2.0.0",
+        )
         self._remove_callback = None
 
     async def async_added_to_hass(self):
@@ -60,6 +62,7 @@ class MelittaStatusSensor(MelittaBaseSensor):
         "ready": "Ready",
         "connected_not_auth": "Connected, waiting for pairing",
         "auth_dropped": "Connection dropped during auth",
+        "waiting_reconnect": "Reconnecting...",
     }
 
     def __init__(self, device: MelittaDevice, entry: ConfigEntry):

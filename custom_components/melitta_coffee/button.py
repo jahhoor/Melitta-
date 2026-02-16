@@ -2,6 +2,7 @@ import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     DOMAIN, CONF_MAC_ADDRESS,
@@ -54,12 +55,13 @@ class MelittaBrewButton(ButtonEntity):
         self._attr_unique_id = f"{entry.data[CONF_MAC_ADDRESS]}_brew_{beverage_type}"
         self._attr_name = f"Brew {bev_name}"
         self._attr_icon = "mdi:coffee"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
-            "name": device.name,
-            "manufacturer": "Melitta",
-            "model": "Caffeo Barista",
-        }
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_MAC_ADDRESS])},
+            name=device.name,
+            manufacturer="Melitta",
+            model="Caffeo Barista",
+            sw_version="2.0.0",
+        )
 
     @property
     def available(self) -> bool:

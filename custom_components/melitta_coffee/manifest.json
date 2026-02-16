@@ -7,7 +7,7 @@
   "documentation": "https://github.com/jahhoor/Melitta-",
   "integration_type": "device",
   "iot_class": "local_push",
-  "requirements": ["bleak>=0.21.0", "cryptography>=41.0.0"],
+  "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.4.0", "cryptography>=41.0.0"],
   "bluetooth": [
     {
       "local_name": "8301*"
