@@ -546,12 +546,108 @@ class MelittaDevice:
             _LOGGER.error("D-Bus connection crashed (EOFError) during StartNotify - BlueZ connection lost")
             return "dbus_crash"
 
+    async def _clear_stale_bluez_notifications(self) -> bool:
+        mac_path = self._address.replace(":", "_").upper()
+        read_uuid_short = BLE_READ_UUID.replace("-", "")
+
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+            import re
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_root = Message(
+                    destination="org.bluez",
+                    path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_root)
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
+
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+
+                    introspect_dev = Message(
+                        destination="org.bluez",
+                        path=device_path,
+                        interface="org.freedesktop.DBus.Introspectable",
+                        member="Introspect",
+                    )
+                    dev_reply = await bus.call(introspect_dev)
+                    if dev_reply.message_type == MessageType.ERROR:
+                        _LOGGER.debug("Device %s not found on %s", device_path, adapter)
+                        continue
+
+                    services = re.findall(r'<node name="(service\w+)"', dev_reply.body[0]) if dev_reply.body else []
+                    for service in services:
+                        service_path = f"{device_path}/{service}"
+                        intro_svc = Message(
+                            destination="org.bluez",
+                            path=service_path,
+                            interface="org.freedesktop.DBus.Introspectable",
+                            member="Introspect",
+                        )
+                        svc_reply = await bus.call(intro_svc)
+                        if svc_reply.message_type == MessageType.ERROR:
+                            continue
+                        chars = re.findall(r'<node name="(char\w+)"', svc_reply.body[0]) if svc_reply.body else []
+                        for char in chars:
+                            char_path = f"{service_path}/{char}"
+                            uuid_msg = Message(
+                                destination="org.bluez",
+                                path=char_path,
+                                interface="org.freedesktop.DBus.Properties",
+                                member="Get",
+                                signature="ss",
+                                body=["org.bluez.GattCharacteristic1", "UUID"],
+                            )
+                            uuid_reply = await bus.call(uuid_msg)
+                            if uuid_reply.message_type == MessageType.ERROR:
+                                continue
+                            char_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
+                            if char_uuid.replace("-", "").lower() == read_uuid_short.lower():
+                                _LOGGER.info(
+                                    "Found stale notification characteristic at %s, sending StopNotify",
+                                    char_path,
+                                )
+                                stop_msg = Message(
+                                    destination="org.bluez",
+                                    path=char_path,
+                                    interface="org.bluez.GattCharacteristic1",
+                                    member="StopNotify",
+                                )
+                                stop_reply = await bus.call(stop_msg)
+                                if stop_reply.message_type == MessageType.ERROR:
+                                    _LOGGER.debug(
+                                        "StopNotify on %s: %s %s",
+                                        char_path, stop_reply.error_name, stop_reply.body,
+                                    )
+                                else:
+                                    _LOGGER.info(
+                                        "StopNotify succeeded on %s - stale notification state cleared",
+                                        char_path,
+                                    )
+                                    return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.debug("dbus_fast not available for StopNotify")
+        except Exception as err:
+            _LOGGER.debug("D-Bus StopNotify failed: %s (%s)", err, type(err).__name__)
+
+        return False
+
     async def _remove_device_from_bluez(self) -> bool:
         mac_path = self._address.replace(":", "_").upper()
 
         try:
             from dbus_fast.aio import MessageBus
             from dbus_fast import Message, MessageType, BusType
+            import re
 
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             try:
@@ -562,7 +658,6 @@ class MelittaDevice:
                     member="Introspect",
                 )
                 reply = await bus.call(introspect_msg)
-                import re
                 adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
                 if not adapters:
                     adapters = ["hci0"]
@@ -626,7 +721,7 @@ class MelittaDevice:
         )
         return False
 
-    async def _do_connect(self, _retry_after_bluez_clear: bool = False) -> bool:
+    async def _do_connect(self, _notify_recovery_depth: int = 0) -> bool:
         self._cancel_reconnect()
 
         if self._client is not None:
@@ -635,8 +730,8 @@ class MelittaDevice:
             await asyncio.sleep(1.0)
 
         _LOGGER.info(
-            "Connecting to %s (attempt %d, bluez_retry=%s)",
-            self._address, self._reconnect_attempts + 1, _retry_after_bluez_clear,
+            "Connecting to %s (attempt %d, recovery_depth=%d)",
+            self._address, self._reconnect_attempts + 1, _notify_recovery_depth,
         )
 
         try:
@@ -670,12 +765,14 @@ class MelittaDevice:
                     "This disconnects the BLE client. Reconnecting immediately..."
                 )
                 await self._internal_disconnect()
-                self._status = "dbus_recovery"
-                self._last_error = "Bluetooth D-Bus verbinding verbroken, opnieuw verbinden..."
-                self._notify_callbacks()
-                if not _retry_after_bluez_clear:
+                if _notify_recovery_depth < 2:
+                    self._status = "dbus_recovery"
+                    self._last_error = "Bluetooth D-Bus verbinding verbroken, opnieuw verbinden..."
+                    self._notify_callbacks()
+                    _LOGGER.info("Clearing stale BlueZ state before D-Bus crash reconnect...")
+                    await self._clear_stale_bluez_notifications()
                     await asyncio.sleep(2.0)
-                    return await self._do_connect(_retry_after_bluez_clear=True)
+                    return await self._do_connect(_notify_recovery_depth=_notify_recovery_depth + 1)
                 else:
                     _LOGGER.warning("D-Bus crashed again on retry - scheduling normal reconnect")
                     self._status = "offline"
@@ -683,34 +780,44 @@ class MelittaDevice:
                     self._notify_callbacks()
                     return False
 
-            if notify_result == "notify_acquired" and not _retry_after_bluez_clear:
+            if notify_result == "notify_acquired" and _notify_recovery_depth < 2:
                 _LOGGER.warning(
                     "=== STALE BLUEZ NOTIFICATION STATE DETECTED ===\n"
                     "BlueZ holds a dead notification file descriptor from a previous session.\n"
-                    "Removing device from BlueZ cache to clear it, then reconnecting..."
+                    "Attempting to clear stale notification state..."
                 )
-                await self._internal_disconnect()
-                removed = await self._remove_device_from_bluez()
-                if removed:
-                    _LOGGER.info("BlueZ state cleared. Waiting for device rediscovery...")
-                    self._status = "clearing_bluez"
-                    self._last_error = "Bluetooth-cache opschonen... even geduld"
-                    self._notify_callbacks()
-                    await asyncio.sleep(3.0)
-                    found = await self._wait_for_device_rediscovery(timeout=15.0)
-                    if found:
-                        return await self._do_connect(_retry_after_bluez_clear=True)
-                    else:
-                        _LOGGER.warning("Device not rediscovered after BlueZ removal - will retry on next cycle")
-                        self._status = "offline"
-                        self._last_error = "Machine opnieuw zoeken na Bluetooth-reset..."
-                        self._notify_callbacks()
-                        return False
+                cleared = await self._clear_stale_bluez_notifications()
+                if cleared:
+                    _LOGGER.info("StopNotify cleared stale state, waiting for BlueZ to settle...")
+                    await asyncio.sleep(0.5)
+                    notify_result = await self._start_notifications_with_retry()
+                    if notify_result == "ok":
+                        _LOGGER.info("Notifications recovered after StopNotify!")
 
-                _LOGGER.warning(
-                    "Could not remove device from BlueZ automatically. "
-                    "Trying polling fallback..."
-                )
+                if notify_result == "notify_acquired":
+                    _LOGGER.warning("StopNotify did not help, trying full device removal from BlueZ...")
+                    await self._internal_disconnect()
+                    removed = await self._remove_device_from_bluez()
+                    if removed:
+                        _LOGGER.info("BlueZ state cleared. Waiting for device rediscovery...")
+                        self._status = "clearing_bluez"
+                        self._last_error = "Bluetooth-cache opschonen... even geduld"
+                        self._notify_callbacks()
+                        await asyncio.sleep(3.0)
+                        found = await self._wait_for_device_rediscovery(timeout=15.0)
+                        if found:
+                            return await self._do_connect(_notify_recovery_depth=_notify_recovery_depth + 1)
+                        else:
+                            _LOGGER.warning("Device not rediscovered after BlueZ removal - will retry on next cycle")
+                            self._status = "offline"
+                            self._last_error = "Machine opnieuw zoeken na Bluetooth-reset..."
+                            self._notify_callbacks()
+                            return False
+
+                    _LOGGER.warning(
+                        "Could not remove device from BlueZ automatically. "
+                        "Trying polling fallback..."
+                    )
 
             if notify_result == "failed":
                 _LOGGER.error("Failed to set up notifications on %s", BLE_READ_UUID)
