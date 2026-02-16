@@ -53,6 +53,7 @@ class MelittaDevice:
         self._last_error: str | None = None
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = RECONNECT_MAX_ATTEMPTS
+        self._disconnect_in_progress = False
         self._last_status_data: bytes | None = None
         self._strength: int = 2
         self._cups: int = 1
@@ -145,31 +146,42 @@ class MelittaDevice:
                 _LOGGER.exception("Error in callback")
 
     def _on_disconnect(self, client: BleakClient):
-        was_auth = self._status == "authenticating"
-        prev_status = self._status
-        self._is_connected = False
-        self._authenticated = False
-        self._session_key = None
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            self._keepalive_task = None
+        if client is not self._client:
+            _LOGGER.debug("Ignoring disconnect callback from stale client")
+            return
+        if self._disconnect_in_progress:
+            _LOGGER.debug("Ignoring duplicate disconnect callback (already processing)")
+            return
 
-        if was_auth:
-            self._status = "auth_dropped"
-            self._last_error = "Machine dropped connection during authentication. Press 'Verbinden' on the machine display."
-            self._auth_event.set()
-        elif not self._shutting_down:
-            self._status = "offline"
-            self._last_error = "Connection lost"
+        self._disconnect_in_progress = True
+        try:
+            was_auth = self._status == "authenticating"
+            prev_status = self._status
+            self._is_connected = False
+            self._authenticated = False
+            self._session_key = None
+            if self._keepalive_task and not self._keepalive_task.done():
+                self._keepalive_task.cancel()
+                self._keepalive_task = None
 
-        _LOGGER.warning(
-            "DISCONNECTED from %s: prev_status=%s, was_auth=%s, shutting_down=%s, new_status=%s",
-            self._address, prev_status, was_auth, self._shutting_down, self._status,
-        )
-        self._notify_callbacks()
+            if was_auth:
+                self._status = "auth_dropped"
+                self._last_error = "Machine dropped connection during authentication. Press 'Verbinden' on the machine display."
+                self._auth_event.set()
+            elif not self._shutting_down:
+                self._status = "offline"
+                self._last_error = "Connection lost"
 
-        if not self._shutting_down:
-            self.schedule_reconnect()
+            _LOGGER.warning(
+                "DISCONNECTED from %s: prev_status=%s, was_auth=%s, shutting_down=%s, new_status=%s",
+                self._address, prev_status, was_auth, self._shutting_down, self._status,
+            )
+            self._notify_callbacks()
+
+            if not self._shutting_down:
+                self.schedule_reconnect()
+        finally:
+            self._disconnect_in_progress = False
 
     def _cancel_reconnect(self):
         if self._reconnect_task and not self._reconnect_task.done():
@@ -375,6 +387,23 @@ class MelittaDevice:
     async def _do_connect(self) -> bool:
         self._cancel_reconnect()
 
+        if self._client is not None:
+            _LOGGER.debug("Cleaning up previous BLE client before reconnect")
+            old_client = self._client
+            self._client = None
+            self._is_connected = False
+            try:
+                try:
+                    await old_client.stop_notify(BLE_READ_UUID)
+                except Exception:
+                    pass
+                try:
+                    await old_client.disconnect()
+                except Exception:
+                    pass
+            except Exception as cleanup_err:
+                _LOGGER.debug("Cleanup error (non-fatal): %s", cleanup_err)
+
         _LOGGER.info(
             "Connecting to %s (attempt %d): status=%s, connected=%s, auth=%s, hass=%s",
             self._address, self._reconnect_attempts + 1,
@@ -457,8 +486,33 @@ class MelittaDevice:
                 return False
 
             _LOGGER.debug("Starting notifications on %s", BLE_READ_UUID)
-            await self._client.start_notify(BLE_READ_UUID, self._on_notification)
-            _LOGGER.debug("Notifications started")
+            try:
+                await self._client.stop_notify(BLE_READ_UUID)
+                _LOGGER.debug("Stopped existing notifications before resubscribing")
+            except Exception:
+                pass
+            try:
+                await self._client.start_notify(BLE_READ_UUID, self._on_notification)
+                _LOGGER.debug("Notifications started")
+            except BleakError as notify_err:
+                err_msg = str(notify_err)
+                if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
+                    _LOGGER.warning(
+                        "Notify acquired error on %s: %s - disconnecting to clear stale state",
+                        BLE_READ_UUID, err_msg,
+                    )
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
+                    self._is_connected = False
+                    self._status = "offline"
+                    self._last_error = "Bluetooth-notificaties konden niet gestart worden. Opnieuw proberen..."
+                    self._notify_callbacks()
+                    return False
+                else:
+                    raise
 
             _LOGGER.debug("Waiting 0.5s after notification setup...")
             await asyncio.sleep(0.5)
