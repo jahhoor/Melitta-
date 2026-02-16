@@ -2,88 +2,20 @@
   "config": {
     "step": {
       "user": {
-        "title": "Melitta Koffiezetapparaat",
-        "description": "Kies hoe je je Melitta koffiezetapparaat wilt toevoegen.",
-        "menu_options": {
-          "scan": "Automatisch scannen naar apparaten",
-          "manual": "MAC-adres handmatig invoeren"
-        }
-      },
-      "scan": {
-        "title": "Bluetooth apparaten gevonden",
-        "description": "Selecteer je Melitta koffiezetapparaat uit de lijst. Apparaten met een * ervoor zijn waarschijnlijk Melitta-apparaten.\n\nBELANGRIJK: Druk na het toevoegen op de 'Verbinden'-knop op het display van je koffiezetapparaat om de Bluetooth-koppeling te activeren. De integratie probeert automatisch opnieuw te verbinden totdat het apparaat de verbinding accepteert.",
+        "title": "Melitta Koffiemachine",
+        "description": "Voer het MAC-adres van je Melitta koffiemachine in of selecteer een gevonden apparaat. Zorg dat Bluetooth is ingeschakeld en de machine aan staat.",
         "data": {
-          "mac_address": "Gevonden apparaat",
-          "device_name": "Naam apparaat",
-          "model": "Model"
-        }
-      },
-      "manual": {
-        "title": "Handmatig toevoegen",
-        "description": "Voer het Bluetooth MAC-adres van je Melitta koffiezetapparaat in. Je vindt dit in de Melitta Connect app bij de apparaatinstellingen.\n\nBELANGRIJK: Druk na het toevoegen op de 'Verbinden'-knop op het display van je koffiezetapparaat om de Bluetooth-koppeling te activeren.",
-        "data": {
-          "mac_address": "MAC-adres (bijv. AA:BB:CC:DD:EE:FF)",
-          "device_name": "Naam apparaat",
-          "model": "Model"
+          "mac_address": "MAC-adres"
         }
       },
       "bluetooth_confirm": {
-        "title": "Melitta gevonden",
-        "description": "Melitta apparaat gevonden: {name} ({address}). Wil je dit apparaat toevoegen?\n\nBELANGRIJK: Druk na het bevestigen op de 'Verbinden'-knop op het display van je koffiezetapparaat om de Bluetooth-koppeling te voltooien.",
-        "data": {
-          "device_name": "Naam",
-          "model": "Model"
-        }
+        "title": "Bevestig Melitta Koffiemachine",
+        "description": "Gevonden: {name}. Druk op 'Verbinden' op het display van de machine en bevestig daarna."
       }
     },
-    "error": {
-      "no_devices_found": "Geen Bluetooth-apparaten gevonden. Zorg dat je koffiezetapparaat aan staat en de Melitta Connect app gesloten is.",
-      "invalid_mac": "Ongeldig MAC-adres. Gebruik het formaat AA:BB:CC:DD:EE:FF."
-    },
     "abort": {
-      "already_configured": "Dit apparaat is al geconfigureerd."
-    }
-  },
-  "entity": {
-    "sensor": {
-      "status": { "name": "Status" },
-      "water_level": { "name": "Waterstand" },
-      "bean_level": { "name": "Bonenvoorraad" },
-      "error": { "name": "Foutmelding" },
-      "beverage": { "name": "Huidig drankje" },
-      "total_brews": { "name": "Totaal gezet" },
-      "last_connect": { "name": "Laatste verbinding" },
-      "last_error": { "name": "Laatste fout" },
-      "ble_discovery": { "name": "BLE Diagnostiek" }
-    },
-    "binary_sensor": {
-      "connected": { "name": "Verbonden" },
-      "brewing": { "name": "Bezig met zetten" }
-    },
-    "button": {
-      "brew_espresso": { "name": "Zet Espresso" },
-      "brew_ristretto": { "name": "Zet Ristretto" },
-      "brew_lungo": { "name": "Zet Lungo" },
-      "brew_espresso_doppio": { "name": "Zet Dubbele Espresso" },
-      "brew_cafe_creme": { "name": "Zet Caf\u00e9 Cr\u00e8me" },
-      "brew_cappuccino": { "name": "Zet Cappuccino" },
-      "brew_caffe_latte": { "name": "Zet Caff\u00e8 Latte" },
-      "brew_latte_macchiato": { "name": "Zet Latte Macchiato" },
-      "brew_flat_white": { "name": "Zet Flat White" },
-      "brew_americano": { "name": "Zet Americano" },
-      "brew_espresso_macchiato": { "name": "Zet Espresso Macchiato" },
-      "brew_cafe_au_lait": { "name": "Zet Caf\u00e9 au Lait" },
-      "brew_milk": { "name": "Warme Melk" },
-      "brew_milk_froth": { "name": "Melkschuim" },
-      "brew_hot_water": { "name": "Heet Water" },
-      "stop": { "name": "Stop" },
-      "clean": { "name": "Reinigen" },
-      "rinse": { "name": "Spoelen" },
-      "standby": { "name": "Standby" }
-    },
-    "select": {
-      "strength": { "name": "Koffiesterkte" },
-      "cups": { "name": "Aantal kopjes" }
+      "already_configured": "Dit apparaat is al geconfigureerd.",
+      "not_supported": "Dit apparaat is geen ondersteunde Melitta koffiemachine."
     }
   }
 }

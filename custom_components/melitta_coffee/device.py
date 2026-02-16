@@ -3,303 +3,55 @@ import logging
 import os
 import struct
 from datetime import datetime
-from typing import Any, Callable
+from typing import Callable
 
-from bleak import BleakClient, BleakScanner
-from bleak.backends.device import BLEDevice
-from bleak.exc import BleakError
+from bleak import BleakClient, BleakError
 
 from .const import (
-    MELITTA_SERVICE_UUID,
-    MELITTA_READ_CHAR_UUID,
-    MELITTA_WRITE_CHAR_UUID,
-    FRAME_START,
-    FRAME_END,
-    FRAME_MAX_SIZE,
-    BLE_MTU_SIZE,
-    CMD_AUTH,
-    CMD_KEEPALIVE,
-    CMD_BREW,
-    CMD_WRITE_VALUE,
-    CMD_READ_VALUE,
-    CMD_SET_PROCESS,
-    CMD_STATUS,
-    CMD_RECIPE_CONFIRM,
-    CMD_ALPHA_VALUE,
-    CMD_VERSION,
-    CMD_ACK,
-    CMD_NACK,
+    BLE_READ_UUID, BLE_WRITE_UUID,
+    CMD_AUTH, CMD_KEEPALIVE, CMD_STATUS, CMD_BREW, CMD_WRITE,
     KEEPALIVE_INTERVAL,
-    SBOX,
-    RC4_KEY,
-    PROCESS_MAP,
-    SUBPROCESS_MAP,
-    MANIPULATION_MAP,
-    BEVERAGE_MAP,
+    MACHINE_STATE_NAMES,
     BEVERAGE_NAMES,
-    BEVERAGE_TO_DIRECT_KEY,
-    DIRECT_KEY_MAP,
-    STRENGTH_MAP,
-    STRENGTH_NAMES,
-    DEFAULT_RECIPES,
-    CONNECT_TIMEOUT,
-    Process,
-    InfoFlag,
-    RecipeProcess,
-    Shots,
-    Blend,
-    Intensity,
-    Aroma,
-    Temperature,
 )
+from .crypto import sbox_hash
+from .protocol import build_frame, EfComParser, EfComFrame
 
 _LOGGER = logging.getLogger(__name__)
 
-MELITTA_KEYWORDS = ["melitta", "caffeo", "barista"]
-RECONNECT_INTERVALS = [5, 10, 30, 60, 120]
-
-
-def _sbox_hash(data: bytes) -> bytes:
-    sbox = SBOX
-    b1 = sbox[(data[0] + 256) % 256]
-    for i in range(1, len(data)):
-        b1 = sbox[((b1 ^ data[i]) + 256) % 256]
-    h1 = (b1 + 93) & 0xFF
-
-    b2 = sbox[(data[0] + 257) % 256]
-    for i in range(1, len(data)):
-        b2 = sbox[((b2 ^ data[i]) + 256) % 256]
-    h2 = (b2 + 167) & 0xFF
-
-    return bytes([h1, h2])
-
-
-def _compute_checksum(frame_bytes: bytes, length: int) -> int:
-    total = 0
-    for i in range(1, length):
-        total = (total + frame_bytes[i]) & 0xFF
-    return (~total) & 0xFF
-
-
-def _rc4_crypt(data: bytearray, offset: int, length: int) -> None:
-    key = RC4_KEY
-    key_len = len(key)
-    s = list(range(256))
-    j = 0
-    for i in range(256):
-        j = ((j + s[i]) + key[i % key_len] + 256) % 256
-        s[i], s[j] = s[j], s[i]
-    i = 0
-    j = 0
-    for k in range(length):
-        i = (i + 1) % 256
-        si = s[i]
-        j = ((j + si) + 256) % 256
-        sj = s[j]
-        s[i] = sj
-        s[j] = si
-        data[offset + k] ^= s[((si + sj) + 256) % 256]
-
-
-def _build_frame(cmd_id: str, payload: bytes = b"", session_key: bytes | None = None, encrypt: bool = False) -> bytes:
-    cmd_bytes = cmd_id.encode("latin-1")
-    cmd_len = len(cmd_bytes)
-    frame = bytearray()
-    frame.append(FRAME_START)
-    frame.extend(cmd_bytes)
-    if session_key and len(session_key) == 2:
-        frame.extend(session_key)
-    if payload:
-        frame.extend(payload)
-    checksum = _compute_checksum(frame, len(frame))
-    frame.append(checksum)
-    frame.append(FRAME_END)
-
-    if encrypt:
-        encrypt_start = cmd_len + 1
-        encrypt_len = len(frame) - cmd_len - 2
-        _rc4_crypt(frame, encrypt_start, encrypt_len)
-
-    return bytes(frame)
-
-
-class EfComParser:
-
-    def __init__(self, on_frame: Callable, encrypted: bool = False):
-        self._buffer = bytearray(FRAME_MAX_SIZE)
-        self._pos = 0
-        self._on_frame = on_frame
-        self._known_commands: dict[str, list[int]] = {}
-        self._encrypted = encrypted
-
-    def register_command(self, cmd_id: str, payload_length: int | list[int]) -> None:
-        if isinstance(payload_length, list):
-            self._known_commands[cmd_id] = payload_length
-        else:
-            self._known_commands[cmd_id] = [payload_length]
-
-    def _try_decode_frame(self, cmd_id: str, cmd_len: int, expected_len: int, use_encryption: bool) -> bool:
-        work_buf = bytearray(self._buffer[:self._pos])
-
-        if use_encryption:
-            decrypt_start = cmd_len + 1
-            decrypt_len = self._pos - cmd_len - 2
-            if decrypt_len > 0:
-                _rc4_crypt(work_buf, decrypt_start, decrypt_len)
-
-        checksum_pos = self._pos - 2
-        expected_checksum = _compute_checksum(work_buf, checksum_pos)
-        if work_buf[checksum_pos] == expected_checksum:
-            payload_start = cmd_len + 1
-            payload = bytes(work_buf[payload_start:payload_start + expected_len])
-            enc_label = "encrypted" if use_encryption else "plaintext"
-            _LOGGER.debug("Decoded %s frame for %s (len=%d)", enc_label, cmd_id, expected_len)
-            self._on_frame(cmd_id, payload)
-            self._reset()
-            return True
-        return False
-
-    def feed(self, byte_val: int) -> None:
-        if self._pos <= 0:
-            if byte_val == FRAME_START:
-                self._buffer[0] = byte_val
-                self._pos = 1
-            return
-
-        if self._pos >= FRAME_MAX_SIZE:
-            self._reset()
-            return
-
-        self._buffer[self._pos] = byte_val
-        self._pos += 1
-
-        if byte_val != FRAME_END or self._pos < 4:
-            return
-
-        try:
-            cmd2 = self._buffer[1:3].decode("latin-1")
-        except Exception:
-            cmd2 = None
-
-        try:
-            cmd1 = self._buffer[1:2].decode("latin-1")
-        except Exception:
-            cmd1 = None
-
-        matched = False
-        for cmd_id, expected_lens in self._known_commands.items():
-            if cmd_id == cmd2 or cmd_id == cmd1:
-                for expected_len in expected_lens:
-                    total = len(cmd_id) + 1 + expected_len + 2
-                    if total == self._pos:
-                        cmd_len = len(cmd_id)
-
-                        if self._try_decode_frame(cmd_id, cmd_len, expected_len, False):
-                            return
-
-                        if self._encrypted:
-                            if self._try_decode_frame(cmd_id, cmd_len, expected_len, True):
-                                return
-
-                            _LOGGER.debug(
-                                "Frame checksum mismatch for %s (both plaintext and encrypted failed, "
-                                "possible false end marker) - continuing accumulation",
-                                cmd_id,
-                            )
-                            self._buffer[self._pos - 1] = byte_val
-                            return
-
-                        _LOGGER.debug(
-                            "Checksum mismatch for %s (plaintext only)",
-                            cmd_id,
-                        )
-                        self._reset()
-                        return
-                    if total > self._pos:
-                        matched = True
-
-        if not matched:
-            self._resync()
-
-    def _reset(self) -> None:
-        self._pos = 0
-
-    def _resync(self) -> None:
-        for i in range(1, self._pos):
-            if self._buffer[i] == FRAME_START:
-                remaining = self._pos - i
-                self._buffer[0:remaining] = self._buffer[i:self._pos]
-                self._pos = remaining
-                return
-        self._reset()
+AUTH_TIMEOUT = 5.0
+CONNECT_TIMEOUT = 15.0
+DISCONNECT_TIMEOUT = 10.0
 
 
 class MelittaDevice:
-
-    def __init__(self, address: str, name: str = "Melitta", hass=None) -> None:
+    def __init__(self, address: str, name: str | None = None):
         self._address = address
-        self._name = name
-        self._hass = hass
+        self._name = name or f"Melitta {address}"
         self._client: BleakClient | None = None
-        self._is_connected = False
-        self._has_ever_connected = False
-        self._authenticated = False
+        self._parser = EfComParser()
         self._session_key: bytes | None = None
         self._auth_challenge: bytes | None = None
-        self._machine_challenge: bytes | None = None
-        self._auth_phase: str = "idle"
-        self._auth_event: asyncio.Event | None = None
-        self._ack_event: asyncio.Event | None = None
-        self._last_ack: bool = False
-
-        self._status = "offline"
-        self._status_raw: str | None = None
-        self._process: int = 0
-        self._subprocess: int = 0
-        self._info_flags: int = 0
-        self._manipulation: int = 0
-        self._progress: int = 0
-        self._water_level = "unknown"
-        self._bean_level = "unknown"
-        self._error: str | None = None
-        self._is_brewing = False
-        self._current_beverage: str | None = None
-        self._strength = "medium"
-        self._cups = 1
-        self._temperature: int | None = None
-        self._total_brews = 0
-        self._version: str | None = None
-
+        self._auth_event = asyncio.Event()
+        self._authenticated = False
+        self._is_connected = False
+        self._shutting_down = False
+        self._keepalive_task: asyncio.Task | None = None
         self._callbacks: list[Callable] = []
-        self._lock = asyncio.Lock()
+        self._status = "offline"
+        self._machine_state: int | None = None
+        self._machine_state_name: str = "Unknown"
+        self._last_error: str | None = None
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 5
-        self._reconnect_task: asyncio.Task | None = None
-        self._keepalive_task: asyncio.Task | None = None
-        self._shutting_down = False
-        self._last_connect_time: str | None = None
-        self._last_error_message: str | None = None
-        self._services_discovered = False
-        self._discovered_services_info: str = "Nog niet verbonden"
-        self._raw_notifications: list[dict[str, str]] = []
-        self._last_raw_status_hex: str | None = None
-        self._last_write_result: str | None = None
-        self._read_char: str | None = None
-        self._write_char: str | None = None
-
-        self._rx_buffer = bytearray()
-        self._parser = EfComParser(self._on_efcom_frame, encrypted=True)
-        self._register_known_commands()
-
-    def _register_known_commands(self) -> None:
-        self._parser.register_command(CMD_AUTH, [4, 6, 8, 10])
-        self._parser.register_command(CMD_KEEPALIVE, 0)
-        self._parser.register_command(CMD_STATUS, 8)
-        self._parser.register_command(CMD_ACK, 0)
-        self._parser.register_command(CMD_NACK, 0)
-        self._parser.register_command(CMD_VERSION, 20)
-        self._parser.register_command(CMD_ALPHA_VALUE, 32)
-        self._parser.register_command(CMD_RECIPE_CONFIRM, 20)
+        self._last_status_data: bytes | None = None
+        self._strength: int = 2
+        self._cups: int = 1
+        self._water_level: int | None = None
+        self._bean_level: int | None = None
+        self._drip_tray_full: bool = False
+        self._brew_progress: int | None = None
+        self._error_code: int | None = None
 
     @property
     def address(self) -> str:
@@ -310,11 +62,11 @@ class MelittaDevice:
         return self._name
 
     @property
-    def is_connected(self) -> bool:
-        return self._is_connected and self._authenticated
+    def status(self) -> str:
+        return self._status
 
     @property
-    def is_ble_connected(self) -> bool:
+    def is_connected(self) -> bool:
         return self._is_connected
 
     @property
@@ -322,861 +74,432 @@ class MelittaDevice:
         return self._authenticated
 
     @property
-    def status(self) -> str:
-        return self._status
+    def machine_state(self) -> int | None:
+        return self._machine_state
 
     @property
-    def status_raw(self) -> str | None:
-        return self._status_raw
+    def machine_state_name(self) -> str:
+        return self._machine_state_name
 
     @property
-    def process_state(self) -> str:
-        return PROCESS_MAP.get(self._process, f"unknown_{self._process}")
+    def last_error(self) -> str | None:
+        return self._last_error
 
     @property
-    def subprocess_state(self) -> str:
-        return SUBPROCESS_MAP.get(self._subprocess, "none")
-
-    @property
-    def progress(self) -> int:
-        return self._progress
-
-    @property
-    def water_level(self) -> str:
+    def water_level(self) -> int | None:
         return self._water_level
 
     @property
-    def bean_level(self) -> str:
+    def bean_level(self) -> int | None:
         return self._bean_level
 
     @property
-    def error(self) -> str | None:
-        return self._error
+    def drip_tray_full(self) -> bool:
+        return self._drip_tray_full
 
     @property
-    def is_brewing(self) -> bool:
-        return self._is_brewing
+    def brew_progress(self) -> int | None:
+        return self._brew_progress
 
     @property
-    def current_beverage(self) -> str | None:
-        return self._current_beverage
+    def error_code(self) -> int | None:
+        return self._error_code
 
     @property
-    def strength(self) -> str:
+    def strength(self) -> int:
         return self._strength
+
+    @strength.setter
+    def strength(self, value: int):
+        self._strength = max(0, min(4, value))
 
     @property
     def cups(self) -> int:
         return self._cups
 
-    @property
-    def temperature(self) -> int | None:
-        return self._temperature
+    @cups.setter
+    def cups(self, value: int):
+        self._cups = max(1, min(2, value))
 
-    @property
-    def total_brews(self) -> int:
-        return self._total_brews
-
-    @property
-    def version(self) -> str | None:
-        return self._version
-
-    @property
-    def last_connect_time(self) -> str | None:
-        return self._last_connect_time
-
-    @property
-    def last_error_message(self) -> str | None:
-        return self._last_error_message
-
-    @property
-    def services_discovered(self) -> bool:
-        return self._services_discovered
-
-    @property
-    def discovered_services_info(self) -> str:
-        return self._discovered_services_info
-
-    @property
-    def raw_notifications(self) -> list[dict[str, str]]:
-        return self._raw_notifications
-
-    @property
-    def last_raw_status_hex(self) -> str | None:
-        return self._last_raw_status_hex
-
-    @property
-    def last_write_result(self) -> str | None:
-        return self._last_write_result
-
-    @property
-    def needs_beans_1(self) -> bool:
-        return bool(self._info_flags & (1 << InfoFlag.FILL_BEANS_1))
-
-    @property
-    def needs_beans_2(self) -> bool:
-        return bool(self._info_flags & (1 << InfoFlag.FILL_BEANS_2))
-
-    @property
-    def needs_cleaning(self) -> bool:
-        return bool(self._info_flags & (1 << InfoFlag.EASY_CLEAN))
-
-    @property
-    def powder_filled(self) -> bool:
-        return bool(self._info_flags & (1 << InfoFlag.POWDER_FILLED))
-
-    def set_strength(self, strength: str) -> None:
-        if strength in STRENGTH_MAP:
-            self._strength = strength
-            self._notify_callbacks()
-
-    def set_cups(self, cups: int) -> None:
-        if 1 <= cups <= 12:
-            self._cups = cups
-            self._notify_callbacks()
-
-    def register_callback(self, callback: Callable) -> None:
+    def register_callback(self, callback: Callable) -> Callable:
         self._callbacks.append(callback)
+        def remove():
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+        return remove
 
-    def remove_callback(self, callback: Callable) -> None:
-        if callback in self._callbacks:
-            self._callbacks.remove(callback)
-
-    def _notify_callbacks(self) -> None:
-        for callback in self._callbacks:
+    def _notify_callbacks(self):
+        for cb in self._callbacks:
             try:
-                callback()
+                cb()
             except Exception:
-                _LOGGER.exception("Error calling callback")
+                _LOGGER.exception("Error in callback")
 
-    async def connect(self) -> bool:
-        async with self._lock:
-            if self._is_connected and self._client:
-                try:
-                    if self._client.is_connected:
-                        if self._authenticated:
-                            return True
-                except Exception:
-                    pass
-                self._is_connected = False
-                self._authenticated = False
-                self._client = None
-
-            try:
-                _LOGGER.debug("Connecting to Melitta at %s", self._address)
-                self._client = BleakClient(
-                    self._address,
-                    timeout=CONNECT_TIMEOUT,
-                    disconnected_callback=self._on_disconnect,
-                )
-                await self._client.connect()
-                self._is_connected = True
-                self._has_ever_connected = True
-                self._reconnect_attempts = 0
-                self._last_connect_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._last_error_message = None
-
-                self._status = "connecting"
-                self._notify_callbacks()
-
-                await self._discover_services()
-                await self._subscribe_notifications()
-
-                self._status = "authenticating"
-                self._notify_callbacks()
-
-                if not self._shutting_down:
-                    await self._authenticate()
-
-                if not self._is_connected:
-                    _LOGGER.warning(
-                        "BLE connection lost during auth for %s - machine may have dropped connection",
-                        self._address,
-                    )
-                    return False
-
-                if self._authenticated:
-                    self._status = "ready"
-                    self._start_keepalive()
-                    _LOGGER.info("Connected and authenticated with Melitta at %s", self._address)
-                    await self._request_initial_status()
-                else:
-                    self._status = "connected_not_auth"
-                    _LOGGER.warning(
-                        "Connected to %s but not authenticated. "
-                        "Press 'Verbinden' on the machine and wait for the next retry.",
-                        self._address,
-                    )
-
-                self._notify_callbacks()
-                return self._authenticated
-
-            except (BleakError, asyncio.TimeoutError, OSError) as err:
-                error_msg = str(err)
-                _LOGGER.warning("Failed to connect to Melitta at %s: %s", self._address, error_msg)
-                self._is_connected = False
-                self._authenticated = False
-                self._client = None
-                self._last_error_message = error_msg
-                if not self._has_ever_connected:
-                    self._status = "offline"
-                self._notify_callbacks()
-                return False
-
-    async def disconnect(self) -> None:
-        self._shutting_down = True
-        self._stop_keepalive()
-
-        if self._auth_event:
-            self._auth_event.set()
-
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            try:
-                await self._reconnect_task
-            except asyncio.CancelledError:
-                pass
-
-        try:
-            await asyncio.wait_for(self._lock.acquire(), timeout=5.0)
-            lock_acquired = True
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Could not acquire lock for disconnect within 5s, forcing cleanup for %s", self._address)
-            lock_acquired = False
-
-        try:
-            if self._client:
-                try:
-                    if self._read_char and self._client.is_connected:
-                        await asyncio.wait_for(
-                            self._client.stop_notify(self._read_char), timeout=3.0
-                        )
-                        _LOGGER.debug("Unsubscribed from notifications on %s", self._read_char)
-                except (BleakError, OSError, asyncio.TimeoutError) as err:
-                    _LOGGER.debug("Failed to unsubscribe notifications: %s", err)
-
-                try:
-                    if self._client.is_connected:
-                        await asyncio.wait_for(
-                            self._client.disconnect(), timeout=5.0
-                        )
-                        _LOGGER.info("Disconnected BLE client from %s", self._address)
-                except (BleakError, OSError, asyncio.TimeoutError) as err:
-                    _LOGGER.debug("BLE disconnect error: %s", err)
-
-                self._client = None
-            self._is_connected = False
-            self._authenticated = False
-            self._session_key = None
-            self._read_char = None
-            self._write_char = None
-            self._status = "offline"
-            self._notify_callbacks()
-            _LOGGER.info("Melitta device %s fully cleaned up", self._address)
-        finally:
-            if lock_acquired:
-                self._lock.release()
-
-    def _on_disconnect(self, client: BleakClient) -> None:
-        was_authenticating = self._status == "authenticating"
-        _LOGGER.info(
-            "Disconnected from Melitta at %s (was_authenticating=%s)",
-            self._address, was_authenticating,
-        )
+    def _on_disconnect(self, client: BleakClient):
+        was_auth = self._status == "authenticating"
+        prev_status = self._status
         self._is_connected = False
         self._authenticated = False
         self._session_key = None
-        self._client = None
-        self._stop_keepalive()
-
-        if was_authenticating:
-            self._status = "auth_dropped"
-            self._last_error_message = (
-                "Machine verbreekt verbinding tijdens authenticatie. "
-                "Druk op 'Verbinden' op het display van de machine."
-            )
-            _LOGGER.warning(
-                "Machine at %s dropped BLE during authentication. "
-                "User must press 'Verbinden' on the machine display.",
-                self._address,
-            )
-        else:
-            self._status = "offline"
-
-        if self._auth_event:
-            self._auth_event.set()
-
-        self._notify_callbacks()
-
-        if not self._shutting_down:
-            self._schedule_reconnect()
-
-    def _schedule_reconnect(self) -> None:
-        if self._reconnect_task and not self._reconnect_task.done():
-            return
-
-        if self._reconnect_attempts >= self._max_reconnect_attempts:
-            _LOGGER.info(
-                "Max reconnect attempts (%d) reached for %s",
-                self._max_reconnect_attempts,
-                self._address,
-            )
-            self._reconnect_attempts = 0
-            return
-
-        delay = RECONNECT_INTERVALS[
-            min(self._reconnect_attempts, len(RECONNECT_INTERVALS) - 1)
-        ]
-        self._reconnect_attempts += 1
-        _LOGGER.debug(
-            "Scheduling reconnect attempt %d in %ds for %s",
-            self._reconnect_attempts,
-            delay,
-            self._address,
-        )
-
-        loop = asyncio.get_event_loop()
-        self._reconnect_task = loop.create_task(self._reconnect_after_delay(delay))
-
-    async def _reconnect_after_delay(self, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-            if not self._shutting_down and not self._is_connected:
-                connected = await self.connect()
-                if not connected and not self._shutting_down:
-                    self._schedule_reconnect()
-        except asyncio.CancelledError:
-            pass
-        except Exception as err:
-            _LOGGER.debug("Reconnect failed for %s: %s", self._address, err)
-            if not self._shutting_down:
-                self._schedule_reconnect()
-
-    async def _request_initial_status(self) -> None:
-        try:
-            frame = _build_frame(CMD_STATUS, b"", session_key=self._session_key, encrypt=True)
-            await self._send_raw(frame)
-            _LOGGER.debug("Initial status request sent")
-        except Exception as err:
-            _LOGGER.debug("Initial status request failed: %s", err)
-
-    async def _ensure_connected(self) -> bool:
-        if self._is_connected and self._authenticated and self._client:
-            try:
-                if self._client.is_connected:
-                    return True
-            except Exception:
-                pass
-            self._is_connected = False
-            self._authenticated = False
-            self._client = None
-
-        return await self.connect()
-
-    async def _discover_services(self) -> None:
-        if not self._client or not self._is_connected:
-            return
-
-        try:
-            services = self._client.services
-            info_lines = []
-            self._read_char = None
-            self._write_char = None
-
-            for service in services:
-                svc_desc = service.description or "Onbekend"
-                info_lines.append(f"Service: {service.uuid} ({svc_desc})")
-
-                for char in service.characteristics:
-                    props = ", ".join(char.properties)
-                    info_lines.append(f"  Kenmerk: {char.uuid} [{props}]")
-
-                    uuid_lower = char.uuid.lower()
-                    if uuid_lower == MELITTA_READ_CHAR_UUID.lower():
-                        self._read_char = char.uuid
-                    elif uuid_lower == MELITTA_WRITE_CHAR_UUID.lower():
-                        self._write_char = char.uuid
-
-            info_lines.append(f"Leesbare kenmerk: {self._read_char or 'Niet gevonden'}")
-            info_lines.append(f"Schrijfbare kenmerk: {self._write_char or 'Niet gevonden'}")
-            self._discovered_services_info = "\n".join(info_lines)
-            self._services_discovered = bool(self._read_char and self._write_char)
-
-            if not self._services_discovered:
-                _LOGGER.warning(
-                    "Required characteristics not found on %s (read=%s, write=%s)",
-                    self._address, self._read_char, self._write_char,
-                )
-                self._last_error_message = "Melitta BLE kenmerken niet gevonden"
-
-        except (BleakError, OSError) as err:
-            _LOGGER.error("Failed to discover services: %s", err)
-            self._last_error_message = f"Service discovery mislukt: {err}"
-
-    async def _subscribe_notifications(self) -> None:
-        if not self._client or not self._read_char:
-            return
-
-        try:
-            await self._client.start_notify(
-                self._read_char, self._handle_notification
-            )
-            _LOGGER.info("Subscribed to notifications on %s", self._read_char)
-        except (BleakError, OSError) as err:
-            _LOGGER.warning("Failed to subscribe to %s: %s", self._read_char, err)
-
-    def _handle_notification(self, sender: Any, data: bytearray) -> None:
-        hex_str = data.hex()
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-        _LOGGER.debug("RX [%s]: %s", timestamp, hex_str)
-
-        notification_entry = {
-            "time": timestamp,
-            "sender": str(sender),
-            "hex": hex_str,
-            "length": str(len(data)),
-        }
-        self._raw_notifications.append(notification_entry)
-        if len(self._raw_notifications) > 50:
-            self._raw_notifications = self._raw_notifications[-50:]
-
-        for byte_val in data:
-            self._parser.feed(byte_val)
-
-    def _on_efcom_frame(self, cmd_id: str, payload: bytes) -> None:
-        _LOGGER.debug("EfCom frame: cmd=%s payload=%s", cmd_id, payload.hex())
-
-        if cmd_id == CMD_AUTH:
-            self._handle_auth_response(payload)
-        elif cmd_id == CMD_STATUS:
-            self._handle_status(payload)
-        elif cmd_id == CMD_ACK:
-            self._handle_ack(True)
-        elif cmd_id == CMD_NACK:
-            self._handle_ack(False)
-        elif cmd_id == CMD_VERSION:
-            self._handle_version(payload)
-        elif cmd_id == CMD_ALPHA_VALUE:
-            self._handle_alpha_value(payload)
-        elif cmd_id == CMD_RECIPE_CONFIRM:
-            _LOGGER.debug("Recipe confirmed: %s", payload.hex())
-
-    async def _authenticate(self) -> None:
-        if not self._services_discovered:
-            _LOGGER.warning("Cannot authenticate: services not discovered")
-            self._authenticated = False
-            return
-
-        self._auth_event = asyncio.Event()
-        self._auth_challenge = os.urandom(4)
-        self._auth_phase = "waiting_auth_response"
-
-        challenge_hash = _sbox_hash(self._auth_challenge)
-        auth_payload = self._auth_challenge + challenge_hash
-
-        _LOGGER.info(
-            "Sending client auth challenge to %s: %s (hash: %s)",
-            self._address,
-            self._auth_challenge.hex(),
-            challenge_hash.hex(),
-        )
-
-        frame = _build_frame(CMD_AUTH, auth_payload, encrypt=False)
-        try:
-            await self._send_raw(frame)
-            _LOGGER.debug("Auth challenge sent (plaintext), frame: %s", frame.hex())
-        except (BleakError, OSError) as err:
-            _LOGGER.warning("Failed to send auth challenge: %s", err)
-            self._authenticated = False
-            self._last_error_message = f"Auth challenge verzenden mislukt: {err}"
-            return
-
-        try:
-            await asyncio.wait_for(self._auth_event.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            if self._shutting_down:
-                _LOGGER.debug("Auth cancelled due to shutdown")
-                self._authenticated = False
-                return
-            _LOGGER.warning(
-                "Authentication timeout: no response within 5s from %s. "
-                "Make sure the machine is in 'Verbinden' (connect) mode.",
-                self._address,
-            )
-            self._authenticated = False
-            self._last_error_message = (
-                "Authenticatie timeout - druk op 'Verbinden' op het koffiezetapparaat"
-            )
-
-        if not self._is_connected:
-            _LOGGER.warning("BLE connection lost during auth for %s", self._address)
-            self._authenticated = False
-
-    def _handle_auth_response(self, payload: bytes) -> None:
-        _LOGGER.debug(
-            "Auth frame received (phase=%s, len=%d): %s",
-            self._auth_phase, len(payload), payload.hex(),
-        )
-
-        if self._auth_phase == "waiting_auth_response":
-            self._process_auth_response(payload)
-        else:
-            _LOGGER.debug("Auth frame in phase %s (len=%d) - ignoring", self._auth_phase, len(payload))
-
-    def _process_auth_response(self, payload: bytes) -> None:
-        if len(payload) != 8:
-            _LOGGER.warning(
-                "Unexpected auth response length: %d bytes (expected 8)",
-                len(payload),
-            )
-            if len(payload) == 6:
-                _LOGGER.debug("Got 6-byte auth frame - may be machine's own challenge, retrying...")
-                return
-            self._authenticated = False
-            if self._auth_event:
-                self._auth_event.set()
-            return
-
-        echo = payload[0:4]
-        session_key = payload[4:6]
-        response_hash = payload[6:8]
-
-        if self._auth_challenge and echo != self._auth_challenge:
-            _LOGGER.warning(
-                "Auth echo mismatch: sent %s got %s",
-                self._auth_challenge.hex(), echo.hex(),
-            )
-            self._authenticated = False
-            if self._auth_event:
-                self._auth_event.set()
-            return
-
-        verify_data = payload[0:6]
-        expected_hash = _sbox_hash(verify_data)
-        if response_hash != expected_hash:
-            _LOGGER.warning(
-                "Auth response hash verification failed: got %s expected %s",
-                response_hash.hex(), expected_hash.hex(),
-            )
-            self._authenticated = False
-            if self._auth_event:
-                self._auth_event.set()
-            return
-
-        self._session_key = session_key
-        self._authenticated = True
-        self._auth_phase = "authenticated"
-        _LOGGER.info("Authentication successful! Session key: %s", session_key.hex())
-
-        if self._auth_event:
-            self._auth_event.set()
-
-    def _handle_status(self, payload: bytes) -> None:
-        if len(payload) < 8:
-            return
-
-        self._last_raw_status_hex = payload.hex()
-
-        process = struct.unpack(">H", payload[0:2])[0]
-        subprocess = struct.unpack(">H", payload[2:4])[0]
-        info_flags = payload[4]
-        manipulation = payload[5]
-        progress = struct.unpack(">H", payload[6:8])[0]
-
-        self._process = process
-        self._subprocess = subprocess
-        self._info_flags = info_flags
-        self._manipulation = manipulation
-        self._progress = progress
-
-        old_status = self._status
-        self._status = PROCESS_MAP.get(process, f"unknown_{process}")
-
-        if manipulation != 0:
-            manip_str = MANIPULATION_MAP.get(manipulation)
-            if manip_str:
-                self._error = manip_str
-                if manipulation == 4:
-                    self._water_level = "empty"
-        else:
-            self._error = None
-
-        if info_flags & (1 << InfoFlag.FILL_BEANS_1):
-            self._bean_level = "empty"
-        elif info_flags & (1 << InfoFlag.FILL_BEANS_2):
-            self._bean_level = "low"
-        else:
-            if self._bean_level in ("empty", "low"):
-                self._bean_level = "ok"
-
-        if manipulation != 4:
-            if self._water_level == "empty":
-                self._water_level = "ok"
-
-        was_brewing = self._is_brewing
-        self._is_brewing = (process == Process.PRODUCT)
-
-        if was_brewing and not self._is_brewing and process == Process.READY:
-            self._total_brews += 1
-            self._current_beverage = None
-
-        self._status_raw = (
-            f"process={process} subprocess={subprocess} "
-            f"info=0x{info_flags:02x} manip={manipulation} progress={progress}%"
-        )
-
-        _LOGGER.debug(
-            "Status: %s subprocess=%s progress=%d%% manip=%s info=0x%02x",
-            self._status, SUBPROCESS_MAP.get(subprocess, "?"),
-            progress, MANIPULATION_MAP.get(manipulation, "?"), info_flags,
-        )
-
-        self._notify_callbacks()
-
-    def _handle_ack(self, success: bool) -> None:
-        self._last_ack = success
-        if self._ack_event:
-            self._ack_event.set()
-
-    def _handle_version(self, payload: bytes) -> None:
-        try:
-            self._version = payload.decode("utf-8").rstrip("\x00")
-            _LOGGER.info("Machine version: %s", self._version)
-        except Exception:
-            self._version = payload.hex()
-
-    def _handle_alpha_value(self, payload: bytes) -> None:
-        if len(payload) >= 2:
-            param_id = struct.unpack(">H", payload[0:2])[0]
-            try:
-                value = payload[2:].decode("utf-8").rstrip("\x00")
-            except Exception:
-                value = payload[2:].hex()
-            _LOGGER.debug("Alpha value: id=%d value=%s", param_id, value)
-
-    def _start_keepalive(self) -> None:
-        self._stop_keepalive()
-        loop = asyncio.get_event_loop()
-        self._keepalive_task = loop.create_task(self._keepalive_loop())
-
-    def _stop_keepalive(self) -> None:
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
             self._keepalive_task = None
 
-    async def _keepalive_loop(self) -> None:
+        if was_auth:
+            self._status = "auth_dropped"
+            self._last_error = "Machine dropped connection during authentication. Press 'Verbinden' on the machine display."
+            self._auth_event.set()
+        elif not self._shutting_down:
+            self._status = "offline"
+            self._last_error = "Connection lost"
+
+        _LOGGER.warning(
+            "DISCONNECTED from %s: prev_status=%s, was_auth=%s, shutting_down=%s, new_status=%s",
+            self._address, prev_status, was_auth, self._shutting_down, self._status,
+        )
+        self._notify_callbacks()
+
+    def _on_notification(self, sender, data: bytes):
+        _LOGGER.info("BLE RX notification: %d bytes, raw_hex=%s, sender=%s", len(data), data.hex(), sender)
+        frames = self._parser.feed(data)
+        if not frames:
+            _LOGGER.debug("No complete frames parsed from this notification (buffering)")
+        for frame in frames:
+            _LOGGER.info("Parsed frame from notification: %s", frame)
+            self._handle_frame(frame)
+
+    def _handle_frame(self, frame: EfComFrame):
+        _LOGGER.debug("Received frame: %s", frame)
+
+        if frame.command == CMD_AUTH:
+            self._handle_auth_response(frame)
+        elif frame.command == CMD_STATUS:
+            self._handle_status_response(frame)
+        elif frame.command == CMD_KEEPALIVE:
+            _LOGGER.debug("Keepalive acknowledged")
+        elif frame.command == "A":
+            _LOGGER.debug("ACK received")
+        elif frame.command == "N":
+            _LOGGER.warning("NACK received")
+        else:
+            _LOGGER.debug("Unhandled frame: %s", frame)
+
+    def _handle_auth_response(self, frame: EfComFrame):
+        payload = frame.payload
+        _LOGGER.info(
+            "Auth response received: %d bytes, payload=%s, encrypted=%s",
+            len(payload), payload.hex(), frame.encrypted,
+        )
+        if len(payload) != 8:
+            _LOGGER.error("Auth response has unexpected length: %d (expected 8)", len(payload))
+            self._auth_event.set()
+            return
+
+        echo = payload[0:4]
+        session = payload[4:6]
+        hash_received = payload[6:8]
+
+        _LOGGER.debug(
+            "Auth response fields: echo=%s, session=%s, hash=%s",
+            echo.hex(), session.hex(), hash_received.hex(),
+        )
+
+        if self._auth_challenge is None:
+            _LOGGER.error("Received auth response without pending challenge")
+            self._auth_event.set()
+            return
+
+        _LOGGER.debug(
+            "Auth challenge comparison: sent=%s, echoed=%s, match=%s",
+            self._auth_challenge.hex(), echo.hex(), echo == self._auth_challenge,
+        )
+        if echo != self._auth_challenge:
+            _LOGGER.error(
+                "Auth challenge echo MISMATCH: sent=%s, got=%s",
+                self._auth_challenge.hex(), echo.hex(),
+            )
+            self._auth_event.set()
+            return
+
+        verify_data = payload[0:6]
+        expected_hash = sbox_hash(verify_data, len(verify_data))
+        _LOGGER.debug(
+            "Auth hash verification: verify_data=%s, expected=%s, received=%s, match=%s",
+            verify_data.hex(), expected_hash.hex(), hash_received.hex(),
+            hash_received == expected_hash,
+        )
+        if hash_received != expected_hash:
+            _LOGGER.error(
+                "Auth hash MISMATCH: expected=%s, received=%s (verify_data=%s)",
+                expected_hash.hex(), hash_received.hex(), verify_data.hex(),
+            )
+            self._auth_event.set()
+            return
+
+        self._session_key = session
+        self._authenticated = True
+        _LOGGER.info("Authentication SUCCESSFUL")
+        _LOGGER.debug("Session key [SENSITIVE]: %s", session.hex())
+        self._auth_event.set()
+
+    def _handle_status_response(self, frame: EfComFrame):
+        self._last_status_data = frame.payload
+        payload = frame.payload
+        _LOGGER.info(
+            "Status response: %d bytes, raw_payload=%s, encrypted=%s",
+            len(payload), payload.hex(), frame.encrypted,
+        )
+        if len(payload) >= 2:
+            state_value = struct.unpack(">H", payload[0:2])[0]
+            self._machine_state = state_value
+            self._machine_state_name = MACHINE_STATE_NAMES.get(state_value, f"Unknown ({state_value})")
+            _LOGGER.debug("  state bytes=[%s] -> value=%d (%s)", payload[0:2].hex(), state_value, self._machine_state_name)
+        if len(payload) >= 3:
+            self._water_level = payload[2] & 0xFF
+            _LOGGER.debug("  water_level byte=0x%02x -> %d%%", payload[2], self._water_level)
+        if len(payload) >= 4:
+            self._bean_level = payload[3] & 0xFF
+            _LOGGER.debug("  bean_level byte=0x%02x -> %d%%", payload[3], self._bean_level)
+        if len(payload) >= 5:
+            self._drip_tray_full = (payload[4] & 0x01) != 0
+            _LOGGER.debug("  drip_tray byte=0x%02x -> full=%s", payload[4], self._drip_tray_full)
+        if len(payload) >= 6:
+            self._brew_progress = payload[5] & 0xFF
+            _LOGGER.debug("  brew_progress byte=0x%02x -> %d%%", payload[5], self._brew_progress)
+        if len(payload) >= 8:
+            self._error_code = struct.unpack(">H", payload[6:8])[0]
+            _LOGGER.debug("  error_code bytes=[%s] -> %d", payload[6:8].hex(), self._error_code)
+            if self._error_code == 0:
+                self._error_code = None
+        _LOGGER.info(
+            "Status parsed: state=%s, water=%s%%, beans=%s%%, tray_full=%s, progress=%s%%, error=%s",
+            self._machine_state_name,
+            self._water_level,
+            self._bean_level,
+            self._drip_tray_full,
+            self._brew_progress,
+            self._error_code,
+        )
+        self._notify_callbacks()
+
+    async def connect(self) -> bool:
+        if self._is_connected and self._authenticated:
+            _LOGGER.debug("Already connected and authenticated to %s", self._address)
+            return True
+
+        _LOGGER.info("Connecting to %s (attempt %d/%d)...", self._address, self._reconnect_attempts + 1, self._max_reconnect_attempts)
+
+        try:
+            self._status = "connecting"
+            self._notify_callbacks()
+
+            self._client = BleakClient(
+                self._address,
+                timeout=CONNECT_TIMEOUT,
+                disconnected_callback=self._on_disconnect,
+            )
+            _LOGGER.debug("BleakClient created, connecting with timeout=%ds...", CONNECT_TIMEOUT)
+            await self._client.connect()
+            self._is_connected = True
+            self._reconnect_attempts = 0
+            self._last_error = None
+            _LOGGER.info("BLE connected to %s", self._address)
+
+            _LOGGER.debug("Starting notifications on %s", BLE_READ_UUID)
+            await self._client.start_notify(BLE_READ_UUID, self._on_notification)
+            _LOGGER.debug("Notifications started")
+
+            self._status = "authenticating"
+            self._notify_callbacks()
+
+            if not self._shutting_down:
+                await self._authenticate()
+
+            if not self._is_connected:
+                _LOGGER.warning("Connection lost during auth for %s", self._address)
+                return False
+
+            if self._authenticated:
+                self._status = "ready"
+                self._start_keepalive()
+                _LOGGER.info("CONNECTED and AUTHENTICATED with %s", self._address)
+                await self._request_status()
+            else:
+                self._status = "connected_not_auth"
+                _LOGGER.warning("Connected but NOT authenticated to %s - machine may need pairing button press", self._address)
+
+            self._notify_callbacks()
+            return self._authenticated
+
+        except (BleakError, asyncio.TimeoutError, OSError) as err:
+            self._status = "offline"
+            self._last_error = str(err)
+            self._reconnect_attempts += 1
+            _LOGGER.error("CONNECT FAILED to %s: %s (attempt %d)", self._address, err, self._reconnect_attempts)
+            self._notify_callbacks()
+            return False
+
+    async def _authenticate(self):
+        self._auth_challenge = os.urandom(4)
+        challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+        auth_payload = self._auth_challenge + challenge_hash
+
+        _LOGGER.info(
+            "Starting authentication: challenge=%s, hash=%s, auth_payload=%s",
+            self._auth_challenge.hex(), challenge_hash.hex(), auth_payload.hex(),
+        )
+
+        auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
+        auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
+
+        _LOGGER.debug("Auth encrypted frame: %s", auth_encrypted.hex())
+        _LOGGER.debug("Auth plaintext frame: %s", auth_plaintext.hex())
+
+        for attempt, (frame, desc) in enumerate([
+            (auth_encrypted, "encrypted"),
+            (auth_plaintext, "plaintext"),
+        ]):
+            if not self._is_connected:
+                _LOGGER.warning("Connection lost before auth attempt %d", attempt + 1)
+                return
+
+            self._auth_event.clear()
+            self._authenticated = False
+
+            _LOGGER.info(
+                "Auth attempt %d/2 (%s): writing %d bytes to %s, frame=%s",
+                attempt + 1, desc, len(frame), BLE_WRITE_UUID, frame.hex(),
+            )
+
+            try:
+                await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
+                _LOGGER.debug("Auth frame written successfully")
+            except Exception as err:
+                _LOGGER.error("Failed to send auth frame (%s): %s", desc, err)
+                continue
+
+            try:
+                await asyncio.wait_for(self._auth_event.wait(), timeout=AUTH_TIMEOUT)
+            except asyncio.TimeoutError:
+                _LOGGER.info("Auth TIMEOUT after %.1fs with %s frame (no response from machine)", AUTH_TIMEOUT, desc)
+                continue
+
+            if self._authenticated:
+                _LOGGER.info("Authentication SUCCEEDED with %s frame on attempt %d", desc, attempt + 1)
+                return
+
+            _LOGGER.info("Auth attempt %d (%s) completed but authentication failed", attempt + 1, desc)
+            await asyncio.sleep(0.5)
+
+        _LOGGER.warning("ALL auth attempts FAILED for %s - machine may need pairing confirmation", self._address)
+
+    def _start_keepalive(self):
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+        self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
+
+    async def _keepalive_loop(self):
         try:
             while self._is_connected and self._authenticated:
                 await asyncio.sleep(KEEPALIVE_INTERVAL)
-                if self._is_connected and self._authenticated:
-                    try:
-                        frame = _build_frame(CMD_KEEPALIVE, session_key=self._session_key, encrypt=True)
-                        await self._send_raw(frame)
-                        _LOGGER.debug("Keepalive sent")
-                    except Exception as err:
-                        _LOGGER.warning("Keepalive failed: %s", err)
-                        break
+                if not self._is_connected or not self._authenticated:
+                    break
+                try:
+                    frame = build_frame(CMD_KEEPALIVE, self._session_key, None, encrypt=True)
+                    await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
+                    _LOGGER.debug("Keepalive sent")
+                except Exception as err:
+                    _LOGGER.warning("Keepalive failed: %s", err)
+                    break
         except asyncio.CancelledError:
             pass
 
-    async def _send_raw(self, data: bytes) -> None:
-        if not self._client or not self._write_char:
-            raise BleakError("Not connected")
-
-        for i in range(0, len(data), BLE_MTU_SIZE):
-            chunk = data[i:i + BLE_MTU_SIZE]
-            await self._client.write_gatt_char(self._write_char, chunk)
-
-    async def _send_command(self, cmd_id: str, payload: bytes = b"") -> bool:
-        if not await self._ensure_connected():
-            self._last_write_result = "Niet verbonden"
-            return False
-
-        frame = _build_frame(cmd_id, payload, session_key=self._session_key, encrypt=True)
-        self._ack_event = asyncio.Event()
-
+    async def _request_status(self):
+        if not self._is_connected or not self._authenticated:
+            return
         try:
-            await self._send_raw(frame)
-            hex_str = frame.hex()
-            self._last_write_result = f"Sent: {cmd_id} ({hex_str})"
-            _LOGGER.debug("Sent command %s: %s", cmd_id, hex_str)
+            frame = build_frame(CMD_STATUS, self._session_key, None, encrypt=True)
+            await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
+            _LOGGER.debug("Status request sent")
+        except Exception as err:
+            _LOGGER.warning("Status request failed: %s", err)
 
-            try:
-                await asyncio.wait_for(self._ack_event.wait(), timeout=3.0)
-                if self._last_ack:
-                    self._last_write_result = f"OK: {cmd_id}"
-                    return True
-                else:
-                    self._last_write_result = f"NACK: {cmd_id}"
-                    return False
-            except asyncio.TimeoutError:
-                self._last_write_result = f"Timeout: {cmd_id}"
-                return True
-
-        except (BleakError, OSError) as err:
-            self._last_write_result = f"Error: {err}"
-            _LOGGER.error("Failed to send command %s: %s", cmd_id, err)
-            self._last_error_message = f"Commando mislukt: {err}"
-            self._is_connected = False
-            self._authenticated = False
-            self._client = None
-            self._stop_keepalive()
-            self._notify_callbacks()
-            self._schedule_reconnect()
-            return False
-
-    async def brew(
-        self,
-        beverage: str = "espresso",
-        strength: str = "medium",
-        cups: int = 1,
-    ) -> bool:
-        bev_type = BEVERAGE_MAP.get(beverage, 0)
-        intensity = STRENGTH_MAP.get(strength, Intensity.MEDIUM)
-
-        recipe = DEFAULT_RECIPES.get(beverage, DEFAULT_RECIPES["espresso"])
-        process_type = recipe["process"]
-        shots = recipe["shots"]
-        portion = recipe["portion"]
-
-        direct_key_name = BEVERAGE_TO_DIRECT_KEY.get(beverage)
-        direct_key = DIRECT_KEY_MAP.get(direct_key_name, 7) if direct_key_name else 7
-
-        recipe_id = 200 + bev_type
-
-        component1 = bytes([
-            process_type,
-            shots,
-            Blend.BLEND_1,
-            intensity,
-            Aroma.STANDARD,
-            Temperature.NORMAL,
-            portion & 0xFF,
-            0,
-        ])
-
-        if beverage in ("cappuccino", "caffe_latte", "cafe_au_lait", "flat_white",
-                        "latte_macchiato", "latte_macchiato_extra", "latte_macchiato_triple",
-                        "espresso_macchiato"):
-            component2 = bytes([
-                RecipeProcess.STEAM,
-                Shots.NONE,
-                Blend.BARISTA_T,
-                Intensity.MEDIUM,
-                Aroma.STANDARD,
-                Temperature.NORMAL,
-                100,
-                0,
-            ])
-        elif beverage == "hot_water":
-            component2 = bytes([0] * 8)
-        elif beverage in ("milk", "milk_froth"):
-            component2 = bytes([0] * 8)
-        else:
-            component2 = bytes([0] * 8)
-
-        payload = bytearray(66)
-        struct.pack_into(">H", payload, 0, recipe_id)
-        payload[2] = bev_type
-        payload[3] = direct_key
-        payload[4:12] = component1
-        payload[12:20] = component2
-
-        self._current_beverage = beverage
-        self._strength = strength
-        self._cups = cups
-
-        success = await self._send_command(CMD_BREW, bytes(payload))
-        if success:
-            self._is_brewing = True
-            self._notify_callbacks()
-        return success
-
-    async def stop(self) -> bool:
-        success = await self._send_command(CMD_SET_PROCESS, struct.pack(">H", Process.READY))
-        if success:
-            self._is_brewing = False
-            self._current_beverage = None
-            self._notify_callbacks()
-        return success
-
-    async def clean(self) -> bool:
-        success = await self._send_command(CMD_SET_PROCESS, struct.pack(">H", Process.CLEANING))
-        if success:
-            self._status = "cleaning"
-            self._notify_callbacks()
-        return success
-
-    async def easy_clean(self) -> bool:
-        success = await self._send_command(CMD_SET_PROCESS, struct.pack(">H", Process.EASY_CLEAN))
-        if success:
-            self._status = "easy_clean"
-            self._notify_callbacks()
-        return success
-
-    async def intensive_clean(self) -> bool:
-        success = await self._send_command(CMD_SET_PROCESS, struct.pack(">H", Process.INTENSIVE_CLEAN))
-        if success:
-            self._status = "intensive_clean"
-            self._notify_callbacks()
-        return success
-
-    async def rinse(self) -> bool:
-        return await self.easy_clean()
-
-    async def descale(self) -> bool:
-        success = await self._send_command(CMD_SET_PROCESS, struct.pack(">H", Process.DESCALING))
-        if success:
-            self._status = "descaling"
-            self._notify_callbacks()
-        return success
-
-    async def standby(self) -> bool:
-        success = await self._send_command(CMD_SET_PROCESS, struct.pack(">H", Process.SWITCH_OFF))
-        if success:
-            self._status = "switch_off"
-            self._notify_callbacks()
-        return success
-
-    async def read_value(self, param_id: int) -> bool:
-        return await self._send_command(CMD_READ_VALUE, struct.pack(">H", param_id))
-
-    async def write_value(self, param_id: int, value: int) -> bool:
-        payload = struct.pack(">Hi", param_id, value)
-        return await self._send_command(CMD_WRITE_VALUE, payload)
-
-    async def update(self) -> None:
+    async def async_update(self):
         if not self._is_connected:
-            await self.connect()
-        elif not self._authenticated:
-            _LOGGER.info("BLE connected but not authenticated, retrying auth for %s", self._address)
+            if self._reconnect_attempts < self._max_reconnect_attempts:
+                await self.connect()
+            return
+
+        if self._is_connected and not self._authenticated:
             await self._authenticate()
             if self._authenticated:
                 self._status = "ready"
                 self._start_keepalive()
-                _LOGGER.info("Authentication succeeded on retry for %s", self._address)
-                await self._request_initial_status()
                 self._notify_callbacks()
-        else:
+
+        if self._authenticated:
+            await self._request_status()
+
+    async def brew(self, beverage_type: int, strength: int | None = None, cups: int | None = None) -> bool:
+        if not self._authenticated or not self._session_key:
+            _LOGGER.warning("Cannot brew: not authenticated (auth=%s, session=%s)", self._authenticated, self._session_key is not None)
+            return False
+
+        s = strength if strength is not None else self._strength
+        c = cups if cups is not None else self._cups
+        payload = bytes([beverage_type & 0xFF, s & 0xFF, c & 0xFF])
+
+        bev_name = BEVERAGE_NAMES.get(beverage_type, f"type_{beverage_type}")
+        _LOGGER.info(
+            "Brewing: %s (type=%d), strength=%d, cups=%d, payload=%s",
+            bev_name, beverage_type, s, c, payload.hex(),
+        )
+
+        try:
+            frame = build_frame(CMD_BREW, self._session_key, payload, encrypt=True)
+            _LOGGER.debug("Brew frame: %s", frame.hex())
+            await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
+            _LOGGER.info("Brew command SENT for %s (strength=%d, cups=%d)", bev_name, s, c)
+            return True
+        except Exception as err:
+            _LOGGER.error("Brew command FAILED: %s", err)
+            return False
+
+    async def send_write(self, param_id: int, value: int) -> bool:
+        if not self._authenticated or not self._session_key:
+            _LOGGER.warning("Cannot write: not authenticated")
+            return False
+
+        payload = bytes([
+            (param_id >> 8) & 0xFF, param_id & 0xFF,
+            (value >> 24) & 0xFF, (value >> 16) & 0xFF,
+            (value >> 8) & 0xFF, value & 0xFF,
+        ])
+
+        try:
+            frame = build_frame(CMD_WRITE, self._session_key, payload, encrypt=True)
+            await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
+            _LOGGER.debug("Write command sent: param=%d, value=%d", param_id, value)
+            return True
+        except Exception as err:
+            _LOGGER.error("Write command failed: %s", err)
+            return False
+
+    async def disconnect(self):
+        self._shutting_down = True
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
+
+        if self._client and self._is_connected:
             try:
-                frame = _build_frame(CMD_STATUS, b"", session_key=self._session_key, encrypt=True)
-                await self._send_raw(frame)
-            except Exception as err:
-                _LOGGER.debug("Status poll failed: %s", err)
-                self._is_connected = False
-                self._authenticated = False
-                self._client = None
-                self._stop_keepalive()
-                self._notify_callbacks()
-                if not self._shutting_down:
-                    self._schedule_reconnect()
+                await asyncio.wait_for(self._client.disconnect(), timeout=DISCONNECT_TIMEOUT)
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.warning("Disconnect error: %s", err)
 
-
-async def discover_all_ble_devices(timeout: float = 10.0) -> list:
-    try:
-        devices = await BleakScanner.discover(timeout=timeout)
-        return devices
-    except Exception as err:
-        _LOGGER.warning("BLE scan failed: %s", err)
-        return []
+        self._is_connected = False
+        self._authenticated = False
+        self._session_key = None
+        self._status = "offline"
+        self._shutting_down = False
+        self._notify_callbacks()

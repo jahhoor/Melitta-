@@ -1,330 +1,184 @@
 DOMAIN = "melitta_coffee"
+
 CONF_MAC_ADDRESS = "mac_address"
-CONF_DEVICE_NAME = "device_name"
-CONF_MODEL = "model"
 
-DEFAULT_NAME = "Melitta Koffiezetapparaat"
+BLE_READ_UUID = "0000ad02-b35c-11e4-9813-0002a5d5c51b"
+BLE_WRITE_UUID = "0000ad03-b35c-11e4-9813-0002a5d5c51b"
 
-MELITTA_SERVICE_UUID = "0000ad01-b35c-11e4-9813-0002a5d5c51b"
-MELITTA_READ_CHAR_UUID = "0000ad02-b35c-11e4-9813-0002a5d5c51b"
-MELITTA_WRITE_CHAR_UUID = "0000ad03-b35c-11e4-9813-0002a5d5c51b"
+FRAME_START = 0x53  # 'S'
+FRAME_END = 0x45    # 'E'
 
-SUPPORTED_MACHINE_CODES_T = {"8301", "8311", "8401"}
-SUPPORTED_MACHINE_CODES_TS = {"8501", "8601", "8604"}
-SUPPORTED_MACHINE_CODES = SUPPORTED_MACHINE_CODES_T | SUPPORTED_MACHINE_CODES_TS
+SUPPORTED_MACHINE_CODES = {"8301", "8311", "8401", "8501", "8601", "8604"}
 
-MACHINE_CODE_TO_MODEL = {
+MACHINE_CODE_NAMES = {
     "8301": "Caffeo Barista T",
-    "8311": "Caffeo Barista T",
-    "8401": "Barista T Smart",
-    "8501": "Caffeo Barista TS",
+    "8311": "Caffeo Barista TS",
+    "8401": "Barista Smart",
+    "8501": "Barista T Smart",
     "8601": "Barista TS Smart",
     "8604": "Barista TS Smart",
 }
 
-SUPPORTED_MODELS = [
-    "Barista Smart",
-    "Barista T Smart",
-    "Barista TS Smart",
-    "Caffeo Barista T",
-    "Caffeo Barista TS",
+AES_KEY = bytes([
+    -125 & 0xFF, 74, 62, -104 & 0xFF, 13, 101, -6 & 0xFF, -52 & 0xFF,
+    89, 70, -71 & 0xFF, 68, 40, 36, 7, 45,
+    -80 & 0xFF, -41 & 0xFF, 125, -48 & 0xFF, -66 & 0xFF, 9, -125 & 0xFF, -77 & 0xFF,
+    -54 & 0xFF, -18 & 0xFF, 10, -81 & 0xFF, -108 & 0xFF, 114, -87 & 0xFF, 36
+])
+
+AES_ENCRYPTED_DATA = bytes([
+    -81 & 0xFF, -14 & 0xFF, 21, -30 & 0xFF, 26, 60, 54, -89 & 0xFF,
+    11, -42 & 0xFF, 95, -65 & 0xFF, 125, -6 & 0xFF, -99 & 0xFF, -111 & 0xFF,
+    65, -16 & 0xFF, 14, 36, -126 & 0xFF, -40 & 0xFF, 13, -28 & 0xFF,
+    15, 114, -48 & 0xFF, 48, -28 & 0xFF, -9 & 0xFF, -87 & 0xFF, 63,
+    72, 122, -75 & 0xFF, 57, -13 & 0xFF, 101, 23, -7 & 0xFF,
+    123, -9 & 0xFF, -66 & 0xFF, -30 & 0xFF, -87 & 0xFF, 5, -113 & 0xFF, -47 & 0xFF
+])
+
+RC4_KEY_PART_B = bytes([
+    125, 57, 51, 41, 121, 78, -30 & 0xFF, 10,
+    -62 & 0xFF, -22 & 0xFF, -27 & 0xFF, -19 & 0xFF, -89 & 0xFF, -85 & 0xFF, 3, 40, -12 & 0xFF
+])
+
+RC4_KEY_PART_A = bytes([
+    99, -127 & 0xFF, 119, 125, 118, 101, -102 & 0xFF, -108 & 0xFF,
+    -39 & 0xFF, 100, -61 & 0xFF, -117 & 0xFF, -95 & 0xFF, -65 & 0xFF, -14 & 0xFF
+])
+
+IV_INIT = bytes([
+    -72 & 0xFF, -1 & 0xFF, -122 & 0xFF, -122 & 0xFF, 64, -10 & 0xFF, 12, -118 & 0xFF,
+    25, 69, -117 & 0xFF, -123 & 0xFF, 58, -99 & 0xFF, 93, -2 & 0xFF
+])
+
+SBOX = [
+    98, 6, 85, 150, 36, 23, 112, 164, 135, 207, 169, 5, 26, 64, 165, 219,
+    61, 20, 68, 89, 130, 63, 52, 102, 24, 229, 132, 245, 80, 216, 195, 115,
+    90, 168, 156, 203, 177, 120, 2, 190, 188, 7, 100, 185, 174, 243, 162, 10,
+    237, 18, 253, 225, 8, 208, 172, 244, 255, 126, 101, 79, 145, 235, 228, 121,
+    123, 251, 67, 250, 161, 0, 107, 97, 241, 111, 181, 82, 249, 33, 69, 55,
+    59, 153, 29, 9, 213, 167, 84, 93, 30, 46, 94, 75, 151, 114, 73, 222,
+    197, 96, 210, 45, 16, 227, 248, 202, 51, 152, 252, 125, 81, 206, 215, 186,
+    39, 158, 178, 187, 131, 136, 1, 49, 50, 17, 141, 91, 47, 129, 60, 99,
+    154, 35, 86, 171, 105, 34, 38, 200, 147, 58, 77, 118, 173, 246, 76, 254,
+    133, 232, 196, 144, 198, 124, 53, 4, 108, 74, 223, 234, 134, 230, 157, 139,
+    189, 205, 199, 128, 176, 19, 211, 236, 127, 192, 231, 70, 233, 88, 146, 44,
+    183, 201, 22, 83, 13, 214, 116, 109, 159, 32, 95, 226, 140, 220, 57, 12,
+    221, 31, 209, 182, 143, 92, 149, 184, 148, 62, 113, 65, 37, 27, 106, 166,
+    3, 14, 204, 72, 21, 41, 56, 66, 28, 193, 40, 217, 25, 54, 179, 117,
+    238, 87, 240, 155, 180, 170, 242, 212, 191, 163, 78, 218, 137, 194, 175, 110,
+    43, 119, 224, 71, 122, 142, 42, 160, 104, 48, 247, 103, 15, 11, 138, 239,
 ]
-
-
-def detect_model_from_name(ble_name: str) -> str | None:
-    if ble_name and len(ble_name) >= 4:
-        prefix = ble_name[:4]
-        return MACHINE_CODE_TO_MODEL.get(prefix)
-    return None
-
-
-def is_melitta_machine_code(name: str) -> bool:
-    if name and len(name) >= 4:
-        return name[:4] in SUPPORTED_MACHINE_CODES
-    return False
-
-FRAME_START = 0x53
-FRAME_END = 0x45
-FRAME_MAX_SIZE = 128
-BLE_MTU_SIZE = 20
 
 CMD_AUTH = "G\x02"
 CMD_KEEPALIVE = "G\x01"
-CMD_BREW = "HJ"
-CMD_WRITE_VALUE = "HW"
-CMD_READ_VALUE = "HR"
-CMD_SET_PROCESS = "HZ"
 CMD_STATUS = "HX"
-CMD_RECIPE_CONFIRM = "HC"
-CMD_ALPHA_VALUE = "HA"
-CMD_VERSION = "HV"
-CMD_ACK = "A"
+CMD_BREW = "HJ"
+CMD_READ = "HR"
+CMD_WRITE = "HW"
+CMD_SET_PROCESS = "HZ"
+CMD_ACKNOWLEDGE = "A"
 CMD_NACK = "N"
+CMD_VERSION = "HV"
+CMD_FACTORY = "HF"
+CMD_LIST = "HL"
+CMD_QUERY = "HQ"
+CMD_ANSWER = "HA"
+CMD_PARAMETER = "HP"
+CMD_CONFIRM = "HC"
+
+COMMAND_REGISTRY = {
+    "A": (0, True),
+    "N": (0, True),
+    "HV": (11, True),
+    "HF": (16, True),
+    "HL": (20, True),
+    "HQ": (15, True),
+    "HR": (6, True),
+    "HW": (6, True),
+    "HA": (66, True),
+    "HP": (14, True),
+    "HC": (66, True),
+    "HX": (8, True),
+    "HJ": (3, True),
+    "HZ": (3, True),
+}
 
 KEEPALIVE_INTERVAL = 55
 
-SBOX = bytes([
-    98, 6, 85, -106 & 0xFF, 36, 23, 112, -92 & 0xFF, -121 & 0xFF, -49 & 0xFF,
-    -87 & 0xFF, 5, 26, 64, -91 & 0xFF, -37 & 0xFF, 61, 20, 68, 89,
-    -126 & 0xFF, 63, 52, 102, 24, -27 & 0xFF, -124 & 0xFF, -11 & 0xFF, 80, -40 & 0xFF,
-    -61 & 0xFF, 115, 90, -88 & 0xFF, -100 & 0xFF, -53 & 0xFF, -79 & 0xFF, 120, 2, -66 & 0xFF,
-    -68 & 0xFF, 7, 100, -71 & 0xFF, -82 & 0xFF, -13 & 0xFF, -94 & 0xFF, 10, -19 & 0xFF, 18,
-    -3 & 0xFF, -31 & 0xFF, 8, -48 & 0xFF, -84 & 0xFF, -12 & 0xFF, -1 & 0xFF, 126, 101, 79,
-    -111 & 0xFF, -21 & 0xFF, -28 & 0xFF, 121, 123, -5 & 0xFF, 67, -6 & 0xFF, -95 & 0xFF, 0,
-    107, 97, -15 & 0xFF, 111, -75 & 0xFF, 82, -7 & 0xFF, 33, 69, 55,
-    59, -103 & 0xFF, 29, 9, -43 & 0xFF, -89 & 0xFF, 84, 93, 30, 46,
-    94, 75, -105 & 0xFF, 114, 73, -34 & 0xFF, -59 & 0xFF, 96, -46 & 0xFF, 45,
-    16, -29 & 0xFF, -8 & 0xFF, -54 & 0xFF, 51, -104 & 0xFF, -4 & 0xFF, 125, 81, -50 & 0xFF,
-    -41 & 0xFF, -70 & 0xFF, 39, -98 & 0xFF, -78 & 0xFF, -69 & 0xFF, -125 & 0xFF, -120 & 0xFF, 1, 49,
-    50, 17, -115 & 0xFF, 91, 47, -127 & 0xFF, 60, 99, -102 & 0xFF, 35,
-    86, -85 & 0xFF, 105, 34, 38, -56 & 0xFF, -109 & 0xFF, 58, 77, 118,
-    -83 & 0xFF, -10 & 0xFF, 76, -2 & 0xFF, -123 & 0xFF, -24 & 0xFF, -60 & 0xFF, -112 & 0xFF, -58 & 0xFF, 124,
-    53, 4, 108, 74, -33 & 0xFF, -22 & 0xFF, -122 & 0xFF, -26 & 0xFF, -99 & 0xFF, -117 & 0xFF,
-    -67 & 0xFF, -51 & 0xFF, -57 & 0xFF, -128 & 0xFF, -80 & 0xFF, 19, -45 & 0xFF, -20 & 0xFF, 127, -64 & 0xFF,
-    -25 & 0xFF, 70, -23 & 0xFF, 88, -110 & 0xFF, 44, -73 & 0xFF, -55 & 0xFF, 22, 83,
-    13, -42 & 0xFF, 116, 109, -97 & 0xFF, 32, 95, -30 & 0xFF, -116 & 0xFF, -36 & 0xFF,
-    57, 12, -35 & 0xFF, 31, -47 & 0xFF, -74 & 0xFF, -113 & 0xFF, 92, -107 & 0xFF, -72 & 0xFF,
-    -108 & 0xFF, 62, 113, 65, 37, 27, 106, -90 & 0xFF, 3, 14,
-    -52 & 0xFF, 72, 21, 41, 56, 66, 28, -63 & 0xFF, 40, -39 & 0xFF,
-    25, 54, -77 & 0xFF, 117, -18 & 0xFF, 87, -16 & 0xFF, -101 & 0xFF, -76 & 0xFF, -86 & 0xFF,
-    -14 & 0xFF, -44 & 0xFF, -65 & 0xFF, -93 & 0xFF, 78, -38 & 0xFF, -119 & 0xFF, -62 & 0xFF, -81 & 0xFF, 110,
-    43, 119, -32 & 0xFF, 71, 122, -114 & 0xFF, 42, -96 & 0xFF, 104, 48,
-    -9 & 0xFF, 103, 15, 11, -118 & 0xFF, -17 & 0xFF,
-])
+BEVERAGE_ESPRESSO = 0
+BEVERAGE_RISTRETTO = 1
+BEVERAGE_LUNGO = 2
+BEVERAGE_ESPRESSO_DOPIO = 3
+BEVERAGE_RISTRETTO_DOPIO = 4
+BEVERAGE_CAFE_CREME = 5
+BEVERAGE_CAFE_CREME_DOPIO = 6
+BEVERAGE_AMERICANO = 7
+BEVERAGE_AMERICANO_EXTRA = 8
+BEVERAGE_CAPPUCCINO = 9
+BEVERAGE_LATTE_MACCHIATO = 10
+BEVERAGE_CAFE_LATTE = 11
+BEVERAGE_FLAT_WHITE = 12
+BEVERAGE_MILK_FOAM = 13
+BEVERAGE_WARM_MILK = 14
+BEVERAGE_HOT_WATER = 15
+BEVERAGE_MY_COFFEE = 16
 
-ENCRYPTION_KEY_48 = bytes([
-    0xAF, 0xF2, 0x15, 0xE2, 0x1A, 0x3C, 0x36, 0xA7,
-    0x0B, 0xD6, 0x5F, 0xBF, 0x7D, 0xFA, 0x9D, 0x91,
-    0x41, 0xF0, 0x0E, 0x24, 0x82, 0xD8, 0x0D, 0xE4,
-    0x0F, 0x72, 0xD0, 0x30, 0xE4, 0xF7, 0xA9, 0x3F,
-    0x48, 0x7A, 0xB5, 0x39, 0xF3, 0x65, 0x17, 0xF9,
-    0x7B, 0xF7, 0xBE, 0xE2, 0xA9, 0x05, 0x8F, 0xD1,
-])
-
-ENCRYPTION_KEY_32 = bytes([
-    0x83, 0x4A, 0x3E, 0x98, 0x0D, 0x65, 0xFA, 0xCC,
-    0x59, 0x46, 0xB9, 0x44, 0x28, 0x24, 0x07, 0x2D,
-    0xB0, 0xD7, 0x7D, 0xD0, 0xBE, 0x09, 0x83, 0xB3,
-    0xCA, 0xEE, 0x0A, 0xAF, 0x94, 0x72, 0xA9, 0x24,
-])
-
-RC4_KEY = bytes([
-    0x4D, 0x45, 0x4C, 0x5F, 0x30, 0x39, 0x30, 0x32,
-    0x31, 0x37, 0x5F, 0x56, 0x31, 0x30, 0x5F, 0x3F,
-    0x52, 0x34, 0x2E, 0x77, 0x6F, 0x7A, 0x4A, 0x21,
-    0x28, 0x2A, 0x71, 0x32, 0x64, 0x73, 0x33, 0x23,
-])
-
-class Process:
-    READY = 2
-    PRODUCT = 4
-    CLEANING = 9
-    DESCALING = 10
-    FILTER_INSERT = 11
-    FILTER_REPLACE = 12
-    FILTER_REMOVE = 13
-    SWITCH_OFF = 16
-    EASY_CLEAN = 17
-    INTENSIVE_CLEAN = 19
-    EVAPORATING = 20
-    BUSY = 99
-
-PROCESS_MAP = {
-    Process.READY: "ready",
-    Process.PRODUCT: "brewing",
-    Process.CLEANING: "cleaning",
-    Process.DESCALING: "descaling",
-    Process.FILTER_INSERT: "filter_insert",
-    Process.FILTER_REPLACE: "filter_replace",
-    Process.FILTER_REMOVE: "filter_remove",
-    Process.SWITCH_OFF: "switch_off",
-    Process.EASY_CLEAN: "easy_clean",
-    Process.INTENSIVE_CLEAN: "intensive_clean",
-    Process.EVAPORATING: "evaporating",
-    Process.BUSY: "busy",
+BEVERAGE_NAMES = {
+    BEVERAGE_ESPRESSO: "Espresso",
+    BEVERAGE_RISTRETTO: "Ristretto",
+    BEVERAGE_LUNGO: "Lungo",
+    BEVERAGE_ESPRESSO_DOPIO: "Espresso Dopio",
+    BEVERAGE_RISTRETTO_DOPIO: "Ristretto Dopio",
+    BEVERAGE_CAFE_CREME: "Café Crème",
+    BEVERAGE_CAFE_CREME_DOPIO: "Café Crème Dopio",
+    BEVERAGE_AMERICANO: "Americano",
+    BEVERAGE_AMERICANO_EXTRA: "Americano Extra",
+    BEVERAGE_CAPPUCCINO: "Cappuccino",
+    BEVERAGE_LATTE_MACCHIATO: "Latte Macchiato",
+    BEVERAGE_CAFE_LATTE: "Café Latte",
+    BEVERAGE_FLAT_WHITE: "Flat White",
+    BEVERAGE_MILK_FOAM: "Milk Foam",
+    BEVERAGE_WARM_MILK: "Warm Milk",
+    BEVERAGE_HOT_WATER: "Hot Water",
+    BEVERAGE_MY_COFFEE: "My Coffee",
 }
 
-class SubProcess:
-    GRINDING = 1
-    COFFEE = 2
-    STEAM = 3
-    WATER = 4
-    PREPARE = 5
+MACHINE_STATE_READY = 2
+MACHINE_STATE_PRODUCT = 4
+MACHINE_STATE_CLEANING = 9
+MACHINE_STATE_DESCALING = 10
+MACHINE_STATE_FILTER_INSERT = 11
+MACHINE_STATE_FILTER_REPLACE = 12
+MACHINE_STATE_FILTER_REMOVE = 13
+MACHINE_STATE_SWITCH_OFF = 16
+MACHINE_STATE_EASY_CLEAN = 17
+MACHINE_STATE_INTENSIVE_CLEAN = 19
+MACHINE_STATE_EVAPORATING = 20
+MACHINE_STATE_BUSY = 99
 
-SUBPROCESS_MAP = {
-    SubProcess.GRINDING: "grinding",
-    SubProcess.COFFEE: "coffee",
-    SubProcess.STEAM: "steam",
-    SubProcess.WATER: "water",
-    SubProcess.PREPARE: "prepare",
+MACHINE_STATE_NAMES = {
+    MACHINE_STATE_READY: "Ready",
+    MACHINE_STATE_PRODUCT: "Brewing",
+    MACHINE_STATE_CLEANING: "Cleaning",
+    MACHINE_STATE_DESCALING: "Descaling",
+    MACHINE_STATE_FILTER_INSERT: "Filter Insert",
+    MACHINE_STATE_FILTER_REPLACE: "Filter Replace",
+    MACHINE_STATE_FILTER_REMOVE: "Filter Remove",
+    MACHINE_STATE_SWITCH_OFF: "Switch Off",
+    MACHINE_STATE_EASY_CLEAN: "Easy Clean",
+    MACHINE_STATE_INTENSIVE_CLEAN: "Intensive Clean",
+    MACHINE_STATE_EVAPORATING: "Evaporating",
+    MACHINE_STATE_BUSY: "Busy",
 }
 
-class Manipulation:
-    NONE = 0
-    BU_REMOVED = 1
-    TRAYS_MISSING = 2
-    EMPTY_TRAYS = 3
-    FILL_WATER = 4
-    CLOSE_POWDER_LID = 5
-    FILL_POWDER = 6
+PRODUCT_ESPRESSO = 0
+PRODUCT_COFFEE = 1
+PRODUCT_CAPPUCCINO = 2
+PRODUCT_MACCHIATO = 3
+PRODUCT_MILK_FROTH = 4
+PRODUCT_MILK = 5
+PRODUCT_WATER = 6
+PRODUCT_MENU = 7
 
-MANIPULATION_MAP = {
-    Manipulation.NONE: None,
-    Manipulation.BU_REMOVED: "brewing_unit_removed",
-    Manipulation.TRAYS_MISSING: "drip_tray_missing",
-    Manipulation.EMPTY_TRAYS: "empty_drip_tray",
-    Manipulation.FILL_WATER: "fill_water",
-    Manipulation.CLOSE_POWDER_LID: "close_powder_lid",
-    Manipulation.FILL_POWDER: "fill_powder",
-}
-
-class InfoFlag:
-    FILL_BEANS_1 = 0
-    FILL_BEANS_2 = 1
-    EASY_CLEAN = 2
-    POWDER_FILLED = 3
-    PREPARATION_CANCELLED = 4
-
-class RecipeProcess:
-    NONE = 0
-    COFFEE = 1
-    STEAM = 2
-    WATER = 3
-    WARM_MILK = 2
-
-class Shots:
-    NONE = 0
-    ONE = 1
-    TWO = 2
-    THREE = 3
-
-class Blend:
-    BARISTA_T = 0
-    BLEND_1 = 1
-    BLEND_2 = 2
-
-class Intensity:
-    VERY_MILD = 0
-    MILD = 1
-    MEDIUM = 2
-    STRONG = 3
-    VERY_STRONG = 4
-
-class Aroma:
-    STANDARD = 0
-    INTENSE = 1
-
-class Temperature:
-    COLD = 0
-    NORMAL = 1
-    HIGH = 2
-
-BEVERAGE_MAP = {
-    "espresso":               0,
-    "ristretto":              1,
-    "lungo":                  2,
-    "espresso_doppio":        3,
-    "ristretto_doppio":       4,
-    "cafe_creme":             5,
-    "cafe_creme_doppio":      6,
-    "americano":              7,
-    "americano_extra":        8,
-    "long_black":             9,
-    "red_eye":                10,
-    "black_eye":              11,
-    "dead_eye":               12,
-    "cappuccino":             13,
-    "espresso_macchiato":     14,
-    "caffe_latte":            15,
-    "cafe_au_lait":           16,
-    "flat_white":             17,
-    "latte_macchiato":        18,
-    "latte_macchiato_extra":  19,
-    "latte_macchiato_triple": 20,
-    "milk":                   21,
-    "milk_froth":             22,
-    "hot_water":              23,
-    "freestyle":              24,
-}
-
-BEVERAGE_NAMES = {v: k for k, v in BEVERAGE_MAP.items()}
-
-DIRECT_KEY_MAP = {
-    "espresso": 0,
-    "coffee": 1,
-    "cappuccino": 2,
-    "macchiato": 3,
-    "milk_froth": 4,
-    "milk": 5,
-    "water": 6,
-    "menu": 7,
-}
-
-BEVERAGE_TO_DIRECT_KEY = {
-    "espresso": "espresso",
-    "ristretto": "espresso",
-    "lungo": "espresso",
-    "espresso_doppio": "espresso",
-    "ristretto_doppio": "espresso",
-    "cafe_creme": "coffee",
-    "cafe_creme_doppio": "coffee",
-    "americano": "coffee",
-    "americano_extra": "coffee",
-    "long_black": "coffee",
-    "red_eye": "coffee",
-    "black_eye": "coffee",
-    "dead_eye": "coffee",
-    "cappuccino": "cappuccino",
-    "espresso_macchiato": "macchiato",
-    "caffe_latte": "macchiato",
-    "cafe_au_lait": "macchiato",
-    "flat_white": "macchiato",
-    "latte_macchiato": "macchiato",
-    "latte_macchiato_extra": "macchiato",
-    "latte_macchiato_triple": "macchiato",
-    "milk": "milk",
-    "milk_froth": "milk_froth",
-    "hot_water": "water",
-}
-
-STRENGTH_MAP = {
-    "very_mild": Intensity.VERY_MILD,
-    "mild": Intensity.MILD,
-    "medium": Intensity.MEDIUM,
-    "strong": Intensity.STRONG,
-    "very_strong": Intensity.VERY_STRONG,
-}
-
-STRENGTH_NAMES = {v: k for k, v in STRENGTH_MAP.items()}
-
-DEFAULT_RECIPES = {
-    "espresso":               {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "ristretto":              {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.STRONG, "portion": 25},
-    "lungo":                  {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 120},
-    "espresso_doppio":        {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 80},
-    "ristretto_doppio":       {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.STRONG, "portion": 50},
-    "cafe_creme":             {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 120},
-    "cafe_creme_doppio":      {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 240},
-    "americano":              {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "americano_extra":        {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "long_black":             {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "red_eye":                {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.STRONG, "portion": 120},
-    "black_eye":              {"process": RecipeProcess.COFFEE, "shots": Shots.THREE, "intensity": Intensity.STRONG, "portion": 120},
-    "dead_eye":               {"process": RecipeProcess.COFFEE, "shots": Shots.THREE, "intensity": Intensity.VERY_STRONG, "portion": 120},
-    "cappuccino":             {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "espresso_macchiato":     {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "caffe_latte":            {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "cafe_au_lait":           {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MILD,   "portion": 60},
-    "flat_white":             {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.STRONG, "portion": 40},
-    "latte_macchiato":        {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "latte_macchiato_extra":  {"process": RecipeProcess.COFFEE, "shots": Shots.TWO,   "intensity": Intensity.MEDIUM, "portion": 40},
-    "latte_macchiato_triple": {"process": RecipeProcess.COFFEE, "shots": Shots.THREE, "intensity": Intensity.MEDIUM, "portion": 40},
-    "milk":                   {"process": RecipeProcess.STEAM,  "shots": Shots.NONE,  "intensity": Intensity.MEDIUM, "portion": 100},
-    "milk_froth":             {"process": RecipeProcess.STEAM,  "shots": Shots.NONE,  "intensity": Intensity.MEDIUM, "portion": 100},
-    "hot_water":              {"process": RecipeProcess.WATER,  "shots": Shots.NONE,  "intensity": Intensity.MEDIUM, "portion": 200},
-    "freestyle":              {"process": RecipeProcess.COFFEE, "shots": Shots.ONE,   "intensity": Intensity.MEDIUM, "portion": 40},
-}
-
-SCAN_INTERVAL = 30
-CONNECT_TIMEOUT = 20
-DISCONNECT_TIMEOUT = 5
+INTENSITY_STANDARD = 0
+INTENSITY_INTENSE = 1
