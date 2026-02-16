@@ -265,33 +265,51 @@ class MelittaDevice:
             self._handle_frame(frame)
 
     async def _start_polling(self):
-        _LOGGER.info("Starting BLE characteristic polling on %s (fallback mode)", BLE_READ_UUID)
+        _LOGGER.warning("POLLING STARTED on %s (200ms interval)", BLE_READ_UUID)
         self._notify_mode = "polling"
         last_data = None
+        poll_count = 0
         try:
             while self._is_connected and not self._shutting_down:
                 client = self._client
                 if client is None:
-                    _LOGGER.debug("Polling: client is None, stopping")
+                    _LOGGER.warning("POLLING STOPPED: client is None")
                     break
                 try:
                     data = await client.read_gatt_char(BLE_READ_UUID)
-                    if data and len(data) > 0 and data != last_data:
-                        _LOGGER.warning("BLE POLL RX: %d bytes, raw_hex=%s", len(data), data.hex())
-                        last_data = data
-                        self._process_incoming_data(data)
+                    poll_count += 1
+                    if data and len(data) > 0:
+                        if data != last_data:
+                            _LOGGER.warning(
+                                "BLE POLL RX [#%d]: NEW data, %d bytes, hex=%s",
+                                poll_count, len(data), data.hex(),
+                            )
+                            last_data = data
+                            self._process_incoming_data(data)
+                        elif poll_count <= 10 or poll_count % 25 == 0:
+                            _LOGGER.warning(
+                                "BLE POLL [#%d]: same data repeated, %d bytes, hex=%s",
+                                poll_count, len(data), data.hex(),
+                            )
+                    elif poll_count <= 10 or poll_count % 25 == 0:
+                        _LOGGER.warning(
+                            "BLE POLL [#%d]: empty/null response (data=%s)",
+                            poll_count, repr(data),
+                        )
                 except BleakError as err:
                     if not self._is_connected or self._shutting_down or self._client is None:
+                        _LOGGER.warning("POLLING STOPPED: disconnected during BleakError: %s", err)
                         break
-                    _LOGGER.debug("Polling read error (non-fatal): %s", err)
+                    _LOGGER.warning("BLE POLL ERROR [#%d]: %s: %s", poll_count, type(err).__name__, err)
                 except Exception as err:
                     if not self._is_connected or self._shutting_down or self._client is None:
+                        _LOGGER.warning("POLLING STOPPED: disconnected during error: %s", err)
                         break
-                    _LOGGER.debug("Polling error (non-fatal): %s", err)
+                    _LOGGER.warning("BLE POLL ERROR [#%d]: %s: %s", poll_count, type(err).__name__, err)
                 await asyncio.sleep(0.2)
         except asyncio.CancelledError:
-            _LOGGER.debug("Polling task cancelled")
-        _LOGGER.debug("Polling loop ended")
+            _LOGGER.warning("POLLING CANCELLED after %d reads", poll_count)
+        _LOGGER.warning("POLLING ENDED after %d reads (connected=%s)", poll_count, self._is_connected)
 
     def _stop_polling(self):
         if self._polling_task and not self._polling_task.done():
@@ -924,8 +942,19 @@ class MelittaDevice:
             )
 
             try:
-                await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=with_response)
+                await asyncio.wait_for(
+                    self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=with_response),
+                    timeout=5.0,
+                )
                 _LOGGER.warning("AUTH WRITE OK (%s)", desc)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "AUTH WRITE HUNG (%s): write_gatt_char did not return within 5s! "
+                    "BLE connection may be stale.",
+                    desc,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
             except Exception as err:
                 _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
                 if not self._is_connected or self._client is None:
