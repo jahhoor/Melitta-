@@ -784,13 +784,7 @@ class MelittaDevice:
                 _LOGGER.warning("Connection lost during settle for %s", self._address)
                 return False
 
-            _LOGGER.info(
-                "Starting polling-first mode on %s (bypasses D-Bus StartNotify issues)",
-                BLE_READ_UUID,
-            )
             self._notify_mode = "polling"
-            self._polling_task = asyncio.ensure_future(self._start_polling())
-
             self._status = "authenticating"
             self._notify_callbacks()
 
@@ -803,6 +797,11 @@ class MelittaDevice:
 
             if self._authenticated:
                 self._status = "ready"
+                _LOGGER.info(
+                    "Starting background polling on %s AFTER successful auth",
+                    BLE_READ_UUID,
+                )
+                self._polling_task = asyncio.ensure_future(self._start_polling())
                 self._start_keepalive()
                 _LOGGER.info("CONNECTED and AUTHENTICATED with %s (polling mode)", self._address)
                 await self._request_status()
@@ -813,6 +812,8 @@ class MelittaDevice:
                     "machine may need pairing button press",
                     self._address,
                 )
+                _LOGGER.info("Starting polling despite auth failure (for retry)")
+                self._polling_task = asyncio.ensure_future(self._start_polling())
 
             self._notify_callbacks()
             return self._authenticated
@@ -922,13 +923,13 @@ class MelittaDevice:
         )
 
         auth_attempts = [
-            (auth_encrypted, "encrypted", False, 0.3),
-            (auth_plaintext, "plaintext", False, 0.5),
-            (auth_encrypted, "encrypted-with-response", True, 0.5),
-            (auth_plaintext, "plaintext-with-response", True, 0.5),
+            (auth_encrypted, "encrypted", False),
+            (auth_plaintext, "plaintext", False),
+            (auth_encrypted, "encrypted-with-response", True),
+            (auth_plaintext, "plaintext-with-response", True),
         ]
 
-        for attempt, (frame, desc, with_response, retry_delay) in enumerate(auth_attempts):
+        for attempt, (frame, desc, with_response) in enumerate(auth_attempts):
             if not self._is_connected or self._client is None:
                 _LOGGER.warning("Connection lost before auth attempt %d", attempt + 1)
                 return
@@ -953,33 +954,31 @@ class MelittaDevice:
                     "BLE connection may be stale.",
                     desc,
                 )
-                await asyncio.sleep(retry_delay)
+                await asyncio.sleep(0.5)
                 continue
             except Exception as err:
                 _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
                 if not self._is_connected or self._client is None:
                     _LOGGER.warning("Connection lost after auth write failure")
                     return
-                await asyncio.sleep(retry_delay)
+                await asyncio.sleep(0.5)
                 continue
 
-            try:
-                await asyncio.wait_for(self._auth_event.wait(), timeout=AUTH_TIMEOUT)
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "AUTH TIMEOUT after %.1fs with %s frame (no response via polling). "
-                    "Machine may not be in pairing mode.",
-                    AUTH_TIMEOUT, desc,
-                )
-                await asyncio.sleep(retry_delay)
-                continue
+            got_response = await self._poll_for_auth_response(desc)
 
             if self._authenticated:
                 _LOGGER.warning("AUTH SUCCEEDED with %s frame on attempt %d", desc, attempt + 1)
                 return
 
-            _LOGGER.warning("AUTH attempt %d (%s) got a response but validation FAILED", attempt + 1, desc)
-            await asyncio.sleep(retry_delay)
+            if got_response:
+                _LOGGER.warning("AUTH attempt %d (%s) got a response but validation FAILED", attempt + 1, desc)
+            else:
+                _LOGGER.warning(
+                    "AUTH attempt %d (%s): no response within timeout. "
+                    "Machine may not be in pairing mode.",
+                    attempt + 1, desc,
+                )
+            await asyncio.sleep(0.3)
 
         self._last_error = (
             "Authenticatie mislukt. Controleer of de machine in koppelmodus staat. "
@@ -990,6 +989,65 @@ class MelittaDevice:
             "Tried encrypted+plaintext with response=False and response=True.",
             len(auth_attempts), self._address,
         )
+
+    async def _poll_for_auth_response(self, desc: str) -> bool:
+        client = self._client
+        if client is None:
+            return False
+
+        poll_interval = 0.15
+        max_polls = int(AUTH_TIMEOUT / poll_interval)
+        last_data = None
+
+        _LOGGER.warning(
+            "AUTH POLL: reading %s every %.0fms for up to %.1fs (%d reads max)",
+            BLE_READ_UUID, poll_interval * 1000, AUTH_TIMEOUT, max_polls,
+        )
+
+        for i in range(max_polls):
+            if not self._is_connected or self._client is None:
+                _LOGGER.warning("AUTH POLL: connection lost at read #%d", i + 1)
+                return False
+
+            try:
+                data = await asyncio.wait_for(
+                    client.read_gatt_char(BLE_READ_UUID),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning("AUTH POLL [#%d]: read_gatt_char timed out (2s)", i + 1)
+                continue
+            except BleakError as err:
+                _LOGGER.warning("AUTH POLL [#%d]: BleakError: %s", i + 1, err)
+                await asyncio.sleep(poll_interval)
+                continue
+            except Exception as err:
+                _LOGGER.warning("AUTH POLL [#%d]: %s: %s", i + 1, type(err).__name__, err)
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if data and len(data) > 0 and data != last_data:
+                _LOGGER.warning(
+                    "AUTH POLL [#%d]: NEW data received, %d bytes, hex=%s",
+                    i + 1, len(data), data.hex(),
+                )
+                last_data = data
+                self._process_incoming_data(data)
+
+                if self._authenticated or self._auth_event.is_set():
+                    _LOGGER.warning("AUTH POLL: auth event set after %d reads", i + 1)
+                    return True
+            elif i < 5 or i % 10 == 0:
+                _LOGGER.warning(
+                    "AUTH POLL [#%d]: %s",
+                    i + 1,
+                    "same/empty data" if data == last_data else f"data={repr(data)}",
+                )
+
+            await asyncio.sleep(poll_interval)
+
+        _LOGGER.warning("AUTH POLL: no auth response after %d reads (%.1fs)", max_polls, AUTH_TIMEOUT)
+        return False
 
     def _start_keepalive(self):
         if self._keepalive_task and not self._keepalive_task.done():
