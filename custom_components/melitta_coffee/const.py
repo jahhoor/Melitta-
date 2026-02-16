@@ -69,8 +69,8 @@ SBOX = [
     43, 119, 224, 71, 122, 142, 42, 160, 104, 48, 247, 103, 15, 11, 138, 239,
 ]
 
-CMD_AUTH = "G\x02"
-CMD_KEEPALIVE = "G\x01"
+CMD_AUTH = "HU"
+CMD_KEEPALIVE = "HV"
 CMD_STATUS = "HX"
 CMD_BREW = "HJ"
 CMD_READ = "HR"
@@ -87,8 +87,9 @@ CMD_PARAMETER = "HP"
 CMD_CONFIRM = "HC"
 
 COMMAND_REGISTRY = {
-    "A": (0, True),
-    "N": (0, True),
+    "A": (0, False),
+    "N": (0, False),
+    "HU": (8, True),
     "HV": (11, True),
     "HF": (16, True),
     "HL": (20, True),

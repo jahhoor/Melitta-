@@ -20,10 +20,10 @@ from .protocol import build_frame, EfComParser, EfComFrame
 
 _LOGGER = logging.getLogger(__name__)
 
-AUTH_TIMEOUT = 8.0
+AUTH_TIMEOUT = 6.0
 CONNECT_TIMEOUT = 15.0
 DISCONNECT_TIMEOUT = 10.0
-BLE_SETTLE_DELAY = 2.0
+BLE_SETTLE_DELAY = 1.0
 RECONNECT_BASE_DELAY = 10.0
 RECONNECT_MAX_DELAY = 300.0
 RECONNECT_MAX_ATTEMPTS = 0
@@ -242,7 +242,13 @@ class MelittaDevice:
         elif frame.command == CMD_STATUS:
             self._handle_status_response(frame)
         elif frame.command == CMD_KEEPALIVE:
-            _LOGGER.debug("Keepalive acknowledged")
+            if len(frame.payload) >= 11:
+                _LOGGER.debug(
+                    "Version/keepalive response: payload=%s (%d bytes)",
+                    frame.payload.hex(), len(frame.payload),
+                )
+            else:
+                _LOGGER.debug("Keepalive acknowledged")
         elif frame.command == "A":
             _LOGGER.debug("ACK received")
         elif frame.command == "N":
@@ -503,10 +509,10 @@ class MelittaDevice:
         _LOGGER.debug("Auth plaintext frame (%d bytes): %s", len(auth_plaintext), auth_plaintext.hex())
 
         auth_attempts = [
-            (auth_encrypted, "encrypted", False, 0.5),
-            (auth_plaintext, "plaintext", False, 1.0),
-            (auth_encrypted, "encrypted-with-response", True, 1.5),
-            (auth_plaintext, "plaintext-with-response", True, 2.0),
+            (auth_encrypted, "encrypted", False, 0.3),
+            (auth_plaintext, "plaintext", False, 0.5),
+            (auth_encrypted, "encrypted-with-response", True, 0.5),
+            (auth_plaintext, "plaintext-with-response", True, 0.5),
         ]
 
         for attempt, (frame, desc, with_response, retry_delay) in enumerate(auth_attempts):

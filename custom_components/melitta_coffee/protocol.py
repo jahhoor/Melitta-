@@ -158,15 +158,6 @@ class EfComParser:
                 _LOGGER.debug("Detected frame cmd=%r, expected_len=%d", cmd_str, expected)
                 return expected
 
-        if self._pos >= 3:
-            cmd_2 = data[1:3].decode("latin-1", errors="replace")
-            if cmd_2 == "G\x02":
-                _LOGGER.debug("Detected auth response frame (G\\x02), expected_len=13")
-                return 1 + 2 + 8 + 2
-            elif cmd_2 == "G\x01":
-                _LOGGER.debug("Detected keepalive frame (G\\x01), expected_len=5")
-                return 1 + 2 + 0 + 2
-
         return 0
 
     def _try_parse_frame(self) -> EfComFrame | None:
@@ -198,45 +189,6 @@ class EfComParser:
                 frame = self._try_decode(data, cmd_str, cmd_len, payload_len, try_encrypted=False)
                 if frame is not None:
                     return frame
-
-        cmd_2 = data[1:3].decode("latin-1", errors="replace")
-        if cmd_2 == "G\x02" or cmd_2 == "G\x01":
-            _LOGGER.debug("Trying G-command parse: cmd=%r, frame_hex=%s", cmd_2, data.hex())
-            payload_start = 3
-            payload_end = self._pos - 2
-            if payload_end > payload_start:
-                payload = data[payload_start:payload_end]
-            else:
-                payload = b""
-            chk = compute_checksum(self._pos - 2, data)
-            _LOGGER.debug("G-cmd plaintext checksum: computed=0x%02x, in_frame=0x%02x", chk, data[self._pos - 2])
-            if chk == data[self._pos - 2]:
-                _LOGGER.debug("G-cmd PLAINTEXT checksum OK, payload=%s", payload.hex())
-                return EfComFrame(cmd_2, payload, False)
-            for key_fn in [get_rc4_key, get_rc4_key_alt]:
-                key_name = "primary" if key_fn == get_rc4_key else "alt"
-                rc4_key = key_fn()
-                work = bytearray(data)
-                enc_start = 3
-                enc_len = self._pos - 3 - 1
-                _LOGGER.debug(
-                    "G-cmd trying %s RC4 key: enc_start=%d, enc_len=%d, encrypted_portion=%s",
-                    key_name, enc_start, enc_len, bytes(work[enc_start:enc_start + enc_len]).hex(),
-                )
-                if enc_len > 0:
-                    decrypted = rc4_crypt(rc4_key, bytes(work[enc_start:enc_start + enc_len]))
-                    for i in range(enc_len):
-                        work[enc_start + i] = decrypted[i]
-                    chk2 = compute_checksum(self._pos - 2, work)
-                    _LOGGER.debug(
-                        "G-cmd %s key: decrypted_frame=%s, checksum computed=0x%02x, in_frame=0x%02x",
-                        key_name, bytes(work).hex(), chk2, work[self._pos - 2],
-                    )
-                    if chk2 == work[self._pos - 2]:
-                        payload = bytes(work[payload_start:payload_end])
-                        _LOGGER.info("G-cmd ENCRYPTED (%s key) checksum OK, payload_len=%d", key_name, len(payload))
-                        _LOGGER.debug("G-cmd decoded payload hex: %s", payload.hex())
-                        return EfComFrame(cmd_2, payload, True)
 
         _LOGGER.warning("Failed to parse frame: %s", data.hex())
         return None
