@@ -171,10 +171,15 @@ class MelittaDevice:
                 self._keepalive_task.cancel()
                 self._keepalive_task = None
 
+            use_fast_reconnect = False
             if was_auth:
                 self._status = "auth_dropped"
                 self._last_error = "Machine dropped connection during authentication. Press 'Verbinden' on the machine display."
                 self._auth_event.set()
+            elif prev_status == "connecting":
+                self._status = "offline"
+                self._last_error = "Verbinding verbroken tijdens opzetten"
+                use_fast_reconnect = True
             elif not self._shutting_down:
                 self._status = "offline"
                 self._last_error = "Connection lost"
@@ -186,7 +191,7 @@ class MelittaDevice:
             self._notify_callbacks()
 
             if not self._shutting_down:
-                self.schedule_reconnect()
+                self.schedule_reconnect(fast=use_fast_reconnect)
         finally:
             self._disconnect_in_progress = False
 
@@ -195,7 +200,7 @@ class MelittaDevice:
             self._reconnect_task.cancel()
             self._reconnect_task = None
 
-    def schedule_reconnect(self):
+    def schedule_reconnect(self, fast: bool = False):
         if self._shutting_down:
             return
         if self._is_connected and self._authenticated:
@@ -207,8 +212,11 @@ class MelittaDevice:
             _LOGGER.debug("Reconnect already scheduled for %s", self._address)
             return
 
-        capped_attempts = min(self._reconnect_attempts, 5)
-        delay = min(RECONNECT_BASE_DELAY * (2 ** capped_attempts), RECONNECT_MAX_DELAY)
+        if fast and self._reconnect_attempts < 2:
+            delay = 3.0
+        else:
+            capped_attempts = min(self._reconnect_attempts, 5)
+            delay = min(RECONNECT_BASE_DELAY * (2 ** capped_attempts), RECONNECT_MAX_DELAY)
         self._reconnect_attempts += 1
         _LOGGER.info(
             "Scheduling reconnect to %s in %.0fs (attempt %d)",
@@ -524,6 +532,9 @@ class MelittaDevice:
                     return "notify_acquired"
                 _LOGGER.error("Notification error (AcquireNotify): %s", err)
                 return "failed"
+            except EOFError:
+                _LOGGER.error("D-Bus connection crashed (EOFError) during AcquireNotify - BlueZ connection lost")
+                return "dbus_crash"
         except BleakError as err:
             err_msg = str(err)
             if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
@@ -531,6 +542,9 @@ class MelittaDevice:
                 return "notify_acquired"
             _LOGGER.error("Notification error (StartNotify): %s", err)
             return "failed"
+        except EOFError:
+            _LOGGER.error("D-Bus connection crashed (EOFError) during StartNotify - BlueZ connection lost")
+            return "dbus_crash"
 
     async def _remove_device_from_bluez(self) -> bool:
         mac_path = self._address.replace(":", "_").upper()
@@ -649,6 +663,26 @@ class MelittaDevice:
 
             notify_result = await self._start_notifications_with_retry()
 
+            if notify_result == "dbus_crash":
+                _LOGGER.error(
+                    "=== D-BUS CONNECTION CRASHED ===\n"
+                    "The BlueZ D-Bus socket closed unexpectedly during notification setup.\n"
+                    "This disconnects the BLE client. Reconnecting immediately..."
+                )
+                await self._internal_disconnect()
+                self._status = "dbus_recovery"
+                self._last_error = "Bluetooth D-Bus verbinding verbroken, opnieuw verbinden..."
+                self._notify_callbacks()
+                if not _retry_after_bluez_clear:
+                    await asyncio.sleep(2.0)
+                    return await self._do_connect(_retry_after_bluez_clear=True)
+                else:
+                    _LOGGER.warning("D-Bus crashed again on retry - scheduling normal reconnect")
+                    self._status = "offline"
+                    self._last_error = "Bluetooth D-Bus blijft crashen. Herstart Home Assistant host."
+                    self._notify_callbacks()
+                    return False
+
             if notify_result == "notify_acquired" and not _retry_after_bluez_clear:
                 _LOGGER.warning(
                     "=== STALE BLUEZ NOTIFICATION STATE DETECTED ===\n"
@@ -725,10 +759,14 @@ class MelittaDevice:
             self._notify_callbacks()
             return self._authenticated
 
-        except (BleakError, asyncio.TimeoutError, OSError) as err:
+        except (BleakError, asyncio.TimeoutError, OSError, EOFError) as err:
             self._status = "offline"
-            self._last_error = f"Verbinding mislukt: {err}"
-            _LOGGER.error("CONNECT FAILED to %s: %s", self._address, err)
+            if isinstance(err, EOFError):
+                self._last_error = "Bluetooth D-Bus verbinding verbroken tijdens verbinden"
+                _LOGGER.error("CONNECT FAILED (D-Bus EOFError) to %s: %s", self._address, err)
+            else:
+                self._last_error = f"Verbinding mislukt: {err}"
+                _LOGGER.error("CONNECT FAILED to %s: %s", self._address, err)
             self._notify_callbacks()
             return False
 
