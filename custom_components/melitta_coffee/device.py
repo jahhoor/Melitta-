@@ -54,6 +54,7 @@ class MelittaDevice:
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = RECONNECT_MAX_ATTEMPTS
         self._disconnect_in_progress = False
+        self._suppress_disconnect_callback = False
         self._last_status_data: bytes | None = None
         self._strength: int = 2
         self._cups: int = 1
@@ -146,6 +147,9 @@ class MelittaDevice:
                 _LOGGER.exception("Error in callback")
 
     def _on_disconnect(self, client: BleakClient):
+        if self._suppress_disconnect_callback:
+            _LOGGER.debug("Ignoring disconnect callback (suppressed during internal disconnect)")
+            return
         if client is not self._client:
             _LOGGER.debug("Ignoring disconnect callback from stale client")
             return
@@ -384,25 +388,130 @@ class MelittaDevice:
         finally:
             self._connect_pending = False
 
+    async def _internal_disconnect(self):
+        if self._client is None:
+            return
+        old_client = self._client
+        self._client = None
+        self._is_connected = False
+        self._suppress_disconnect_callback = True
+        try:
+            try:
+                await old_client.stop_notify(BLE_READ_UUID)
+            except Exception:
+                pass
+            try:
+                await old_client.disconnect()
+            except Exception:
+                pass
+        finally:
+            self._suppress_disconnect_callback = False
+
+    async def _internal_reconnect_ble(self) -> bool:
+        ble_device = None
+        if self._hass is not None:
+            try:
+                from homeassistant.components.bluetooth import async_ble_device_from_address
+                ble_device = async_ble_device_from_address(self._hass, self._address, connectable=True)
+                if not ble_device:
+                    _LOGGER.warning("Device not found during internal reconnect")
+                    return False
+            except Exception as e:
+                _LOGGER.error("Failed to get BLEDevice during internal reconnect: %s", e)
+                return False
+        else:
+            ble_device = self._address
+
+        try:
+            if self._hass is not None and not isinstance(ble_device, str):
+                self._client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    ble_device,
+                    self._name,
+                    disconnected_callback=self._on_disconnect,
+                    max_attempts=2,
+                )
+            else:
+                self._client = BleakClient(
+                    ble_device,
+                    timeout=CONNECT_TIMEOUT,
+                    disconnected_callback=self._on_disconnect,
+                )
+                await self._client.connect()
+            self._is_connected = True
+            _LOGGER.info("Internal BLE reconnect succeeded for %s", self._address)
+            await asyncio.sleep(BLE_SETTLE_DELAY)
+            return True
+        except Exception as err:
+            _LOGGER.error("Internal BLE reconnect failed: %s", err)
+            self._client = None
+            self._is_connected = False
+            return False
+
+    async def _start_notifications_with_retry(self) -> bool:
+        self._cancel_reconnect()
+
+        for attempt in range(3):
+            if not self._client or not self._is_connected:
+                _LOGGER.warning("No client/connection for notify attempt %d", attempt + 1)
+                return False
+
+            try:
+                await self._client.stop_notify(BLE_READ_UUID)
+                _LOGGER.debug("stop_notify succeeded (attempt %d)", attempt + 1)
+            except Exception as e:
+                _LOGGER.debug("stop_notify failed (attempt %d, non-fatal): %s", attempt + 1, e)
+
+            try:
+                await self._client.start_notify(BLE_READ_UUID, self._on_notification)
+                _LOGGER.info("Notifications started successfully (attempt %d)", attempt + 1)
+                return True
+            except BleakError as err:
+                err_msg = str(err)
+                if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
+                    is_last_attempt = (attempt == 2)
+
+                    if is_last_attempt:
+                        _LOGGER.warning(
+                            "Notify acquired (attempt %d/3, FINAL): %s - "
+                            "accepting existing BlueZ subscription as fallback. "
+                            "Notifications may already be active from previous session.",
+                            attempt + 1, err_msg,
+                        )
+                        return True
+
+                    _LOGGER.warning(
+                        "Notify acquired (attempt %d/3): %s - internal disconnect + wait + reconnect",
+                        attempt + 1, err_msg,
+                    )
+                    await self._internal_disconnect()
+
+                    wait_time = 3.0 + attempt * 2.0
+                    _LOGGER.debug("Waiting %.1fs for BlueZ to release notify FD...", wait_time)
+                    await asyncio.sleep(wait_time)
+
+                    if self._shutting_down:
+                        return False
+
+                    if not await self._internal_reconnect_ble():
+                        return False
+
+                    self._cancel_reconnect()
+                else:
+                    _LOGGER.error("Unexpected notification error: %s", err)
+                    return False
+
+        _LOGGER.error("Failed to start notifications after 3 attempts")
+        return False
+
     async def _do_connect(self) -> bool:
         self._cancel_reconnect()
 
         if self._client is not None:
             _LOGGER.debug("Cleaning up previous BLE client before reconnect")
-            old_client = self._client
-            self._client = None
-            self._is_connected = False
-            try:
-                try:
-                    await old_client.stop_notify(BLE_READ_UUID)
-                except Exception:
-                    pass
-                try:
-                    await old_client.disconnect()
-                except Exception:
-                    pass
-            except Exception as cleanup_err:
-                _LOGGER.debug("Cleanup error (non-fatal): %s", cleanup_err)
+            await self._internal_disconnect()
+            _LOGGER.debug("Waiting 2s after disconnect for BlueZ to release resources...")
+            await asyncio.sleep(2.0)
 
         _LOGGER.info(
             "Connecting to %s (attempt %d): status=%s, connected=%s, auth=%s, hass=%s",
@@ -486,33 +595,14 @@ class MelittaDevice:
                 return False
 
             _LOGGER.debug("Starting notifications on %s", BLE_READ_UUID)
-            try:
-                await self._client.stop_notify(BLE_READ_UUID)
-                _LOGGER.debug("Stopped existing notifications before resubscribing")
-            except Exception:
-                pass
-            try:
-                await self._client.start_notify(BLE_READ_UUID, self._on_notification)
-                _LOGGER.debug("Notifications started")
-            except BleakError as notify_err:
-                err_msg = str(notify_err)
-                if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
-                    _LOGGER.warning(
-                        "Notify acquired error on %s: %s - disconnecting to clear stale state",
-                        BLE_READ_UUID, err_msg,
-                    )
-                    try:
-                        await self._client.disconnect()
-                    except Exception:
-                        pass
-                    self._client = None
-                    self._is_connected = False
-                    self._status = "offline"
-                    self._last_error = "Bluetooth-notificaties konden niet gestart worden. Opnieuw proberen..."
-                    self._notify_callbacks()
-                    return False
-                else:
-                    raise
+            notify_ok = await self._start_notifications_with_retry()
+
+            if not notify_ok:
+                _LOGGER.error("Failed to set up notifications on %s after all attempts", BLE_READ_UUID)
+                self._status = "offline"
+                self._last_error = "Bluetooth-notificaties konden niet gestart worden"
+                self._notify_callbacks()
+                return False
 
             _LOGGER.debug("Waiting 0.5s after notification setup...")
             await asyncio.sleep(0.5)
