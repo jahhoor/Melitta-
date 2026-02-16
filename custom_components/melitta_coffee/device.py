@@ -55,6 +55,8 @@ class MelittaDevice:
         self._max_reconnect_attempts = RECONNECT_MAX_ATTEMPTS
         self._disconnect_in_progress = False
         self._suppress_disconnect_callback = False
+        self._notify_mode = "notifications"
+        self._polling_task: asyncio.Task | None = None
         self._last_status_data: bytes | None = None
         self._strength: int = 2
         self._cups: int = 1
@@ -164,6 +166,7 @@ class MelittaDevice:
             self._is_connected = False
             self._authenticated = False
             self._session_key = None
+            self._stop_polling()
             if self._keepalive_task and not self._keepalive_task.done():
                 self._keepalive_task.cancel()
                 self._keepalive_task = None
@@ -243,12 +246,49 @@ class MelittaDevice:
 
     def _on_notification(self, sender, data: bytes):
         _LOGGER.info("BLE RX notification: %d bytes, raw_hex=%s, sender=%s", len(data), data.hex(), sender)
+        self._process_incoming_data(data)
+
+    def _process_incoming_data(self, data: bytes):
         frames = self._parser.feed(data)
         if not frames:
-            _LOGGER.debug("No complete frames parsed from this notification (buffering)")
+            _LOGGER.debug("No complete frames parsed (buffering)")
         for frame in frames:
-            _LOGGER.info("Parsed frame from notification: %s", frame)
+            _LOGGER.info("Parsed frame: %s", frame)
             self._handle_frame(frame)
+
+    async def _start_polling(self):
+        _LOGGER.info("Starting BLE characteristic polling on %s (fallback mode)", BLE_READ_UUID)
+        self._notify_mode = "polling"
+        last_data = None
+        try:
+            while self._is_connected and not self._shutting_down:
+                client = self._client
+                if client is None:
+                    _LOGGER.debug("Polling: client is None, stopping")
+                    break
+                try:
+                    data = await client.read_gatt_char(BLE_READ_UUID)
+                    if data and len(data) > 0 and data != last_data:
+                        _LOGGER.info("BLE POLL RX: %d bytes, raw_hex=%s", len(data), data.hex())
+                        last_data = data
+                        self._process_incoming_data(data)
+                except BleakError as err:
+                    if not self._is_connected or self._shutting_down or self._client is None:
+                        break
+                    _LOGGER.debug("Polling read error (non-fatal): %s", err)
+                except Exception as err:
+                    if not self._is_connected or self._shutting_down or self._client is None:
+                        break
+                    _LOGGER.debug("Polling error (non-fatal): %s", err)
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            _LOGGER.debug("Polling task cancelled")
+        _LOGGER.debug("Polling loop ended")
+
+    def _stop_polling(self):
+        if self._polling_task and not self._polling_task.done():
+            self._polling_task.cancel()
+            self._polling_task = None
 
     def _handle_frame(self, frame: EfComFrame):
         _LOGGER.debug("Received frame: %s", frame)
@@ -394,6 +434,7 @@ class MelittaDevice:
         old_client = self._client
         self._client = None
         self._is_connected = False
+        self._stop_polling()
         self._suppress_disconnect_callback = True
         try:
             try:
@@ -451,58 +492,123 @@ class MelittaDevice:
     async def _start_notifications_with_retry(self) -> bool:
         self._cancel_reconnect()
 
-        for attempt in range(3):
-            if not self._client or not self._is_connected:
-                _LOGGER.warning("No client/connection for notify attempt %d", attempt + 1)
+        if not self._client or not self._is_connected:
+            _LOGGER.warning("No client/connection for notify setup")
+            return False
+
+        try:
+            await self._client.stop_notify(BLE_READ_UUID)
+            _LOGGER.debug("stop_notify succeeded, waiting 1s for BlueZ to release FD...")
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            _LOGGER.debug("stop_notify failed (non-fatal): %s", e)
+
+        bleak_supports_start_notify = True
+        try:
+            await self._client.start_notify(
+                BLE_READ_UUID, self._on_notification,
+                **{"use_start_notify": True}
+            )
+            _LOGGER.info(
+                "BLE notifications active via StartNotify (bleak >= 2.1.0). "
+                "Using legacy D-Bus method - avoids AcquireNotify FD issues."
+            )
+            self._notify_mode = "notifications"
+            return True
+        except TypeError:
+            bleak_supports_start_notify = False
+            _LOGGER.info(
+                "use_start_notify not available (bleak < 2.1.0). "
+                "Trying default AcquireNotify method."
+            )
+        except BleakError as err:
+            err_msg = str(err)
+            if "Notify acquired" not in err_msg and "NotPermitted" not in err_msg:
+                _LOGGER.error("Notification error (StartNotify): %s", err)
                 return False
+            _LOGGER.warning(
+                "StartNotify failed with: %s. "
+                "This should not happen with bleak >= 2.1.0 - check bleak version.",
+                err_msg,
+            )
 
-            try:
-                await self._client.stop_notify(BLE_READ_UUID)
-                _LOGGER.debug("stop_notify succeeded (attempt %d)", attempt + 1)
-            except Exception as e:
-                _LOGGER.debug("stop_notify failed (attempt %d, non-fatal): %s", attempt + 1, e)
-
+        if not bleak_supports_start_notify:
             try:
                 await self._client.start_notify(BLE_READ_UUID, self._on_notification)
-                _LOGGER.info("Notifications started successfully (attempt %d)", attempt + 1)
+                _LOGGER.info("BLE notifications active via AcquireNotify (bleak 2.0.x)")
+                self._notify_mode = "notifications"
                 return True
             except BleakError as err:
                 err_msg = str(err)
-                if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
-                    is_last_attempt = (attempt == 2)
-
-                    if is_last_attempt:
-                        _LOGGER.warning(
-                            "Notify acquired (attempt %d/3, FINAL): %s - "
-                            "accepting existing BlueZ subscription as fallback. "
-                            "Notifications may already be active from previous session.",
-                            attempt + 1, err_msg,
-                        )
-                        return True
-
-                    _LOGGER.warning(
-                        "Notify acquired (attempt %d/3): %s - internal disconnect + wait + reconnect",
-                        attempt + 1, err_msg,
-                    )
-                    await self._internal_disconnect()
-
-                    wait_time = 3.0 + attempt * 2.0
-                    _LOGGER.debug("Waiting %.1fs for BlueZ to release notify FD...", wait_time)
-                    await asyncio.sleep(wait_time)
-
-                    if self._shutting_down:
-                        return False
-
-                    if not await self._internal_reconnect_ble():
-                        return False
-
-                    self._cancel_reconnect()
-                else:
-                    _LOGGER.error("Unexpected notification error: %s", err)
+                if "Notify acquired" not in err_msg and "NotPermitted" not in err_msg:
+                    _LOGGER.error("Notification error (AcquireNotify): %s", err)
                     return False
+                _LOGGER.error(
+                    "=== KNOWN BLEAK 2.0.0 BUG: 'Notify acquired' ===\n"
+                    "Error: %s\n"
+                    "BlueZ holds a stale notification file descriptor from a previous session.\n"
+                    "This prevents receiving BLE notifications (including auth responses).\n"
+                    "\n"
+                    "SOLUTIONS (in order of preference):\n"
+                    "1. Upgrade Home Assistant to a version with bleak >= 2.1.0\n"
+                    "   (Adds use_start_notify=True which bypasses this bug)\n"
+                    "2. Reboot your Home Assistant host (clears stale BlueZ state)\n"
+                    "3. Run: bluetoothctl remove %s (then re-add the integration)\n"
+                    "\n"
+                    "Attempting CCCD descriptor write + polling as best-effort workaround...",
+                    err_msg, self._address,
+                )
 
-        _LOGGER.error("Failed to start notifications after 3 attempts")
-        return False
+        cccd_ok = await self._try_enable_notifications_via_cccd()
+        if cccd_ok:
+            return True
+
+        _LOGGER.warning(
+            "CCCD write unavailable. Starting polling fallback (every 200ms). "
+            "Auth may not work - see solutions above."
+        )
+        self._polling_task = asyncio.ensure_future(self._start_polling())
+        return True
+
+    async def _try_enable_notifications_via_cccd(self) -> bool:
+        ENABLE_NOTIFICATION = b'\x01\x00'
+
+        try:
+            if not self._client or not self._client.services:
+                return False
+
+            char = self._client.services.get_characteristic(BLE_READ_UUID)
+            if char is None:
+                _LOGGER.debug("Characteristic %s not found in services", BLE_READ_UUID)
+                return False
+
+            cccd_desc = None
+            for desc in char.descriptors:
+                if "2902" in desc.uuid.lower():
+                    cccd_desc = desc
+                    break
+
+            if cccd_desc is None:
+                _LOGGER.debug("No CCCD descriptor (0x2902) on characteristic %s", BLE_READ_UUID)
+                return False
+
+            _LOGGER.info(
+                "Writing ENABLE_NOTIFICATION (0x0100) to CCCD descriptor "
+                "(handle=%d, uuid=%s) - this matches the Android APK approach",
+                cccd_desc.handle, cccd_desc.uuid,
+            )
+            await self._client.write_gatt_descriptor(cccd_desc.handle, ENABLE_NOTIFICATION)
+            _LOGGER.info(
+                "CCCD write succeeded. Notifications enabled at device level. "
+                "Starting polling to read characteristic data."
+            )
+
+            self._notify_mode = "polling"
+            self._polling_task = asyncio.ensure_future(self._start_polling())
+            return True
+        except Exception as err:
+            _LOGGER.warning("CCCD descriptor write failed: %s", err)
+            return False
 
     async def _do_connect(self) -> bool:
         self._cancel_reconnect()
@@ -522,6 +628,8 @@ class MelittaDevice:
 
         try:
             self._status = "connecting"
+            self._notify_mode = "notifications"
+            self._stop_polling()
             self._notify_callbacks()
 
             ble_device = None
@@ -804,6 +912,7 @@ class MelittaDevice:
         _LOGGER.info("Disconnecting from %s...", self._address)
         self._shutting_down = True
         self._cancel_reconnect()
+        self._stop_polling()
 
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
