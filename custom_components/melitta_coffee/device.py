@@ -474,6 +474,19 @@ class MelittaDevice:
             try:
                 if self._dbus_notify_handler:
                     self._dbus_notify_bus.remove_message_handler(self._dbus_notify_handler)
+                if self._dbus_match_rule:
+                    try:
+                        from dbus_fast import Message
+                        await self._dbus_notify_bus.call(Message(
+                            destination="org.freedesktop.DBus",
+                            path="/org/freedesktop/DBus",
+                            interface="org.freedesktop.DBus",
+                            member="RemoveMatch",
+                            signature="s",
+                            body=[self._dbus_match_rule],
+                        ))
+                    except Exception:
+                        pass
                 self._dbus_notify_bus.disconnect()
             except Exception:
                 pass
@@ -542,59 +555,25 @@ class MelittaDevice:
             self._is_connected = False
             return False
 
-    async def _start_notifications_with_retry(self) -> str:
-        self._cancel_reconnect()
-
-        if not self._client or not self._is_connected:
-            _LOGGER.warning("No client/connection for notify setup")
-            return "failed"
-
+    async def _get_char_dbus_path_async(self, uuid: str) -> str | None:
+        if not self._client:
+            return None
         try:
-            await self._client.stop_notify(BLE_READ_UUID)
-            _LOGGER.debug("stop_notify succeeded")
-        except Exception as e:
-            _LOGGER.debug("stop_notify skipped (non-fatal): %s", e)
+            for service in self._client.services:
+                for char in service.characteristics:
+                    if char.uuid.lower() == uuid.lower():
+                        if hasattr(char, 'path'):
+                            _LOGGER.info("Found char path from bleak service cache: %s", char.path)
+                            return char.path
+                        if hasattr(char, 'obj') and hasattr(char.obj, 'get_object_path'):
+                            p = char.obj.get_object_path()
+                            _LOGGER.info("Found char path from bleak obj: %s", p)
+                            return p
+        except Exception as err:
+            _LOGGER.debug("Could not get char path from bleak services: %s", err)
 
-        try:
-            await self._client.start_notify(
-                BLE_READ_UUID, self._on_notification,
-                **{"use_start_notify": True}
-            )
-            _LOGGER.info("BLE notifications active via StartNotify (bleak >= 2.1.0)")
-            self._notify_mode = "notifications"
-            return "ok"
-        except TypeError:
-            _LOGGER.info("use_start_notify not available (bleak < 2.1.0), trying AcquireNotify")
-            try:
-                await self._client.start_notify(BLE_READ_UUID, self._on_notification)
-                _LOGGER.info("BLE notifications active via AcquireNotify")
-                self._notify_mode = "notifications"
-                return "ok"
-            except BleakError as err:
-                err_msg = str(err)
-                if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
-                    _LOGGER.warning("AcquireNotify blocked by stale BlueZ state: %s", err_msg)
-                    return "notify_acquired"
-                _LOGGER.error("Notification error (AcquireNotify): %s", err)
-                return "failed"
-            except EOFError:
-                _LOGGER.error("D-Bus connection crashed (EOFError) during AcquireNotify - BlueZ connection lost")
-                return "dbus_crash"
-        except BleakError as err:
-            err_msg = str(err)
-            if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
-                _LOGGER.warning("StartNotify blocked by stale BlueZ state: %s", err_msg)
-                return "notify_acquired"
-            _LOGGER.error("Notification error (StartNotify): %s", err)
-            return "failed"
-        except EOFError:
-            _LOGGER.error("D-Bus connection crashed (EOFError) during StartNotify - BlueZ connection lost")
-            return "dbus_crash"
-
-    async def _clear_stale_bluez_notifications(self) -> bool:
         mac_path = self._address.replace(":", "_").upper()
-        read_uuid_short = BLE_READ_UUID.replace("-", "")
-
+        uuid_short = uuid.replace("-", "").lower()
         try:
             from dbus_fast.aio import MessageBus
             from dbus_fast import Message, MessageType, BusType
@@ -603,8 +582,7 @@ class MelittaDevice:
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             try:
                 introspect_root = Message(
-                    destination="org.bluez",
-                    path="/org/bluez",
+                    destination="org.bluez", path="/org/bluez",
                     interface="org.freedesktop.DBus.Introspectable",
                     member="Introspect",
                 )
@@ -615,156 +593,45 @@ class MelittaDevice:
 
                 for adapter in adapters:
                     device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
-
-                    introspect_dev = Message(
-                        destination="org.bluez",
-                        path=device_path,
+                    dev_reply = await bus.call(Message(
+                        destination="org.bluez", path=device_path,
                         interface="org.freedesktop.DBus.Introspectable",
                         member="Introspect",
-                    )
-                    dev_reply = await bus.call(introspect_dev)
+                    ))
                     if dev_reply.message_type == MessageType.ERROR:
-                        _LOGGER.debug("Device %s not found on %s", device_path, adapter)
                         continue
-
                     services = re.findall(r'<node name="(service\w+)"', dev_reply.body[0]) if dev_reply.body else []
-                    for service in services:
-                        service_path = f"{device_path}/{service}"
-                        intro_svc = Message(
-                            destination="org.bluez",
-                            path=service_path,
+                    for svc in services:
+                        svc_path = f"{device_path}/{svc}"
+                        svc_reply = await bus.call(Message(
+                            destination="org.bluez", path=svc_path,
                             interface="org.freedesktop.DBus.Introspectable",
                             member="Introspect",
-                        )
-                        svc_reply = await bus.call(intro_svc)
+                        ))
                         if svc_reply.message_type == MessageType.ERROR:
                             continue
                         chars = re.findall(r'<node name="(char\w+)"', svc_reply.body[0]) if svc_reply.body else []
-                        for char in chars:
-                            char_path = f"{service_path}/{char}"
-                            uuid_msg = Message(
-                                destination="org.bluez",
-                                path=char_path,
+                        for ch in chars:
+                            cp = f"{svc_path}/{ch}"
+                            uuid_reply = await bus.call(Message(
+                                destination="org.bluez", path=cp,
                                 interface="org.freedesktop.DBus.Properties",
-                                member="Get",
-                                signature="ss",
+                                member="Get", signature="ss",
                                 body=["org.bluez.GattCharacteristic1", "UUID"],
-                            )
-                            uuid_reply = await bus.call(uuid_msg)
+                            ))
                             if uuid_reply.message_type == MessageType.ERROR:
                                 continue
                             char_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
-                            if char_uuid.replace("-", "").lower() == read_uuid_short.lower():
-                                _LOGGER.info(
-                                    "Found stale notification characteristic at %s, sending StopNotify",
-                                    char_path,
-                                )
-                                stop_msg = Message(
-                                    destination="org.bluez",
-                                    path=char_path,
-                                    interface="org.bluez.GattCharacteristic1",
-                                    member="StopNotify",
-                                )
-                                stop_reply = await bus.call(stop_msg)
-                                if stop_reply.message_type == MessageType.ERROR:
-                                    _LOGGER.debug(
-                                        "StopNotify on %s: %s %s",
-                                        char_path, stop_reply.error_name, stop_reply.body,
-                                    )
-                                else:
-                                    _LOGGER.info(
-                                        "StopNotify succeeded on %s - stale notification state cleared",
-                                        char_path,
-                                    )
-                                    return True
+                            if char_uuid.replace("-", "").lower() == uuid_short:
+                                _LOGGER.info("Found char path via D-Bus introspection: %s", cp)
+                                return cp
             finally:
                 bus.disconnect()
         except ImportError:
-            _LOGGER.debug("dbus_fast not available for StopNotify")
+            _LOGGER.warning("dbus_fast not available for D-Bus introspection")
         except Exception as err:
-            _LOGGER.debug("D-Bus StopNotify failed: %s (%s)", err, type(err).__name__)
-
-        return False
-
-    async def _remove_device_from_bluez(self) -> bool:
-        mac_path = self._address.replace(":", "_").upper()
-
-        try:
-            from dbus_fast.aio import MessageBus
-            from dbus_fast import Message, MessageType, BusType
-            import re
-
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            try:
-                introspect_msg = Message(
-                    destination="org.bluez",
-                    path="/org/bluez",
-                    interface="org.freedesktop.DBus.Introspectable",
-                    member="Introspect",
-                )
-                reply = await bus.call(introspect_msg)
-                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
-                if not adapters:
-                    adapters = ["hci0"]
-
-                for adapter in adapters:
-                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
-                    adapter_path = f"/org/bluez/{adapter}"
-                    _LOGGER.info(
-                        "Removing %s from BlueZ via D-Bus (adapter=%s, path=%s)",
-                        self._address, adapter, device_path,
-                    )
-                    remove_msg = Message(
-                        destination="org.bluez",
-                        path=adapter_path,
-                        interface="org.bluez.Adapter1",
-                        member="RemoveDevice",
-                        signature="o",
-                        body=[device_path],
-                    )
-                    rm_reply = await bus.call(remove_msg)
-                    if rm_reply.message_type == MessageType.ERROR:
-                        _LOGGER.debug(
-                            "RemoveDevice on %s: %s %s",
-                            adapter, rm_reply.error_name, rm_reply.body,
-                        )
-                        continue
-                    _LOGGER.info(
-                        "Successfully removed %s from BlueZ cache (adapter=%s). "
-                        "Stale notification state cleared.",
-                        self._address, adapter,
-                    )
-                    return True
-            finally:
-                bus.disconnect()
-        except ImportError:
-            _LOGGER.debug("dbus_fast not available for RemoveDevice")
-        except Exception as err:
-            _LOGGER.debug("D-Bus RemoveDevice failed: %s (%s)", err, type(err).__name__)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "bluetoothctl", "remove", self._address,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-            output = (stdout or b"").decode() + (stderr or b"").decode()
-            if proc.returncode == 0 or "removed" in output.lower():
-                _LOGGER.info("Removed %s from BlueZ via bluetoothctl", self._address)
-                return True
-            _LOGGER.debug("bluetoothctl remove output: %s", output.strip())
-        except FileNotFoundError:
-            _LOGGER.debug("bluetoothctl not found")
-        except Exception as err:
-            _LOGGER.debug("bluetoothctl remove failed: %s", err)
-
-        _LOGGER.warning(
-            "Could not remove %s from BlueZ automatically. "
-            "To fix manually, run: bluetoothctl remove %s",
-            self._address, self._address,
-        )
-        return False
+            _LOGGER.warning("D-Bus introspection failed: %s (%s)", err, type(err).__name__)
+        return None
 
     async def _do_connect(self) -> bool:
         self._cancel_reconnect()
@@ -775,7 +642,7 @@ class MelittaDevice:
             await asyncio.sleep(1.0)
 
         _LOGGER.info(
-            "Connecting to %s (attempt %d, polling-first mode)",
+            "Connecting to %s (attempt %d)",
             self._address, self._reconnect_attempts + 1,
         )
 
@@ -816,19 +683,19 @@ class MelittaDevice:
             if self._authenticated:
                 self._status = "ready"
                 if self._notifications_active:
-                    _LOGGER.warning(
-                        "Auth succeeded with notifications. Switching to polling mode "
-                        "to avoid D-Bus stability issues.",
+                    self._notify_mode = "notifications"
+                    _LOGGER.info(
+                        "Auth succeeded with D-Bus notifications active - keeping them for responses",
                     )
-                    await self._stop_notifications()
-                self._notify_mode = "polling"
-                _LOGGER.info(
-                    "Starting background polling on %s AFTER successful auth",
-                    BLE_READ_UUID,
-                )
-                self._polling_task = asyncio.ensure_future(self._start_polling())
+                else:
+                    self._notify_mode = "polling"
+                    _LOGGER.info("Starting background polling (no notifications available)")
+                    self._polling_task = asyncio.ensure_future(self._start_polling())
                 self._start_keepalive()
-                _LOGGER.info("CONNECTED and AUTHENTICATED with %s (polling mode)", self._address)
+                _LOGGER.warning(
+                    "CONNECTED and AUTHENTICATED with %s (mode=%s)",
+                    self._address, self._notify_mode,
+                )
                 await self._request_status()
             else:
                 self._status = "connected_not_auth"
@@ -837,11 +704,10 @@ class MelittaDevice:
                     "machine may need pairing button press",
                     self._address,
                 )
-                if self._notifications_active:
-                    await self._stop_notifications()
-                self._notify_mode = "polling"
-                _LOGGER.info("Starting polling despite auth failure (for retry)")
-                self._polling_task = asyncio.ensure_future(self._start_polling())
+                if not self._notifications_active:
+                    self._notify_mode = "polling"
+                    _LOGGER.info("Starting polling despite auth failure (for retry)")
+                    self._polling_task = asyncio.ensure_future(self._start_polling())
 
             self._notify_callbacks()
             return self._authenticated
@@ -906,181 +772,185 @@ class MelittaDevice:
             )
             await self._client.connect()
 
-    async def _wait_for_device_rediscovery(self, timeout: float = 15.0) -> bool:
-        if self._hass is None:
-            await asyncio.sleep(2.0)
-            return True
-
-        end_time = asyncio.get_event_loop().time() + timeout
-        attempt = 0
-        while asyncio.get_event_loop().time() < end_time:
-            attempt += 1
-            try:
-                from homeassistant.components.bluetooth import async_ble_device_from_address
-                device = async_ble_device_from_address(self._hass, self._address, connectable=True)
-                if device:
-                    _LOGGER.info(
-                        "Device %s rediscovered after BlueZ reset (attempt %d)",
-                        self._address, attempt,
-                    )
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(2.0)
-
-        _LOGGER.warning("Device %s not rediscovered within %.0fs", self._address, timeout)
-        return False
 
     async def _enable_notifications(self):
         if not self._client or not self._is_connected:
             _LOGGER.warning("Cannot enable notifications: no client/connection")
             return False
 
-        result = await self._start_notifications_with_retry()
+        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+        _LOGGER.info("Read characteristic D-Bus path: %s", read_char_path)
 
-        if result == "ok":
-            self._notifications_active = True
-            _LOGGER.warning(
-                "NOTIFICATIONS ENABLED on %s - "
-                "CCCD 0x2902 written by BlueZ, machine should accept auth commands",
-                BLE_READ_UUID,
-            )
-            await asyncio.sleep(0.3)
-            return True
-
-        if result == "notify_acquired":
-            _LOGGER.warning(
-                "start_notify blocked by 'Notify acquired', clearing stale BlueZ state...",
-            )
-            cleared = await self._clear_stale_bluez_notifications()
-            if cleared:
-                _LOGGER.warning("Stale notification state cleared, retrying start_notify...")
-                await asyncio.sleep(0.5)
-                result2 = await self._start_notifications_with_retry()
-                if result2 == "ok":
+        if self._hass is not None:
+            if read_char_path:
+                _LOGGER.info(
+                    "Running inside Home Assistant - using D-Bus PropertiesChanged handler "
+                    "(start_notify skipped to prevent D-Bus crash)."
+                )
+                dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                if dbus_ok:
                     self._notifications_active = True
                     _LOGGER.warning(
-                        "NOTIFICATIONS ENABLED on %s after clearing stale state",
+                        "NOTIFICATIONS via D-Bus PropertiesChanged on %s "
+                        "(safe mode - no start_notify called)",
                         BLE_READ_UUID,
                     )
+                    cccd_ok = await self._ensure_cccd_enabled(read_char_path)
+                    if cccd_ok:
+                        _LOGGER.warning("CCCD confirmed enabled - machine will send notifications")
+                    else:
+                        _LOGGER.warning("CCCD status unknown - notifications may or may not work")
                     await asyncio.sleep(0.3)
                     return True
-                _LOGGER.warning("start_notify still failed after clearing stale state: %s", result2)
+                _LOGGER.warning("D-Bus PropertiesChanged handler registration failed")
             else:
-                _LOGGER.warning("Could not clear stale notification state via D-Bus")
-
-            _LOGGER.warning(
-                "Attempting D-Bus PropertiesChanged fallback to capture notifications "
-                "(another process already has CCCD enabled)..."
-            )
-            dbus_ok = await self._register_dbus_notification_handler()
-            if dbus_ok:
-                self._notifications_active = True
                 _LOGGER.warning(
-                    "NOTIFICATIONS via D-Bus PropertiesChanged handler on %s "
-                    "(piggy-backing on existing CCCD from other process)",
-                    BLE_READ_UUID,
+                    "Could not find read characteristic D-Bus path from service cache. "
+                    "Services may not be fully resolved yet. Retrying after brief delay..."
                 )
+                await asyncio.sleep(1.0)
+                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                if read_char_path:
+                    _LOGGER.info("Found char path on retry: %s", read_char_path)
+                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                    if dbus_ok:
+                        self._notifications_active = True
+                        _LOGGER.warning(
+                            "NOTIFICATIONS via D-Bus PropertiesChanged on %s (after retry)",
+                            BLE_READ_UUID,
+                        )
+                        cccd_ok = await self._ensure_cccd_enabled(read_char_path)
+                        if cccd_ok:
+                            _LOGGER.warning("CCCD confirmed enabled")
+                        await asyncio.sleep(0.3)
+                        return True
+                _LOGGER.warning(
+                    "Cannot find characteristic path in HA mode. "
+                    "Notifications unavailable - auth will use polling fallback."
+                )
+
+            self._notifications_active = False
+            return False
+
+        if self._client and self._is_connected:
+            try:
+                await self._client.start_notify(BLE_READ_UUID, self._on_notification)
+                self._notifications_active = True
+                _LOGGER.warning("NOTIFICATIONS ENABLED via bleak start_notify on %s", BLE_READ_UUID)
                 await asyncio.sleep(0.3)
                 return True
-
-        elif result == "failed":
-            _LOGGER.warning(
-                "start_notify failed (not notify_acquired). "
-                "Cannot guarantee CCCD is written. Falling back to polling."
-            )
-
-        elif result == "dbus_crash":
-            _LOGGER.error("D-Bus crashed during notification setup - cannot recover")
+            except Exception as err:
+                _LOGGER.warning("start_notify failed (non-HA mode): %s", err)
 
         _LOGGER.warning(
-            "All notification methods exhausted (last_result=%s). "
-            "Auth will use polling fallback (may not work if machine only sends via notification).",
-            result,
+            "All notification methods failed. "
+            "Auth will use polling fallback (unlikely to work - machine sends via notification only).",
         )
         self._notifications_active = False
         return False
 
-    async def _register_dbus_notification_handler(self) -> bool:
-        mac_path = self._address.replace(":", "_").upper()
-        read_uuid_short = BLE_READ_UUID.replace("-", "")
-
+    async def _ensure_cccd_enabled(self, char_path: str) -> bool:
         try:
             from dbus_fast.aio import MessageBus
-            from dbus_fast import Message, MessageType, BusType
+            from dbus_fast import Message, MessageType, BusType, Variant
             import re
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                intro_reply = await bus.call(Message(
+                    destination="org.bluez", path=char_path,
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                ))
+                if intro_reply.message_type == MessageType.ERROR:
+                    _LOGGER.info(
+                        "Cannot introspect char path %s: %s - assuming CCCD enabled by other process",
+                        char_path, intro_reply.error_name,
+                    )
+                    return True
+
+                descs = re.findall(r'<node name="(desc\w+)"', intro_reply.body[0]) if intro_reply.body else []
+                for desc_name in descs:
+                    desc_path = f"{char_path}/{desc_name}"
+                    uuid_reply = await bus.call(Message(
+                        destination="org.bluez", path=desc_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get", signature="ss",
+                        body=["org.bluez.GattDescriptor1", "UUID"],
+                    ))
+                    if uuid_reply.message_type == MessageType.ERROR:
+                        continue
+                    desc_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
+                    if "2902" in desc_uuid:
+                        _LOGGER.info("Found CCCD descriptor at %s", desc_path)
+                        read_reply = await bus.call(Message(
+                            destination="org.bluez", path=desc_path,
+                            interface="org.bluez.GattDescriptor1",
+                            member="ReadValue", signature="a{sv}",
+                            body=[{}],
+                        ))
+                        if read_reply.message_type != MessageType.ERROR and read_reply.body:
+                            cccd_val = bytes(read_reply.body[0])
+                            _LOGGER.info("CCCD current value: %s", cccd_val.hex())
+                            if len(cccd_val) >= 2 and (cccd_val[0] & 0x01):
+                                _LOGGER.info("CCCD already has notifications enabled (0x%04x)", cccd_val[0] | (cccd_val[1] << 8))
+                                return True
+
+                        _LOGGER.info("Writing CCCD 0x0100 (enable notifications) to %s", desc_path)
+                        write_reply = await bus.call(Message(
+                            destination="org.bluez", path=desc_path,
+                            interface="org.bluez.GattDescriptor1",
+                            member="WriteValue", signature="aya{sv}",
+                            body=[bytes([0x01, 0x00]), {}],
+                        ))
+                        if write_reply.message_type == MessageType.ERROR:
+                            _LOGGER.warning(
+                                "CCCD write failed: %s %s (another process may own it - that's OK)",
+                                write_reply.error_name, write_reply.body,
+                            )
+                            return True
+                        _LOGGER.warning("CCCD written successfully - notifications now enabled on machine")
+                        return True
+
+                notifying_reply = await bus.call(Message(
+                    destination="org.bluez", path=char_path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get", signature="ss",
+                    body=["org.bluez.GattCharacteristic1", "Notifying"],
+                ))
+                if notifying_reply.message_type != MessageType.ERROR and notifying_reply.body:
+                    notifying = notifying_reply.body[0].value if hasattr(notifying_reply.body[0], 'value') else notifying_reply.body[0]
+                    _LOGGER.info("Characteristic 'Notifying' property: %s", notifying)
+                    if notifying:
+                        return True
+
+                _LOGGER.info(
+                    "No CCCD descriptor found via D-Bus, but another process (HA bluetooth) "
+                    "likely has notifications enabled already. Proceeding optimistically."
+                )
+                return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.info("dbus_fast not available for CCCD check - assuming another process has CCCD enabled")
+            return True
+        except Exception as err:
+            _LOGGER.info(
+                "CCCD check/write error: %s (%s) - assuming another process has CCCD enabled",
+                err, type(err).__name__,
+            )
+            return True
+
+    async def _register_dbus_notification_handler(self, char_path: str) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, BusType
 
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             self._dbus_notify_bus = bus
 
-            introspect_root = Message(
-                destination="org.bluez",
-                path="/org/bluez",
-                interface="org.freedesktop.DBus.Introspectable",
-                member="Introspect",
-            )
-            reply = await bus.call(introspect_root)
-            adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
-            if not adapters:
-                adapters = ["hci0"]
-
-            char_path = None
-            for adapter in adapters:
-                device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
-                introspect_dev = Message(
-                    destination="org.bluez",
-                    path=device_path,
-                    interface="org.freedesktop.DBus.Introspectable",
-                    member="Introspect",
-                )
-                dev_reply = await bus.call(introspect_dev)
-                if dev_reply.message_type == MessageType.ERROR:
-                    continue
-
-                services = re.findall(r'<node name="(service\w+)"', dev_reply.body[0]) if dev_reply.body else []
-                for service in services:
-                    service_path = f"{device_path}/{service}"
-                    intro_svc = Message(
-                        destination="org.bluez",
-                        path=service_path,
-                        interface="org.freedesktop.DBus.Introspectable",
-                        member="Introspect",
-                    )
-                    svc_reply = await bus.call(intro_svc)
-                    if svc_reply.message_type == MessageType.ERROR:
-                        continue
-                    chars = re.findall(r'<node name="(char\w+)"', svc_reply.body[0]) if svc_reply.body else []
-                    for char in chars:
-                        cp = f"{service_path}/{char}"
-                        uuid_msg = Message(
-                            destination="org.bluez",
-                            path=cp,
-                            interface="org.freedesktop.DBus.Properties",
-                            member="Get",
-                            signature="ss",
-                            body=["org.bluez.GattCharacteristic1", "UUID"],
-                        )
-                        uuid_reply = await bus.call(uuid_msg)
-                        if uuid_reply.message_type == MessageType.ERROR:
-                            continue
-                        char_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
-                        if char_uuid.replace("-", "").lower() == read_uuid_short.lower():
-                            char_path = cp
-                            break
-                    if char_path:
-                        break
-                if char_path:
-                    break
-
-            if not char_path:
-                _LOGGER.warning("D-Bus fallback: could not find read characteristic path")
-                bus.disconnect()
-                self._dbus_notify_bus = None
-                return False
-
             _LOGGER.info(
-                "D-Bus fallback: registering PropertiesChanged handler on %s",
-                char_path,
+                "Registering D-Bus PropertiesChanged handler on %s", char_path,
             )
 
             match_rule = (
@@ -1104,36 +974,49 @@ class MelittaDevice:
             def on_dbus_message(msg):
                 if msg.member != "PropertiesChanged":
                     return
+                msg_path = msg.path if hasattr(msg, 'path') else ""
+                if msg_path != char_path:
+                    return
                 if not msg.body or len(msg.body) < 2:
                     return
                 iface = msg.body[0]
                 changed = msg.body[1]
                 if iface != "org.bluez.GattCharacteristic1":
                     return
-                if "Value" in changed:
-                    value = changed["Value"]
-                    if hasattr(value, 'value'):
-                        value = value.value
-                    data = bytes(value)
-                    _LOGGER.warning(
-                        "D-Bus NOTIFICATION RX: %d bytes, hex=%s (via PropertiesChanged)",
-                        len(data), data.hex(),
-                    )
-                    self._process_incoming_data(data)
+                if "Value" not in changed:
+                    return
+
+                value = changed["Value"]
+                if hasattr(value, 'value'):
+                    value = value.value
+                data = bytes(value)
+                if len(data) == 0:
+                    return
+
+                _LOGGER.warning(
+                    "D-Bus NOTIFICATION RX: %d bytes, hex=%s, path=%s",
+                    len(data), data.hex(), msg_path,
+                )
+                self._process_incoming_data(data)
 
             bus.add_message_handler(on_dbus_message)
             self._dbus_notify_handler = on_dbus_message
-            _LOGGER.info("D-Bus PropertiesChanged handler registered successfully")
+            _LOGGER.info("D-Bus PropertiesChanged handler registered successfully for %s", char_path)
             return True
 
         except ImportError:
-            _LOGGER.warning("dbus_fast not available for D-Bus notification fallback")
+            _LOGGER.warning("dbus_fast not available for D-Bus notification handler")
             return False
         except Exception as err:
             _LOGGER.warning(
-                "D-Bus notification fallback failed: %s (%s)",
-                err, type(err).__name__,
+                "D-Bus notification handler failed: %s (%s)", err, type(err).__name__,
             )
+            if self._dbus_notify_bus:
+                try:
+                    self._dbus_notify_bus.disconnect()
+                except Exception:
+                    pass
+                self._dbus_notify_bus = None
             return False
 
     async def _stop_notifications(self):
@@ -1457,16 +1340,10 @@ class MelittaDevice:
                 pass
             self._keepalive_task = None
 
+        await self._stop_notifications()
+
         if self._client:
             if self._is_connected:
-                try:
-                    _LOGGER.debug("Stopping BLE notifications on %s", BLE_READ_UUID)
-                    await asyncio.wait_for(
-                        self._client.stop_notify(BLE_READ_UUID),
-                        timeout=5.0,
-                    )
-                except (BleakError, asyncio.TimeoutError, OSError, Exception) as err:
-                    _LOGGER.debug("Stop notify error (non-critical): %s", err)
 
                 try:
                     _LOGGER.debug("Disconnecting BLE client...")
