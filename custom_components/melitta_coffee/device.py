@@ -23,7 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 AUTH_TIMEOUT = 6.0
 CONNECT_TIMEOUT = 15.0
 DISCONNECT_TIMEOUT = 10.0
-BLE_SETTLE_DELAY = 1.0
+BLE_SETTLE_DELAY = 0.3
 RECONNECT_BASE_DELAY = 10.0
 RECONNECT_MAX_DELAY = 300.0
 RECONNECT_MAX_ATTEMPTS = 0
@@ -481,7 +481,7 @@ class MelittaDevice:
                 await self._client.connect()
             self._is_connected = True
             _LOGGER.info("Internal BLE reconnect succeeded for %s", self._address)
-            await asyncio.sleep(BLE_SETTLE_DELAY)
+            await asyncio.sleep(0.3)
             return True
         except Exception as err:
             _LOGGER.error("Internal BLE reconnect failed: %s", err)
@@ -489,141 +489,140 @@ class MelittaDevice:
             self._is_connected = False
             return False
 
-    async def _start_notifications_with_retry(self) -> bool:
+    async def _start_notifications_with_retry(self) -> str:
         self._cancel_reconnect()
 
         if not self._client or not self._is_connected:
             _LOGGER.warning("No client/connection for notify setup")
-            return False
+            return "failed"
 
         try:
             await self._client.stop_notify(BLE_READ_UUID)
-            _LOGGER.debug("stop_notify succeeded, waiting 1s for BlueZ to release FD...")
-            await asyncio.sleep(1.0)
+            _LOGGER.debug("stop_notify succeeded")
         except Exception as e:
-            _LOGGER.debug("stop_notify failed (non-fatal): %s", e)
+            _LOGGER.debug("stop_notify skipped (non-fatal): %s", e)
 
-        bleak_supports_start_notify = True
         try:
             await self._client.start_notify(
                 BLE_READ_UUID, self._on_notification,
                 **{"use_start_notify": True}
             )
-            _LOGGER.info(
-                "BLE notifications active via StartNotify (bleak >= 2.1.0). "
-                "Using legacy D-Bus method - avoids AcquireNotify FD issues."
-            )
+            _LOGGER.info("BLE notifications active via StartNotify (bleak >= 2.1.0)")
             self._notify_mode = "notifications"
-            return True
+            return "ok"
         except TypeError:
-            bleak_supports_start_notify = False
-            _LOGGER.info(
-                "use_start_notify not available (bleak < 2.1.0). "
-                "Trying default AcquireNotify method."
-            )
-        except BleakError as err:
-            err_msg = str(err)
-            if "Notify acquired" not in err_msg and "NotPermitted" not in err_msg:
-                _LOGGER.error("Notification error (StartNotify): %s", err)
-                return False
-            _LOGGER.warning(
-                "StartNotify failed with: %s. "
-                "This should not happen with bleak >= 2.1.0 - check bleak version.",
-                err_msg,
-            )
-
-        if not bleak_supports_start_notify:
+            _LOGGER.info("use_start_notify not available (bleak < 2.1.0), trying AcquireNotify")
             try:
                 await self._client.start_notify(BLE_READ_UUID, self._on_notification)
-                _LOGGER.info("BLE notifications active via AcquireNotify (bleak 2.0.x)")
+                _LOGGER.info("BLE notifications active via AcquireNotify")
                 self._notify_mode = "notifications"
-                return True
+                return "ok"
             except BleakError as err:
                 err_msg = str(err)
-                if "Notify acquired" not in err_msg and "NotPermitted" not in err_msg:
-                    _LOGGER.error("Notification error (AcquireNotify): %s", err)
-                    return False
-                _LOGGER.error(
-                    "=== KNOWN BLEAK 2.0.0 BUG: 'Notify acquired' ===\n"
-                    "Error: %s\n"
-                    "BlueZ holds a stale notification file descriptor from a previous session.\n"
-                    "This prevents receiving BLE notifications (including auth responses).\n"
-                    "\n"
-                    "SOLUTIONS (in order of preference):\n"
-                    "1. Upgrade Home Assistant to a version with bleak >= 2.1.0\n"
-                    "   (Adds use_start_notify=True which bypasses this bug)\n"
-                    "2. Reboot your Home Assistant host (clears stale BlueZ state)\n"
-                    "3. Run: bluetoothctl remove %s (then re-add the integration)\n"
-                    "\n"
-                    "Attempting CCCD descriptor write + polling as best-effort workaround...",
-                    err_msg, self._address,
-                )
+                if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
+                    _LOGGER.warning("AcquireNotify blocked by stale BlueZ state: %s", err_msg)
+                    return "notify_acquired"
+                _LOGGER.error("Notification error (AcquireNotify): %s", err)
+                return "failed"
+        except BleakError as err:
+            err_msg = str(err)
+            if "Notify acquired" in err_msg or "NotPermitted" in err_msg:
+                _LOGGER.warning("StartNotify blocked by stale BlueZ state: %s", err_msg)
+                return "notify_acquired"
+            _LOGGER.error("Notification error (StartNotify): %s", err)
+            return "failed"
 
-        cccd_ok = await self._try_enable_notifications_via_cccd()
-        if cccd_ok:
-            return True
-
-        _LOGGER.warning(
-            "CCCD write unavailable. Starting polling fallback (every 200ms). "
-            "Auth may not work - see solutions above."
-        )
-        self._polling_task = asyncio.ensure_future(self._start_polling())
-        return True
-
-    async def _try_enable_notifications_via_cccd(self) -> bool:
-        ENABLE_NOTIFICATION = b'\x01\x00'
+    async def _remove_device_from_bluez(self) -> bool:
+        mac_path = self._address.replace(":", "_").upper()
 
         try:
-            if not self._client or not self._client.services:
-                return False
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
 
-            char = self._client.services.get_characteristic(BLE_READ_UUID)
-            if char is None:
-                _LOGGER.debug("Characteristic %s not found in services", BLE_READ_UUID)
-                return False
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_msg = Message(
+                    destination="org.bluez",
+                    path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_msg)
+                import re
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
 
-            cccd_desc = None
-            for desc in char.descriptors:
-                if "2902" in desc.uuid.lower():
-                    cccd_desc = desc
-                    break
-
-            if cccd_desc is None:
-                _LOGGER.debug("No CCCD descriptor (0x2902) on characteristic %s", BLE_READ_UUID)
-                return False
-
-            _LOGGER.info(
-                "Writing ENABLE_NOTIFICATION (0x0100) to CCCD descriptor "
-                "(handle=%d, uuid=%s) - this matches the Android APK approach",
-                cccd_desc.handle, cccd_desc.uuid,
-            )
-            await self._client.write_gatt_descriptor(cccd_desc.handle, ENABLE_NOTIFICATION)
-            _LOGGER.info(
-                "CCCD write succeeded. Notifications enabled at device level. "
-                "Starting polling to read characteristic data."
-            )
-
-            self._notify_mode = "polling"
-            self._polling_task = asyncio.ensure_future(self._start_polling())
-            return True
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+                    adapter_path = f"/org/bluez/{adapter}"
+                    _LOGGER.info(
+                        "Removing %s from BlueZ via D-Bus (adapter=%s, path=%s)",
+                        self._address, adapter, device_path,
+                    )
+                    remove_msg = Message(
+                        destination="org.bluez",
+                        path=adapter_path,
+                        interface="org.bluez.Adapter1",
+                        member="RemoveDevice",
+                        signature="o",
+                        body=[device_path],
+                    )
+                    rm_reply = await bus.call(remove_msg)
+                    if rm_reply.message_type == MessageType.ERROR:
+                        _LOGGER.debug(
+                            "RemoveDevice on %s: %s %s",
+                            adapter, rm_reply.error_name, rm_reply.body,
+                        )
+                        continue
+                    _LOGGER.info(
+                        "Successfully removed %s from BlueZ cache (adapter=%s). "
+                        "Stale notification state cleared.",
+                        self._address, adapter,
+                    )
+                    return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.debug("dbus_fast not available for RemoveDevice")
         except Exception as err:
-            _LOGGER.warning("CCCD descriptor write failed: %s", err)
-            return False
+            _LOGGER.debug("D-Bus RemoveDevice failed: %s (%s)", err, type(err).__name__)
 
-    async def _do_connect(self) -> bool:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "remove", self._address,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            output = (stdout or b"").decode() + (stderr or b"").decode()
+            if proc.returncode == 0 or "removed" in output.lower():
+                _LOGGER.info("Removed %s from BlueZ via bluetoothctl", self._address)
+                return True
+            _LOGGER.debug("bluetoothctl remove output: %s", output.strip())
+        except FileNotFoundError:
+            _LOGGER.debug("bluetoothctl not found")
+        except Exception as err:
+            _LOGGER.debug("bluetoothctl remove failed: %s", err)
+
+        _LOGGER.warning(
+            "Could not remove %s from BlueZ automatically. "
+            "To fix manually, run: bluetoothctl remove %s",
+            self._address, self._address,
+        )
+        return False
+
+    async def _do_connect(self, _retry_after_bluez_clear: bool = False) -> bool:
         self._cancel_reconnect()
 
         if self._client is not None:
             _LOGGER.debug("Cleaning up previous BLE client before reconnect")
             await self._internal_disconnect()
-            _LOGGER.debug("Waiting 2s after disconnect for BlueZ to release resources...")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
 
         _LOGGER.info(
-            "Connecting to %s (attempt %d): status=%s, connected=%s, auth=%s, hass=%s",
-            self._address, self._reconnect_attempts + 1,
-            self._status, self._is_connected, self._authenticated,
-            self._hass is not None,
+            "Connecting to %s (attempt %d, bluez_retry=%s)",
+            self._address, self._reconnect_attempts + 1, _retry_after_bluez_clear,
         )
 
         try:
@@ -632,88 +631,73 @@ class MelittaDevice:
             self._stop_polling()
             self._notify_callbacks()
 
-            ble_device = None
-            if self._hass is not None:
-                try:
-                    from homeassistant.components.bluetooth import async_ble_device_from_address
-                    ble_device = async_ble_device_from_address(self._hass, self._address, connectable=True)
-                    if ble_device:
-                        _LOGGER.info("Got BLEDevice from HA Bluetooth: %s (%s)", ble_device.name, ble_device.address)
-                    else:
-                        _LOGGER.warning(
-                            "HA Bluetooth could not find device %s - ensure the machine is on, "
-                            "within range, and the HA Bluetooth integration is active",
-                            self._address,
-                        )
-                        self._status = "offline"
-                        self._last_error = (
-                            "Machine niet gevonden via Bluetooth. Controleer of de machine aan staat, "
-                            "binnen bereik is, en de Bluetooth-integratie actief is in Home Assistant."
-                        )
-                        self._notify_callbacks()
-                        return False
-                except ImportError:
-                    _LOGGER.error(
-                        "homeassistant.components.bluetooth not available - "
-                        "ensure the Bluetooth integration is set up in Home Assistant"
-                    )
-                    self._status = "offline"
-                    self._last_error = "Bluetooth-integratie niet beschikbaar in Home Assistant"
-                    self._notify_callbacks()
-                    return False
-                except Exception as err:
-                    _LOGGER.error("Failed to get BLEDevice from HA Bluetooth: %s", err)
-                    self._status = "offline"
-                    self._last_error = f"Bluetooth-fout: {err}"
-                    self._notify_callbacks()
-                    return False
-            else:
-                _LOGGER.debug("No hass reference, using direct MAC address (standalone mode)")
-                ble_device = self._address
+            ble_device = await self._get_ble_device()
+            if ble_device is None:
+                return False
 
-            _LOGGER.debug("BleakClient target: %s (type=%s)", ble_device, type(ble_device).__name__)
-
-            if self._hass is not None and not isinstance(ble_device, str):
-                _LOGGER.debug("Using establish_connection (HA managed) with timeout=%ds", CONNECT_TIMEOUT)
-                self._client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    ble_device,
-                    self._name,
-                    disconnected_callback=self._on_disconnect,
-                    max_attempts=3,
-                )
-            else:
-                self._client = BleakClient(
-                    ble_device,
-                    timeout=CONNECT_TIMEOUT,
-                    disconnected_callback=self._on_disconnect,
-                )
-                _LOGGER.debug("BleakClient created (standalone), connecting with timeout=%ds...", CONNECT_TIMEOUT)
-                await self._client.connect()
+            await self._establish_ble_connection(ble_device)
             self._is_connected = True
             self._reconnect_attempts = 0
             self._last_error = None
             _LOGGER.info("BLE connected to %s", self._address)
 
-            _LOGGER.debug("Waiting %.1fs for BLE connection to settle...", BLE_SETTLE_DELAY)
-            await asyncio.sleep(BLE_SETTLE_DELAY)
+            await asyncio.sleep(0.3)
 
             if not self._is_connected or self._shutting_down:
-                _LOGGER.warning("Connection lost during settle delay for %s", self._address)
+                _LOGGER.warning("Connection lost during settle for %s", self._address)
                 return False
 
-            _LOGGER.debug("Starting notifications on %s", BLE_READ_UUID)
-            notify_ok = await self._start_notifications_with_retry()
+            notify_result = await self._start_notifications_with_retry()
 
-            if not notify_ok:
-                _LOGGER.error("Failed to set up notifications on %s after all attempts", BLE_READ_UUID)
+            if notify_result == "notify_acquired" and not _retry_after_bluez_clear:
+                _LOGGER.warning(
+                    "=== STALE BLUEZ NOTIFICATION STATE DETECTED ===\n"
+                    "BlueZ holds a dead notification file descriptor from a previous session.\n"
+                    "Removing device from BlueZ cache to clear it, then reconnecting..."
+                )
+                await self._internal_disconnect()
+                removed = await self._remove_device_from_bluez()
+                if removed:
+                    _LOGGER.info("BlueZ state cleared. Waiting for device rediscovery...")
+                    self._status = "clearing_bluez"
+                    self._last_error = "Bluetooth-cache opschonen... even geduld"
+                    self._notify_callbacks()
+                    await asyncio.sleep(3.0)
+                    found = await self._wait_for_device_rediscovery(timeout=15.0)
+                    if found:
+                        return await self._do_connect(_retry_after_bluez_clear=True)
+                    else:
+                        _LOGGER.warning("Device not rediscovered after BlueZ removal - will retry on next cycle")
+                        self._status = "offline"
+                        self._last_error = "Machine opnieuw zoeken na Bluetooth-reset..."
+                        self._notify_callbacks()
+                        return False
+
+                _LOGGER.warning(
+                    "Could not remove device from BlueZ automatically. "
+                    "Trying polling fallback..."
+                )
+
+            if notify_result == "failed":
+                _LOGGER.error("Failed to set up notifications on %s", BLE_READ_UUID)
                 self._status = "offline"
                 self._last_error = "Bluetooth-notificaties konden niet gestart worden"
                 self._notify_callbacks()
                 return False
 
-            _LOGGER.debug("Waiting 0.5s after notification setup...")
-            await asyncio.sleep(0.5)
+            if notify_result == "notify_acquired":
+                _LOGGER.warning(
+                    "Notifications still blocked after all recovery attempts. "
+                    "Trying polling as last resort (auth may not work). "
+                    "Consider rebooting your Home Assistant host."
+                )
+                self._last_error = (
+                    "Bluetooth-notificaties geblokkeerd door verouderde cache. "
+                    "Herstart Home Assistant host als authenticatie faalt."
+                )
+                self._notify_mode = "polling"
+                self._polling_task = asyncio.ensure_future(self._start_polling())
+                self._notify_callbacks()
 
             self._status = "authenticating"
             self._notify_callbacks()
@@ -732,7 +716,11 @@ class MelittaDevice:
                 await self._request_status()
             else:
                 self._status = "connected_not_auth"
-                _LOGGER.warning("Connected but NOT authenticated to %s - machine may need pairing button press", self._address)
+                _LOGGER.warning(
+                    "Connected but NOT authenticated to %s - "
+                    "machine may need pairing button press",
+                    self._address,
+                )
 
             self._notify_callbacks()
             return self._authenticated
@@ -740,9 +728,82 @@ class MelittaDevice:
         except (BleakError, asyncio.TimeoutError, OSError) as err:
             self._status = "offline"
             self._last_error = f"Verbinding mislukt: {err}"
-            _LOGGER.error("CONNECT FAILED to %s: %s (attempt %d)", self._address, err, self._reconnect_attempts + 1)
+            _LOGGER.error("CONNECT FAILED to %s: %s", self._address, err)
             self._notify_callbacks()
             return False
+
+    async def _get_ble_device(self):
+        if self._hass is not None:
+            try:
+                from homeassistant.components.bluetooth import async_ble_device_from_address
+                ble_device = async_ble_device_from_address(self._hass, self._address, connectable=True)
+                if ble_device:
+                    _LOGGER.debug("BLEDevice from HA: %s", ble_device.name)
+                    return ble_device
+                _LOGGER.warning("Device %s not found via HA Bluetooth", self._address)
+                self._status = "offline"
+                self._last_error = (
+                    "Machine niet gevonden via Bluetooth. Controleer of de machine aan staat "
+                    "en binnen bereik is."
+                )
+                self._notify_callbacks()
+                return None
+            except ImportError:
+                _LOGGER.error("HA Bluetooth integration not available")
+                self._status = "offline"
+                self._last_error = "Bluetooth-integratie niet beschikbaar in Home Assistant"
+                self._notify_callbacks()
+                return None
+            except Exception as err:
+                _LOGGER.error("Failed to get BLEDevice: %s", err)
+                self._status = "offline"
+                self._last_error = f"Bluetooth-fout: {err}"
+                self._notify_callbacks()
+                return None
+        else:
+            return self._address
+
+    async def _establish_ble_connection(self, ble_device):
+        if self._hass is not None and not isinstance(ble_device, str):
+            self._client = await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self._name,
+                disconnected_callback=self._on_disconnect,
+                max_attempts=3,
+            )
+        else:
+            self._client = BleakClient(
+                ble_device,
+                timeout=CONNECT_TIMEOUT,
+                disconnected_callback=self._on_disconnect,
+            )
+            await self._client.connect()
+
+    async def _wait_for_device_rediscovery(self, timeout: float = 15.0) -> bool:
+        if self._hass is None:
+            await asyncio.sleep(2.0)
+            return True
+
+        end_time = asyncio.get_event_loop().time() + timeout
+        attempt = 0
+        while asyncio.get_event_loop().time() < end_time:
+            attempt += 1
+            try:
+                from homeassistant.components.bluetooth import async_ble_device_from_address
+                device = async_ble_device_from_address(self._hass, self._address, connectable=True)
+                if device:
+                    _LOGGER.info(
+                        "Device %s rediscovered after BlueZ reset (attempt %d)",
+                        self._address, attempt,
+                    )
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+
+        _LOGGER.warning("Device %s not rediscovered within %.0fs", self._address, timeout)
+        return False
 
     async def _authenticate(self):
         self._auth_challenge = os.urandom(4)
@@ -768,7 +829,7 @@ class MelittaDevice:
         ]
 
         for attempt, (frame, desc, with_response, retry_delay) in enumerate(auth_attempts):
-            if not self._is_connected:
+            if not self._is_connected or self._client is None:
                 _LOGGER.warning("Connection lost before auth attempt %d", attempt + 1)
                 return
 
@@ -776,16 +837,18 @@ class MelittaDevice:
             self._authenticated = False
 
             _LOGGER.info(
-                "Auth attempt %d/%d (%s): writing %d bytes to %s, response=%s, frame=%s",
+                "Auth attempt %d/%d (%s): writing %d bytes to %s",
                 attempt + 1, len(auth_attempts), desc, len(frame), BLE_WRITE_UUID,
-                with_response, frame.hex(),
             )
 
             try:
                 await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=with_response)
-                _LOGGER.info("Auth frame written successfully (%s)", desc)
+                _LOGGER.info("Auth frame written (%s)", desc)
             except Exception as err:
                 _LOGGER.error("Failed to send auth frame (%s): %s", desc, err)
+                if not self._is_connected or self._client is None:
+                    _LOGGER.warning("Connection lost after auth write failure")
+                    return
                 await asyncio.sleep(retry_delay)
                 continue
 
