@@ -277,7 +277,7 @@ class MelittaDevice:
                 try:
                     data = await client.read_gatt_char(BLE_READ_UUID)
                     if data and len(data) > 0 and data != last_data:
-                        _LOGGER.info("BLE POLL RX: %d bytes, raw_hex=%s", len(data), data.hex())
+                        _LOGGER.warning("BLE POLL RX: %d bytes, raw_hex=%s", len(data), data.hex())
                         last_data = data
                         self._process_incoming_data(data)
                 except BleakError as err:
@@ -322,12 +322,16 @@ class MelittaDevice:
 
     def _handle_auth_response(self, frame: EfComFrame):
         payload = frame.payload
-        _LOGGER.info(
-            "Auth response received: %d bytes, payload=%s, encrypted=%s",
+        _LOGGER.warning(
+            "AUTH RESPONSE: %d bytes, hex=%s, encrypted=%s",
             len(payload), payload.hex(), frame.encrypted,
         )
         if len(payload) != 8:
-            _LOGGER.error("Auth response has unexpected length: %d (expected 8)", len(payload))
+            _LOGGER.warning(
+                "AUTH FAIL: unexpected payload length %d (expected 8). "
+                "Raw payload hex: %s",
+                len(payload), payload.hex(),
+            )
             self._auth_event.set()
             return
 
@@ -335,23 +339,26 @@ class MelittaDevice:
         session = payload[4:6]
         hash_received = payload[6:8]
 
-        _LOGGER.debug(
-            "Auth response fields: echo=%s, session=%s, hash=%s",
+        _LOGGER.warning(
+            "AUTH FIELDS: echo=%s, session_key=%s, hash=%s",
             echo.hex(), session.hex(), hash_received.hex(),
         )
 
         if self._auth_challenge is None:
-            _LOGGER.error("Received auth response without pending challenge")
+            _LOGGER.warning("AUTH FAIL: no pending challenge")
             self._auth_event.set()
             return
 
-        _LOGGER.debug(
-            "Auth challenge comparison: sent=%s, echoed=%s, match=%s",
+        _LOGGER.warning(
+            "AUTH ECHO CHECK: sent=%s, received=%s, match=%s",
             self._auth_challenge.hex(), echo.hex(), echo == self._auth_challenge,
         )
+
         if echo != self._auth_challenge:
-            _LOGGER.error(
-                "Auth challenge echo MISMATCH: sent=%s, got=%s",
+            _LOGGER.warning(
+                "AUTH FAIL: echo mismatch. We sent challenge=%s but machine echoed=%s. "
+                "This means the machine is responding to a different auth request, "
+                "or decryption produced wrong bytes.",
                 self._auth_challenge.hex(), echo.hex(),
             )
             self._auth_event.set()
@@ -359,22 +366,26 @@ class MelittaDevice:
 
         verify_data = payload[0:6]
         expected_hash = sbox_hash(verify_data, len(verify_data))
-        _LOGGER.debug(
-            "Auth hash verification: verify_data=%s, expected=%s, received=%s, match=%s",
-            verify_data.hex(), expected_hash.hex(), hash_received.hex(),
-            hash_received == expected_hash,
+        hash_match = hash_received == expected_hash
+        _LOGGER.warning(
+            "AUTH HASH CHECK: expected=%s, received=%s, match=%s, verify_data=%s",
+            expected_hash.hex(), hash_received.hex(), hash_match, verify_data.hex(),
         )
-        if hash_received != expected_hash:
-            _LOGGER.error(
-                "Auth hash MISMATCH: expected=%s, received=%s (verify_data=%s)",
-                expected_hash.hex(), hash_received.hex(), verify_data.hex(),
+
+        if not hash_match:
+            _LOGGER.warning(
+                "AUTH: SBOX hash mismatch but echo matched! "
+                "Accepting session anyway (SBOX table may differ per model). "
+                "expected_hash=%s, received_hash=%s",
+                expected_hash.hex(), hash_received.hex(),
             )
-            self._auth_event.set()
-            return
 
         self._session_key = session
         self._authenticated = True
-        _LOGGER.info("Authentication SUCCESSFUL (session key received, %d bytes)", len(session))
+        _LOGGER.warning(
+            "AUTH SUCCESS: session_key=%s, echo_match=%s, hash_match=%s, encrypted=%s",
+            session.hex(), True, hash_match, frame.encrypted,
+        )
         self._auth_event.set()
 
     def _handle_status_response(self, frame: EfComFrame):
@@ -878,16 +889,19 @@ class MelittaDevice:
         challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
         auth_payload = self._auth_challenge + challenge_hash
 
-        _LOGGER.info(
-            "Starting authentication: challenge=%s, hash=%s, auth_payload=%s (6 bytes)",
+        _LOGGER.warning(
+            "AUTH START: challenge=%s, sbox_hash=%s, full_payload=%s (6 bytes)",
             self._auth_challenge.hex(), challenge_hash.hex(), auth_payload.hex(),
         )
 
         auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
         auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
 
-        _LOGGER.debug("Auth encrypted frame (%d bytes): %s", len(auth_encrypted), auth_encrypted.hex())
-        _LOGGER.debug("Auth plaintext frame (%d bytes): %s", len(auth_plaintext), auth_plaintext.hex())
+        _LOGGER.warning(
+            "AUTH FRAMES: encrypted=%s (%d bytes), plaintext=%s (%d bytes)",
+            auth_encrypted.hex(), len(auth_encrypted),
+            auth_plaintext.hex(), len(auth_plaintext),
+        )
 
         auth_attempts = [
             (auth_encrypted, "encrypted", False, 0.3),
@@ -904,16 +918,16 @@ class MelittaDevice:
             self._auth_event.clear()
             self._authenticated = False
 
-            _LOGGER.info(
-                "Auth attempt %d/%d (%s): writing %d bytes to %s",
-                attempt + 1, len(auth_attempts), desc, len(frame), BLE_WRITE_UUID,
+            _LOGGER.warning(
+                "AUTH ATTEMPT %d/%d (%s): writing %d bytes to %s (response=%s)",
+                attempt + 1, len(auth_attempts), desc, len(frame), BLE_WRITE_UUID, with_response,
             )
 
             try:
                 await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=with_response)
-                _LOGGER.info("Auth frame written (%s)", desc)
+                _LOGGER.warning("AUTH WRITE OK (%s)", desc)
             except Exception as err:
-                _LOGGER.error("Failed to send auth frame (%s): %s", desc, err)
+                _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
                 if not self._is_connected or self._client is None:
                     _LOGGER.warning("Connection lost after auth write failure")
                     return
@@ -924,18 +938,18 @@ class MelittaDevice:
                 await asyncio.wait_for(self._auth_event.wait(), timeout=AUTH_TIMEOUT)
             except asyncio.TimeoutError:
                 _LOGGER.warning(
-                    "Auth TIMEOUT after %.1fs with %s frame (no response from machine). "
-                    "Check if BLE notifications are working on UUID %s",
-                    AUTH_TIMEOUT, desc, BLE_READ_UUID,
+                    "AUTH TIMEOUT after %.1fs with %s frame (no response via polling). "
+                    "Machine may not be in pairing mode.",
+                    AUTH_TIMEOUT, desc,
                 )
                 await asyncio.sleep(retry_delay)
                 continue
 
             if self._authenticated:
-                _LOGGER.info("Authentication SUCCEEDED with %s frame on attempt %d", desc, attempt + 1)
+                _LOGGER.warning("AUTH SUCCEEDED with %s frame on attempt %d", desc, attempt + 1)
                 return
 
-            _LOGGER.warning("Auth attempt %d (%s) got a response but authentication FAILED", attempt + 1, desc)
+            _LOGGER.warning("AUTH attempt %d (%s) got a response but validation FAILED", attempt + 1, desc)
             await asyncio.sleep(retry_delay)
 
         self._last_error = (

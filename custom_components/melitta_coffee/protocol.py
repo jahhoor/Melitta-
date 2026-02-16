@@ -224,8 +224,7 @@ class EfComParser:
                 payload_start = cmd_len + 1
                 payload_end = payload_start + payload_len
                 payload = bytes(work[payload_start:payload_end])
-                _LOGGER.info("Decoded frame: cmd=%r, key=%s, payload_len=%d", cmd_str, key_name, len(payload))
-                _LOGGER.debug("Decoded payload hex: %s", payload.hex())
+                _LOGGER.warning("FRAME DECODED: cmd=%r, key=%s, payload=%s (%d bytes)", cmd_str, key_name, payload.hex(), len(payload))
                 return EfComFrame(cmd_str, payload, key_fn is not None)
 
         return None
