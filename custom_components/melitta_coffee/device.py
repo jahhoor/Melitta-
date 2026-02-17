@@ -61,7 +61,6 @@ class MelittaDevice:
         self._suppress_disconnect_callback = False
         self._notify_mode = "notifications"
         self._notifications_active = False
-        self._start_notify_failures = 0
         self._polling_task: asyncio.Task | None = None
         self._last_status_data: bytes | None = None
         self._dbus_notify_bus = None
@@ -829,7 +828,7 @@ class MelittaDevice:
             self._last_error = None
             _LOGGER.info("BLE connected to %s", self._address)
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
 
             if not self._is_connected or self._shutting_down:
                 _LOGGER.warning("Connection lost during settle for %s", self._address)
@@ -959,234 +958,71 @@ class MelittaDevice:
             return False
 
         _LOGGER.warning(
-            "=== ENABLING NOTIFICATIONS on %s ===\n"
+            "=== ENABLING NOTIFICATIONS on %s (FAST MODE) ===\n"
+            "  Strategy: CCCD write + D-Bus handler ONLY (no StartNotify/AcquireNotify)\n"
+            "  Machine drops connection if BlueZ notification management is used.\n"
             "  hass=%s, connected=%s, client=%s",
             BLE_READ_UUID, self._hass is not None, self._is_connected, type(self._client).__name__,
         )
 
-        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-        _LOGGER.warning("NOTIFICATIONS: D-Bus char path = %s", read_char_path)
+        if self._hass is not None:
+            read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+            _LOGGER.warning("NOTIFICATIONS: D-Bus char path = %s", read_char_path)
 
-        await self._release_stale_notifications(read_char_path)
-
-        start_notify_ok = False
-        if self._start_notify_failures >= 1 and self._hass is not None:
-            _LOGGER.warning(
-                "NOTIFICATIONS: SKIPPING start_notify (failed %d times before). "
-                "Going directly to manual CCCD + D-Bus handler approach.",
-                self._start_notify_failures,
-            )
-        else:
-            try:
-                _LOGGER.warning(
-                    "NOTIFICATIONS: Calling start_notify on %s "
-                    "(this tells BlueZ to write CCCD + subscribe to notifications)",
-                    BLE_READ_UUID,
-                )
-                await asyncio.wait_for(
-                    self._client.start_notify(BLE_READ_UUID, self._on_notification),
-                    timeout=5.0,
-                )
-                start_notify_ok = True
-                self._notifications_active = True
-                self._start_notify_failures = 0
-                _LOGGER.warning(
-                    "NOTIFICATIONS: start_notify SUCCEEDED on %s - "
-                    "BlueZ will now forward Value notifications via callback!",
-                    BLE_READ_UUID,
-                )
-            except asyncio.TimeoutError:
-                self._start_notify_failures += 1
-                _LOGGER.warning(
-                    "NOTIFICATIONS: start_notify TIMED OUT after 5s on %s (failure #%d). "
-                    "Machine may have dropped connection during CCCD write. "
-                    "Will try manual CCCD + D-Bus handler approach.",
-                    BLE_READ_UUID, self._start_notify_failures,
-                )
-            except Exception as start_err:
-                self._start_notify_failures += 1
-                _LOGGER.warning(
-                    "NOTIFICATIONS: start_notify FAILED (failure #%d): %s (%s).\n"
-                    "  Will try manual CCCD + D-Bus handler approach (matching APK behavior).",
-                    self._start_notify_failures, start_err, type(start_err).__name__,
-                )
-
-        if not start_notify_ok and self._hass is not None:
             if not read_char_path:
-                _LOGGER.warning("NOTIFICATIONS: Char D-Bus path not found, retrying after 1s delay...")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
                 read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-                _LOGGER.warning("NOTIFICATIONS: Char D-Bus path after retry: %s", read_char_path)
+                _LOGGER.warning("NOTIFICATIONS: D-Bus char path after retry: %s", read_char_path)
 
             if read_char_path:
-                _LOGGER.warning(
-                    "NOTIFICATIONS: Trying MANUAL approach (APK-style):\n"
-                    "  1. Try D-Bus StartNotify (stale state was released)\n"
-                    "  2. Write CCCD descriptor (0x0100) directly\n"
-                    "  3. Register D-Bus PropertiesChanged handler\n"
-                    "  This bypasses BlueZ's AcquireNotify which causes 'Notify acquired' errors.",
-                )
-
-                dbus_start_ok = await self._call_dbus_start_notify(read_char_path)
-                if dbus_start_ok:
-                    _LOGGER.warning("NOTIFICATIONS: D-Bus StartNotify SUCCEEDED after stale release!")
-
                 cccd_ok = await self._ensure_cccd_enabled(read_char_path)
-                if cccd_ok:
-                    _LOGGER.warning("NOTIFICATIONS: CCCD write/check OK")
-                else:
-                    _LOGGER.warning("NOTIFICATIONS: CCCD write/check failed (may still work)")
+                _LOGGER.warning("NOTIFICATIONS: CCCD write result: %s", cccd_ok)
 
                 dbus_ok = await self._register_dbus_notification_handler(read_char_path)
                 if dbus_ok:
                     self._notifications_active = True
                     self._notify_mode = "dbus_handler"
                     _LOGGER.warning(
-                        "=== NOTIFICATIONS ACTIVE (manual D-Bus mode) on %s ===\n"
-                        "  StartNotify=%s, CCCD=%s, D-Bus handler=True\n"
-                        "  Notifications will arrive via D-Bus signal handler.",
-                        BLE_READ_UUID, dbus_start_ok, cccd_ok,
+                        "=== NOTIFICATIONS READY (CCCD + D-Bus handler) on %s ===\n"
+                        "  CCCD=%s, D-Bus handler=True\n"
+                        "  No StartNotify/AcquireNotify used (machine rejects those).\n"
+                        "  Proceeding to auth immediately.",
+                        BLE_READ_UUID, cccd_ok,
                     )
-                    await asyncio.sleep(0.3)
                     return True
                 else:
-                    _LOGGER.warning("NOTIFICATIONS: D-Bus handler registration also failed")
+                    _LOGGER.warning("NOTIFICATIONS: D-Bus handler registration failed")
+            else:
+                _LOGGER.warning("NOTIFICATIONS: No D-Bus char path found")
 
-        if start_notify_ok and self._hass is not None and read_char_path:
-            dbus_ok = await self._register_dbus_notification_handler(read_char_path)
-            if dbus_ok:
+        if not self._notifications_active:
+            try:
                 _LOGGER.warning(
-                    "NOTIFICATIONS: D-Bus PropertiesChanged handler ALSO registered as backup on %s",
-                    read_char_path,
+                    "NOTIFICATIONS: Trying bleak start_notify as last resort on %s",
+                    BLE_READ_UUID,
+                )
+                await asyncio.wait_for(
+                    self._client.start_notify(BLE_READ_UUID, self._on_notification),
+                    timeout=2.0,
+                )
+                self._notifications_active = True
+                _LOGGER.warning("NOTIFICATIONS: bleak start_notify SUCCEEDED on %s", BLE_READ_UUID)
+                return True
+            except Exception as err:
+                _LOGGER.warning(
+                    "NOTIFICATIONS: bleak start_notify failed: %s (%s) - will use polling",
+                    err, type(err).__name__,
                 )
 
-        if self._notifications_active:
-            _LOGGER.warning(
-                "=== NOTIFICATIONS ACTIVE on %s ===\n"
-                "  method: %s",
-                BLE_READ_UUID,
-                "start_notify" if start_notify_ok else "manual D-Bus",
-            )
-            await asyncio.sleep(0.3)
-            return True
-
         _LOGGER.error(
-            "=== ALL NOTIFICATION METHODS FAILED on %s ===\n"
-            "  start_notify_ok=%s, read_char_path=%s, hass=%s\n"
-            "  Machine auth response will NOT be received!\n"
-            "  Auth will use polling fallback but machine only sends via notifications.",
-            BLE_READ_UUID, start_notify_ok, read_char_path, self._hass is not None,
+            "=== NOTIFICATION SETUP FAILED on %s ===\n"
+            "  Will use polling fallback, but machine may not respond to auth.\n"
+            "  hass=%s",
+            BLE_READ_UUID, self._hass is not None,
         )
         self._notifications_active = False
         return False
 
-    async def _release_stale_notifications(self, char_path: str | None):
-        _LOGGER.warning("NOTIFICATIONS: Releasing any stale notification state...")
-        try:
-            await self._client.stop_notify(BLE_READ_UUID)
-            _LOGGER.warning("NOTIFICATIONS: stop_notify succeeded (cleaned up stale bleak state)")
-        except Exception as err:
-            _LOGGER.warning("NOTIFICATIONS: stop_notify: %s (OK - no stale bleak state)", err)
-
-        if char_path:
-            try:
-                from dbus_fast.aio import MessageBus
-                from dbus_fast import Message, MessageType, BusType
-
-                bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-                try:
-                    acq_reply = await bus.call(Message(
-                        destination="org.bluez", path=char_path,
-                        interface="org.freedesktop.DBus.Properties",
-                        member="Get", signature="ss",
-                        body=["org.bluez.GattCharacteristic1", "NotifyAcquired"],
-                    ))
-                    if acq_reply.message_type != MessageType.ERROR and acq_reply.body:
-                        acquired = acq_reply.body[0].value if hasattr(acq_reply.body[0], 'value') else acq_reply.body[0]
-                        _LOGGER.warning("NOTIFICATIONS: NotifyAcquired property = %s", acquired)
-                        if acquired:
-                            _LOGGER.warning(
-                                "NOTIFICATIONS: BlueZ has an active AcquireNotify FD.\n"
-                                "  Will try StopNotify to release it. If this doesn't work,\n"
-                                "  notifications go through the FD (not PropertiesChanged).",
-                            )
-                    else:
-                        _LOGGER.warning("NOTIFICATIONS: NotifyAcquired property not available")
-
-                    notifying_reply = await bus.call(Message(
-                        destination="org.bluez", path=char_path,
-                        interface="org.freedesktop.DBus.Properties",
-                        member="Get", signature="ss",
-                        body=["org.bluez.GattCharacteristic1", "Notifying"],
-                    ))
-                    if notifying_reply.message_type != MessageType.ERROR and notifying_reply.body:
-                        notifying = notifying_reply.body[0].value if hasattr(notifying_reply.body[0], 'value') else notifying_reply.body[0]
-                        _LOGGER.warning("NOTIFICATIONS: Notifying property = %s", notifying)
-
-                    reply = await bus.call(Message(
-                        destination="org.bluez",
-                        path=char_path,
-                        interface="org.bluez.GattCharacteristic1",
-                        member="StopNotify",
-                    ))
-                    if reply.message_type == MessageType.ERROR:
-                        _LOGGER.warning(
-                            "NOTIFICATIONS: D-Bus StopNotify: %s %s (OK - nothing to stop)",
-                            reply.error_name, reply.body,
-                        )
-                    else:
-                        _LOGGER.warning("NOTIFICATIONS: D-Bus StopNotify succeeded (stale state released)")
-                        self._start_notify_failures = 0
-                finally:
-                    bus.disconnect()
-            except ImportError:
-                pass
-            except Exception as err:
-                _LOGGER.warning("NOTIFICATIONS: D-Bus release error: %s (OK - continuing)", err)
-
-    async def _call_dbus_start_notify(self, char_path: str) -> bool:
-        try:
-            from dbus_fast.aio import MessageBus
-            from dbus_fast import Message, MessageType, BusType
-
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            try:
-                _LOGGER.warning("Calling org.bluez.GattCharacteristic1.StartNotify on %s", char_path)
-                reply = await bus.call(Message(
-                    destination="org.bluez",
-                    path=char_path,
-                    interface="org.bluez.GattCharacteristic1",
-                    member="StartNotify",
-                ))
-                if reply.message_type == MessageType.ERROR:
-                    error_msg = str(reply.error_name or "")
-                    error_body = reply.body if reply.body else []
-                    error_str = f"{error_msg} {error_body}"
-                    if "InProgress" in error_str or "Already notifying" in error_str:
-                        _LOGGER.warning(
-                            "StartNotify: already active (%s) - notifications are working",
-                            error_msg,
-                        )
-                        return True
-                    if "NotPermitted" in error_str and "acquired" in str(error_body).lower():
-                        _LOGGER.warning(
-                            "StartNotify: 'Notify acquired' means another process has AcquireNotify.\n"
-                            "  Will rely on D-Bus PropertiesChanged handler instead.\n"
-                            "  Note: PropertiesChanged might not fire when FD-acquired.",
-                        )
-                        return False
-                    _LOGGER.warning("StartNotify failed: %s %s", error_msg, error_body)
-                    return False
-                _LOGGER.warning("StartNotify succeeded on %s", char_path)
-                return True
-            finally:
-                bus.disconnect()
-        except ImportError:
-            _LOGGER.warning("dbus_fast not available for StartNotify")
-            return False
-        except Exception as err:
-            _LOGGER.warning("StartNotify error: %s (%s)", err, type(err).__name__)
-            return False
 
     async def _ensure_cccd_enabled(self, char_path: str) -> bool:
         try:
@@ -1221,21 +1057,7 @@ class MelittaDevice:
                         continue
                     desc_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
                     if "2902" in desc_uuid:
-                        _LOGGER.info("Found CCCD descriptor at %s", desc_path)
-                        read_reply = await bus.call(Message(
-                            destination="org.bluez", path=desc_path,
-                            interface="org.bluez.GattDescriptor1",
-                            member="ReadValue", signature="a{sv}",
-                            body=[{}],
-                        ))
-                        if read_reply.message_type != MessageType.ERROR and read_reply.body:
-                            cccd_val = bytes(read_reply.body[0])
-                            _LOGGER.info("CCCD current value: %s", cccd_val.hex())
-                            if len(cccd_val) >= 2 and (cccd_val[0] & 0x01):
-                                _LOGGER.info("CCCD already has notifications enabled (0x%04x)", cccd_val[0] | (cccd_val[1] << 8))
-                                return True
-
-                        _LOGGER.info("Writing CCCD 0x0100 (enable notifications) to %s", desc_path)
+                        _LOGGER.warning("Found CCCD descriptor at %s, writing 0x0100", desc_path)
                         write_reply = await bus.call(Message(
                             destination="org.bluez", path=desc_path,
                             interface="org.bluez.GattDescriptor1",
@@ -1244,28 +1066,16 @@ class MelittaDevice:
                         ))
                         if write_reply.message_type == MessageType.ERROR:
                             _LOGGER.warning(
-                                "CCCD write failed: %s %s (another process may own it - that's OK)",
+                                "CCCD write failed: %s %s (may already be enabled - continuing)",
                                 write_reply.error_name, write_reply.body,
                             )
-                            return True
-                        _LOGGER.warning("CCCD written successfully - notifications now enabled on machine")
+                        else:
+                            _LOGGER.warning("CCCD written successfully - notifications enabled on machine")
                         return True
 
-                notifying_reply = await bus.call(Message(
-                    destination="org.bluez", path=char_path,
-                    interface="org.freedesktop.DBus.Properties",
-                    member="Get", signature="ss",
-                    body=["org.bluez.GattCharacteristic1", "Notifying"],
-                ))
-                if notifying_reply.message_type != MessageType.ERROR and notifying_reply.body:
-                    notifying = notifying_reply.body[0].value if hasattr(notifying_reply.body[0], 'value') else notifying_reply.body[0]
-                    _LOGGER.info("Characteristic 'Notifying' property: %s", notifying)
-                    if notifying:
-                        return True
-
-                _LOGGER.info(
-                    "No CCCD descriptor found via D-Bus, but another process (HA bluetooth) "
-                    "likely has notifications enabled already. Proceeding optimistically."
+                _LOGGER.warning(
+                    "No CCCD descriptor found via D-Bus. Proceeding anyway - "
+                    "HA bluetooth may have CCCD enabled already."
                 )
                 return True
             finally:
