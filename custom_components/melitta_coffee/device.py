@@ -20,7 +20,7 @@ from .protocol import build_frame, EfComParser, EfComFrame
 
 _LOGGER = logging.getLogger(__name__)
 
-AUTH_TIMEOUT = 6.0
+AUTH_TIMEOUT = 30.0
 CONNECT_TIMEOUT = 15.0
 DISCONNECT_TIMEOUT = 10.0
 BLE_SETTLE_DELAY = 0.3
@@ -167,7 +167,7 @@ class MelittaDevice:
 
         self._disconnect_in_progress = True
         try:
-            was_auth = self._status == "authenticating"
+            was_auth = self._status in ("authenticating", "waiting_for_machine_button")
             prev_status = self._status
             self._is_connected = False
             self._authenticated = False
@@ -212,6 +212,9 @@ class MelittaDevice:
             return
         if self._connect_pending or self._connect_lock.locked():
             _LOGGER.debug("Connect already in progress for %s, skipping schedule", self._address)
+            return
+        if self._auth_lock.locked():
+            _LOGGER.debug("Auth in progress for %s, skipping reconnect schedule", self._address)
             return
         if self._reconnect_task and not self._reconnect_task.done():
             _LOGGER.debug("Reconnect already scheduled for %s", self._address)
@@ -1178,6 +1181,10 @@ class MelittaDevice:
         async with self._auth_lock:
             await self._do_authenticate()
 
+        if not self._authenticated and not self._is_connected and not self._shutting_down:
+            _LOGGER.info("Auth completed without success and disconnected - scheduling reconnect")
+            self.schedule_reconnect()
+
     async def _do_authenticate(self):
         self._auth_challenge = os.urandom(4)
         challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
@@ -1197,24 +1204,34 @@ class MelittaDevice:
             auth_plaintext.hex(), len(auth_plaintext),
         )
 
-        auth_attempts = [
-            (auth_encrypted, "encrypted"),
+        self._status = "waiting_for_machine_button"
+        self._last_error = (
+            "Druk op 'Verbinden' op het display van het koffieapparaat. "
+            "Wacht tot het Bluetooth-lampje knippert..."
+        )
+        self._notify_callbacks()
+
+        frames_to_send = [
             (auth_plaintext, "plaintext"),
+            (auth_encrypted, "encrypted"),
         ]
 
-        for attempt, (frame, desc) in enumerate(auth_attempts):
+        if not self._is_connected or self._client is None:
+            _LOGGER.warning("Connection lost before auth")
+            return
+
+        self._auth_event.clear()
+        self._authenticated = False
+
+        for frame, desc in frames_to_send:
             if not self._is_connected or self._client is None:
-                _LOGGER.warning("Connection lost before auth attempt %d", attempt + 1)
+                _LOGGER.warning("Connection lost before sending %s auth frame", desc)
                 return
 
-            self._auth_event.clear()
-            self._authenticated = False
-
             _LOGGER.warning(
-                "AUTH ATTEMPT %d/%d (%s): writing %d bytes to %s (response=False, matching APK writeType=1)",
-                attempt + 1, len(auth_attempts), desc, len(frame), BLE_WRITE_UUID,
+                "AUTH SEND (%s): writing %d bytes to %s (response=False)",
+                desc, len(frame), BLE_WRITE_UUID,
             )
-
             try:
                 await asyncio.wait_for(
                     self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False),
@@ -1231,35 +1248,48 @@ class MelittaDevice:
             except Exception as err:
                 _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
                 if not self._is_connected or self._client is None:
-                    _LOGGER.warning("Connection lost after auth write failure")
                     return
-                await asyncio.sleep(0.5)
                 continue
 
-            got_response = await self._poll_for_auth_response(desc)
+            await asyncio.sleep(0.1)
 
-            if self._authenticated:
-                _LOGGER.warning("AUTH SUCCEEDED with %s frame on attempt %d", desc, attempt + 1)
-                return
+        _LOGGER.warning(
+            "AUTH: both frames sent. Waiting up to %.0fs for response. "
+            "User should press 'Verbinden' on the machine display.",
+            AUTH_TIMEOUT,
+        )
 
-            if got_response:
-                _LOGGER.warning("AUTH attempt %d (%s) got a response but validation FAILED", attempt + 1, desc)
-            else:
-                _LOGGER.warning(
-                    "AUTH attempt %d (%s): no response within timeout. "
-                    "Machine may not be in pairing mode.",
-                    attempt + 1, desc,
-                )
-            await asyncio.sleep(0.5)
+        self._status = "authenticating"
+        self._last_error = (
+            "Auth-frames verstuurd. Druk NU op 'Verbinden' op het display van het koffieapparaat! "
+            "Wachten op antwoord... (max %d seconden)" % int(AUTH_TIMEOUT)
+        )
+        self._notify_callbacks()
+
+        got_response = await self._poll_for_auth_response("both-frames")
+
+        if self._authenticated:
+            _LOGGER.warning("AUTH SUCCEEDED after sending both frames!")
+            return
+
+        if got_response:
+            _LOGGER.warning("AUTH got a response but validation FAILED")
+        else:
+            _LOGGER.warning(
+                "AUTH: no response within %.0fs. "
+                "Machine button may not have been pressed in time.",
+                AUTH_TIMEOUT,
+            )
 
         self._last_error = (
-            "Authenticatie mislukt. Controleer of de machine in koppelmodus staat. "
-            "Druk op de Bluetooth-knop op het display van de machine."
+            "Authenticatie mislukt. Heb je op 'Verbinden' gedrukt op het display "
+            "van het koffieapparaat? Probeer opnieuw: herstart de integratie en "
+            "druk op 'Verbinden' zodra de status verandert."
         )
         _LOGGER.error(
-            "ALL %d auth attempts FAILED for %s - machine may need pairing confirmation. "
-            "Tried encrypted and plaintext frames with response=False.",
-            len(auth_attempts), self._address,
+            "Auth FAILED for %s - machine button may not have been pressed. "
+            "Sent both plaintext and encrypted frames with response=False.",
+            self._address,
         )
 
     async def _poll_for_auth_response(self, desc: str) -> bool:
