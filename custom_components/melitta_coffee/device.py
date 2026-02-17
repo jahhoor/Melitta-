@@ -45,7 +45,9 @@ class MelittaDevice:
         self._keepalive_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
+        self._auth_lock = asyncio.Lock()
         self._connect_pending = False
+        self._last_reconnect_time: float = 0.0
         self._callbacks: list[Callable] = []
         self._status = "offline"
         self._machine_state: int | None = None
@@ -178,12 +180,11 @@ class MelittaDevice:
             use_fast_reconnect = False
             if was_auth:
                 self._status = "auth_dropped"
-                self._last_error = "Machine dropped connection during authentication. Press 'Verbinden' on the machine display."
+                self._last_error = "Machine heeft verbinding verbroken tijdens authenticatie. Wacht op automatische herverbinding."
                 self._auth_event.set()
             elif prev_status == "connecting":
                 self._status = "offline"
                 self._last_error = "Verbinding verbroken tijdens opzetten"
-                use_fast_reconnect = True
             elif not self._shutting_down:
                 self._status = "offline"
                 self._last_error = "Connection lost"
@@ -209,18 +210,31 @@ class MelittaDevice:
             return
         if self._is_connected and self._authenticated:
             return
-        if self._connect_pending:
+        if self._connect_pending or self._connect_lock.locked():
             _LOGGER.debug("Connect already in progress for %s, skipping schedule", self._address)
             return
         if self._reconnect_task and not self._reconnect_task.done():
             _LOGGER.debug("Reconnect already scheduled for %s", self._address)
             return
 
+        import time
+        now = time.monotonic()
+        since_last = now - self._last_reconnect_time
+        min_cooldown = 8.0
+
         if fast and self._reconnect_attempts < 2:
-            delay = 3.0
+            delay = 5.0
         else:
             capped_attempts = min(self._reconnect_attempts, 5)
             delay = min(RECONNECT_BASE_DELAY * (2 ** capped_attempts), RECONNECT_MAX_DELAY)
+
+        if since_last < min_cooldown:
+            cooldown_remaining = min_cooldown - since_last
+            delay = max(delay, cooldown_remaining)
+            _LOGGER.debug(
+                "Reconnect cooldown: only %.1fs since last attempt, enforcing delay=%.1fs",
+                since_last, delay,
+            )
         self._reconnect_attempts += 1
         _LOGGER.info(
             "Scheduling reconnect to %s in %.0fs (attempt %d)",
@@ -243,6 +257,8 @@ class MelittaDevice:
             await asyncio.sleep(delay)
             if self._shutting_down or (self._is_connected and self._authenticated):
                 return
+            import time
+            self._last_reconnect_time = time.monotonic()
             _LOGGER.info("Attempting reconnect to %s (attempt %d)...", self._address, self._reconnect_attempts)
             self._reconnect_task = None
             success = await self.connect()
@@ -633,6 +649,89 @@ class MelittaDevice:
             _LOGGER.warning("D-Bus introspection failed: %s (%s)", err, type(err).__name__)
         return None
 
+    async def _force_bluez_disconnect(self):
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+            import re
+
+            mac_path = self._address.replace(":", "_").upper()
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_root = Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_root)
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
+
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+                    connected_reply = await bus.call(Message(
+                        destination="org.bluez", path=device_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get", signature="ss",
+                        body=["org.bluez.Device1", "Connected"],
+                    ))
+                    if connected_reply.message_type == MessageType.ERROR:
+                        continue
+
+                    is_connected = False
+                    if connected_reply.body:
+                        val = connected_reply.body[0]
+                        is_connected = val.value if hasattr(val, 'value') else bool(val)
+
+                    if is_connected:
+                        _LOGGER.warning(
+                            "BlueZ shows device %s as connected on %s - forcing disconnect",
+                            self._address, adapter,
+                        )
+                        disc_reply = await bus.call(Message(
+                            destination="org.bluez", path=device_path,
+                            interface="org.bluez.Device1",
+                            member="Disconnect",
+                        ))
+                        if disc_reply.message_type == MessageType.ERROR:
+                            _LOGGER.warning(
+                                "BlueZ force disconnect failed: %s %s",
+                                disc_reply.error_name, disc_reply.body,
+                            )
+                        else:
+                            _LOGGER.warning("BlueZ force disconnect succeeded - waiting for cleanup")
+                            await asyncio.sleep(2.0)
+                    else:
+                        _LOGGER.debug("BlueZ shows device %s not connected on %s", self._address, adapter)
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.debug("dbus_fast not available for BlueZ force disconnect")
+        except Exception as err:
+            _LOGGER.debug("BlueZ force disconnect error (non-fatal): %s", err)
+
+    async def _test_ble_write(self) -> bool:
+        if not self._client or not self._is_connected:
+            return False
+
+        test_frame = build_frame(CMD_KEEPALIVE, None, b"", encrypt=False)
+        try:
+            await asyncio.wait_for(
+                self._client.write_gatt_char(BLE_WRITE_UUID, test_frame, response=False),
+                timeout=3.0,
+            )
+            _LOGGER.warning("BLE write probe OK - connection is usable")
+            return True
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "BLE write probe HUNG (3s) - connection is stale, will disconnect and retry"
+            )
+            return False
+        except Exception as err:
+            _LOGGER.warning("BLE write probe FAILED: %s - connection may be stale", err)
+            return False
+
     async def _do_connect(self) -> bool:
         self._cancel_reconnect()
 
@@ -640,6 +739,9 @@ class MelittaDevice:
             _LOGGER.debug("Cleaning up previous BLE client before reconnect")
             await self._internal_disconnect()
             await asyncio.sleep(1.0)
+
+        if self._hass is not None:
+            await self._force_bluez_disconnect()
 
         _LOGGER.info(
             "Connecting to %s (attempt %d)",
@@ -665,6 +767,18 @@ class MelittaDevice:
 
             if not self._is_connected or self._shutting_down:
                 _LOGGER.warning("Connection lost during settle for %s", self._address)
+                return False
+
+            write_ok = await self._test_ble_write()
+            if not write_ok:
+                _LOGGER.warning("BLE write probe failed - disconnecting stale connection")
+                await self._internal_disconnect()
+                await asyncio.sleep(2.0)
+                if self._hass is not None:
+                    await self._force_bluez_disconnect()
+                self._status = "offline"
+                self._last_error = "BLE verbinding was niet bruikbaar (stale). Opnieuw proberen..."
+                self._notify_callbacks()
                 return False
 
             self._status = "authenticating"
@@ -1057,6 +1171,14 @@ class MelittaDevice:
         self._notifications_active = False
 
     async def _authenticate(self):
+        if self._auth_lock.locked():
+            _LOGGER.warning("Auth already in progress for %s, skipping duplicate attempt", self._address)
+            return
+
+        async with self._auth_lock:
+            await self._do_authenticate()
+
+    async def _do_authenticate(self):
         self._auth_challenge = os.urandom(4)
         challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
         auth_payload = self._auth_challenge + challenge_hash
@@ -1076,13 +1198,11 @@ class MelittaDevice:
         )
 
         auth_attempts = [
-            (auth_encrypted, "encrypted-with-response", True),
-            (auth_encrypted, "encrypted", False),
-            (auth_plaintext, "plaintext-with-response", True),
-            (auth_plaintext, "plaintext", False),
+            (auth_encrypted, "encrypted"),
+            (auth_plaintext, "plaintext"),
         ]
 
-        for attempt, (frame, desc, with_response) in enumerate(auth_attempts):
+        for attempt, (frame, desc) in enumerate(auth_attempts):
             if not self._is_connected or self._client is None:
                 _LOGGER.warning("Connection lost before auth attempt %d", attempt + 1)
                 return
@@ -1091,13 +1211,13 @@ class MelittaDevice:
             self._authenticated = False
 
             _LOGGER.warning(
-                "AUTH ATTEMPT %d/%d (%s): writing %d bytes to %s (response=%s)",
-                attempt + 1, len(auth_attempts), desc, len(frame), BLE_WRITE_UUID, with_response,
+                "AUTH ATTEMPT %d/%d (%s): writing %d bytes to %s (response=False, matching APK writeType=1)",
+                attempt + 1, len(auth_attempts), desc, len(frame), BLE_WRITE_UUID,
             )
 
             try:
                 await asyncio.wait_for(
-                    self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=with_response),
+                    self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False),
                     timeout=5.0,
                 )
                 _LOGGER.warning("AUTH WRITE OK (%s)", desc)
@@ -1107,8 +1227,7 @@ class MelittaDevice:
                     "BLE connection may be stale.",
                     desc,
                 )
-                await asyncio.sleep(0.5)
-                continue
+                return
             except Exception as err:
                 _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
                 if not self._is_connected or self._client is None:
@@ -1131,7 +1250,7 @@ class MelittaDevice:
                     "Machine may not be in pairing mode.",
                     attempt + 1, desc,
                 )
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
 
         self._last_error = (
             "Authenticatie mislukt. Controleer of de machine in koppelmodus staat. "
@@ -1139,7 +1258,7 @@ class MelittaDevice:
         )
         _LOGGER.error(
             "ALL %d auth attempts FAILED for %s - machine may need pairing confirmation. "
-            "Tried encrypted+plaintext with response=False and response=True.",
+            "Tried encrypted and plaintext frames with response=False.",
             len(auth_attempts), self._address,
         )
 
@@ -1271,12 +1390,17 @@ class MelittaDevice:
             self.schedule_reconnect()
             return
 
+        if self._connect_pending or self._connect_lock.locked():
+            _LOGGER.debug("Skipping async_update: connect in progress for %s", self._address)
+            return
+
         if self._is_connected and not self._authenticated:
-            await self._authenticate()
-            if self._authenticated:
-                self._status = "ready"
-                self._start_keepalive()
-                self._notify_callbacks()
+            if not self._auth_lock.locked():
+                await self._authenticate()
+                if self._authenticated:
+                    self._status = "ready"
+                    self._start_keepalive()
+                    self._notify_callbacks()
 
         if self._authenticated:
             await self._request_status()
