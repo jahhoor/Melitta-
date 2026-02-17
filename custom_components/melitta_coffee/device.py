@@ -59,6 +59,7 @@ class MelittaDevice:
         self._max_reconnect_attempts = RECONNECT_MAX_ATTEMPTS
         self._disconnect_in_progress = False
         self._suppress_disconnect_callback = False
+        self._cccd_recovery_in_progress = False
         self._notify_mode = "notifications"
         self._notifications_active = False
         self._polling_task: asyncio.Task | None = None
@@ -160,10 +161,10 @@ class MelittaDevice:
         import traceback
         caller_info = "".join(traceback.format_stack(limit=5))
 
-        if self._suppress_disconnect_callback:
+        if self._suppress_disconnect_callback or self._cccd_recovery_in_progress:
             _LOGGER.warning(
-                "DISCONNECT CALLBACK (suppressed) for %s - ignoring (called during internal disconnect)",
-                self._address,
+                "DISCONNECT CALLBACK (suppressed) for %s - ignoring (suppress=%s, cccd_recovery=%s)",
+                self._address, self._suppress_disconnect_callback, self._cccd_recovery_in_progress,
             )
             return
         if client is not self._client:
@@ -853,6 +854,10 @@ class MelittaDevice:
             if not notifications_ok:
                 self._notify_mode = "polling"
 
+            if not self._is_connected or self._client is None:
+                _LOGGER.warning("Connection lost during notification setup for %s", self._address)
+                return False
+
             if not self._shutting_down:
                 await self._authenticate()
 
@@ -960,49 +965,196 @@ class MelittaDevice:
 
         _LOGGER.warning(
             "=== ENABLING NOTIFICATIONS on %s ===\n"
-            "  Strategy: D-Bus PropertiesChanged handler ONLY (no CCCD write, no StartNotify).\n"
-            "  Reason: StartNotify causes machine disconnect within 40-90ms (confirmed in logs).\n"
-            "  BlueZ blocks manual CCCD writes with NotPermitted.\n"
-            "  Connection is STABLE without notification setup - stays alive for auth.\n"
-            "  Primary auth response method: polling read characteristic.\n"
-            "  D-Bus handler registered as bonus (may catch data if CCCD was enabled in prior session).\n"
+            "  Strategy: start_notify (CCCD write) with disconnect recovery.\n"
+            "  CCCD write is REQUIRED for machine to enter pairing mode (blue display).\n"
+            "  If machine disconnects after CCCD, we reconnect and retry.\n"
             "  hass=%s, connected=%s, client=%s",
             BLE_READ_UUID, self._hass is not None, self._is_connected, type(self._client).__name__,
         )
 
+        notify_ok = await self._start_notify_with_recovery()
+
+        if notify_ok:
+            self._notifications_active = True
+            self._notify_mode = "bleak_notify"
+            _LOGGER.warning(
+                "=== NOTIFICATIONS ACTIVE on %s (mode=bleak_notify) ===",
+                BLE_READ_UUID,
+            )
+
+            if self._hass is not None:
+                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                if read_char_path:
+                    await self._register_dbus_notification_handler(read_char_path)
+                    _LOGGER.warning("D-Bus handler also registered as backup")
+
+            return True
+
+        _LOGGER.warning(
+            "NOTIFICATIONS: start_notify failed after recovery attempts.\n"
+            "  Falling back to polling only."
+        )
+
         if self._hass is not None:
             read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-            _LOGGER.warning("NOTIFICATIONS: D-Bus char path = %s", read_char_path)
-
             if read_char_path:
                 dbus_ok = await self._register_dbus_notification_handler(read_char_path)
-
                 if dbus_ok:
                     self._notifications_active = True
                     self._notify_mode = "dbus_handler_only"
-                    _LOGGER.warning(
-                        "=== NOTIFICATIONS: D-Bus handler registered on %s ===\n"
-                        "  No CCCD write, no StartNotify (avoids disconnect).\n"
-                        "  D-Bus handler may receive data if CCCD was enabled in prior session.\n"
-                        "  Primary method: polling read characteristic after auth write.",
-                        BLE_READ_UUID,
-                    )
+                    _LOGGER.warning("Fallback: D-Bus handler registered (polling is primary)")
                     return True
-                else:
-                    _LOGGER.warning(
-                        "NOTIFICATIONS: D-Bus handler registration failed.\n"
-                        "  Will use polling only."
-                    )
 
         self._notifications_active = False
         self._notify_mode = "polling_only"
-        _LOGGER.warning(
-            "=== NOTIFICATIONS: polling mode on %s ===\n"
-            "  Will poll read characteristic after sending auth frames.\n"
-            "  No BLE notification traffic - connection stays stable.",
-            BLE_READ_UUID,
-        )
         return False
+
+    async def _start_notify_with_recovery(self) -> bool:
+        max_cccd_attempts = 3
+        self._cccd_recovery_in_progress = True
+
+        try:
+            for attempt in range(1, max_cccd_attempts + 1):
+                if not self._client or not self._is_connected:
+                    _LOGGER.warning("CCCD attempt %d: no connection", attempt)
+                    return False
+
+                if self._shutting_down:
+                    _LOGGER.warning("CCCD attempt %d: shutting down", attempt)
+                    return False
+
+                _LOGGER.warning(
+                    "=== CCCD ATTEMPT %d/%d: calling start_notify on %s ===",
+                    attempt, max_cccd_attempts, BLE_READ_UUID,
+                )
+
+                cccd_disconnect_detected = False
+
+                self._suppress_disconnect_callback = True
+                try:
+                    try:
+                        start_notify_kwargs = {
+                            "char_specifier": BLE_READ_UUID,
+                            "callback": self._notification_callback,
+                        }
+                        try:
+                            from bleak.args.bluez import BlueZStartNotifyArgs
+                            start_notify_kwargs["bluez"] = BlueZStartNotifyArgs(use_start_notify=True)
+                            _LOGGER.debug("CCCD: using use_start_notify=True (bleak 2.1+)")
+                        except ImportError:
+                            _LOGGER.debug("CCCD: BlueZStartNotifyArgs not available (bleak <2.1)")
+                        await asyncio.wait_for(
+                            self._client.start_notify(**start_notify_kwargs),
+                            timeout=3.0,
+                        )
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning("CCCD ATTEMPT %d: start_notify timed out (3s)", attempt)
+                    except BleakError as err:
+                        err_str = str(err).lower()
+                        if any(w in err_str for w in ("not connected", "disconnected", "disconnect")):
+                            cccd_disconnect_detected = True
+                            _LOGGER.warning("CCCD ATTEMPT %d: disconnect error: %s", attempt, err)
+                        else:
+                            _LOGGER.warning("CCCD ATTEMPT %d: BleakError: %s", attempt, err)
+                    except (EOFError, OSError) as err:
+                        cccd_disconnect_detected = True
+                        _LOGGER.warning("CCCD ATTEMPT %d: %s: %s", attempt, type(err).__name__, err)
+                    except Exception as err:
+                        _LOGGER.warning("CCCD ATTEMPT %d: error: %s (%s)", attempt, err, type(err).__name__)
+                finally:
+                    self._suppress_disconnect_callback = False
+
+                if not cccd_disconnect_detected:
+                    for check_ms in (100, 200, 300, 500, 750):
+                        await asyncio.sleep(0.1 if check_ms <= 200 else 0.2)
+                        try:
+                            still_connected = self._client and self._client.is_connected
+                        except Exception:
+                            still_connected = False
+                        if not still_connected:
+                            cccd_disconnect_detected = True
+                            _LOGGER.warning(
+                                "CCCD ATTEMPT %d: connection dropped %dms after start_notify",
+                                attempt, check_ms,
+                            )
+                            break
+
+                    if not cccd_disconnect_detected:
+                        _LOGGER.warning(
+                            "CCCD ATTEMPT %d: start_notify SUCCEEDED! Connection stable after 750ms.",
+                            attempt,
+                        )
+                        return True
+
+                _LOGGER.warning(
+                    "CCCD ATTEMPT %d: machine disconnected after CCCD write (expected).\n"
+                    "  CCCD written to machine - it may now enter pairing mode.\n"
+                    "  Cleaning up fully and reconnecting...",
+                    attempt,
+                )
+
+                if self._keepalive_task and not self._keepalive_task.done():
+                    self._keepalive_task.cancel()
+                    self._keepalive_task = None
+                self._cancel_reconnect()
+
+                await self._internal_disconnect()
+
+                self._auth_event.clear()
+                self._auth_got_frame = False
+                self._auth_disconnect_reason = None
+                self._authenticated = False
+                self._session_key = None
+
+                if attempt >= max_cccd_attempts:
+                    _LOGGER.warning(
+                        "CCCD: all %d attempts caused disconnect.\n"
+                        "  Reconnecting for polling-only mode...",
+                        max_cccd_attempts,
+                    )
+                    await asyncio.sleep(2.0)
+                    if self._hass is not None:
+                        await self._force_bluez_disconnect()
+                    reconnect_ok = await self._internal_reconnect_ble()
+                    if reconnect_ok:
+                        _LOGGER.warning("CCCD: final reconnect OK - will use polling only")
+                    return False
+
+                await asyncio.sleep(2.0)
+
+                if self._shutting_down:
+                    return False
+
+                if self._hass is not None:
+                    await self._force_bluez_disconnect()
+
+                reconnect_ok = await self._internal_reconnect_ble()
+                if not reconnect_ok:
+                    _LOGGER.warning("CCCD ATTEMPT %d: first reconnect failed, retrying...", attempt)
+                    await asyncio.sleep(2.0)
+                    if self._hass is not None:
+                        await self._force_bluez_disconnect()
+                    reconnect_ok = await self._internal_reconnect_ble()
+                    if not reconnect_ok:
+                        _LOGGER.warning("CCCD ATTEMPT %d: reconnect failed twice", attempt)
+                        return False
+
+                _LOGGER.warning(
+                    "CCCD ATTEMPT %d: reconnected. Trying start_notify again...", attempt,
+                )
+                await asyncio.sleep(0.5)
+
+            return False
+
+        finally:
+            self._cccd_recovery_in_progress = False
+
+    def _notification_callback(self, sender, data: bytearray):
+        _LOGGER.warning(
+            ">>> BLE NOTIFICATION RX: sender=%s, %d bytes, hex=%s",
+            sender, len(data), bytes(data).hex(),
+        )
+        self._process_incoming_data(bytes(data))
 
     async def _register_dbus_notification_handler(self, char_path: str) -> bool:
         try:
@@ -1324,14 +1476,86 @@ class MelittaDevice:
         if client is None:
             return False
 
+        if self._notify_mode == "bleak_notify" and self._notifications_active:
+            _LOGGER.warning(
+                "AUTH WAIT: %s - notifications ACTIVE (mode=%s).\n"
+                "  Waiting for notification callback + polling as backup.",
+                desc, self._notify_mode,
+            )
+            result = await self._wait_for_auth_combined(desc)
+            if result:
+                return True
+            if self._authenticated or self._auth_got_frame:
+                return True
+
+        if not self._authenticated and not self._auth_got_frame:
+            _LOGGER.warning(
+                "AUTH POLL: %s - using read polling (notify_mode=%s, notifications_active=%s)",
+                desc, self._notify_mode, self._notifications_active,
+            )
+            return await self._wait_for_auth_via_polling(desc)
+
+        return False
+
+    async def _wait_for_auth_combined(self, desc: str) -> bool:
         _LOGGER.warning(
-            "AUTH POLL: %s - using combined polling + D-Bus handler\n"
-            "  notify_mode=%s, notifications_active=%s\n"
-            "  Polling read characteristic is PRIMARY (no StartNotify = no BlueZ forwarding).\n"
-            "  D-Bus handler is bonus (may work if CCCD was enabled in prior session).",
-            desc, self._notify_mode, self._notifications_active,
+            "AUTH COMBINED WAIT: notifications + polling for up to %.1fs\n"
+            "  Checking auth_event (from notification callback) every 150ms\n"
+            "  Also polling read characteristic as backup",
+            AUTH_TIMEOUT,
         )
-        return await self._wait_for_auth_via_polling(desc)
+        client = self._client
+        if client is None:
+            return False
+
+        poll_interval = 0.15
+        max_polls = int(AUTH_TIMEOUT / poll_interval)
+        last_data = None
+
+        for i in range(max_polls):
+            if self._authenticated or self._auth_got_frame:
+                _LOGGER.warning("AUTH COMBINED [#%d]: auth result detected!", i + 1)
+                return True
+
+            if self._auth_event.is_set():
+                _LOGGER.warning("AUTH COMBINED [#%d]: auth_event set!", i + 1)
+                return True
+
+            if not self._is_connected or self._client is None:
+                _LOGGER.warning("AUTH COMBINED [#%d]: connection lost", i + 1)
+                return False
+
+            try:
+                data = await asyncio.wait_for(
+                    client.read_gatt_char(BLE_READ_UUID),
+                    timeout=2.0,
+                )
+                if data and len(data) > 0 and data != last_data:
+                    _LOGGER.warning(
+                        "AUTH COMBINED POLL [#%d]: NEW data via read, %d bytes, hex=%s",
+                        i + 1, len(data), data.hex(),
+                    )
+                    last_data = data
+                    self._process_incoming_data(data)
+                    if self._authenticated or self._auth_event.is_set():
+                        return True
+                elif i < 5 or i % 20 == 0:
+                    _LOGGER.warning(
+                        "AUTH COMBINED [#%d]: waiting... (notify_mode=%s)",
+                        i + 1, self._notify_mode,
+                    )
+            except asyncio.TimeoutError:
+                if i < 5 or i % 20 == 0:
+                    _LOGGER.warning("AUTH COMBINED [#%d]: read timed out (notification may still arrive)", i + 1)
+            except (BleakError, EOFError) as err:
+                _LOGGER.warning("AUTH COMBINED [#%d]: read error: %s", i + 1, err)
+            except Exception as err:
+                _LOGGER.warning("AUTH COMBINED [#%d]: %s: %s", i + 1, type(err).__name__, err)
+
+            await asyncio.sleep(poll_interval)
+
+        _LOGGER.warning("AUTH COMBINED: timeout after %.1fs", AUTH_TIMEOUT)
+        return False
 
     async def _wait_for_auth_via_notifications(self, desc: str) -> bool:
         _LOGGER.warning(
