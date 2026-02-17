@@ -3,7 +3,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.backends import default_backend
 from .const import (
-    AES_ENCRYPTED_DATA, IV_INIT,
+    AES_KEY, AES_ENCRYPTED_DATA, IV_INIT,
     RC4_KEY_PART_A, RC4_KEY_PART_B, SBOX,
 )
 
@@ -37,16 +37,33 @@ def get_rc4_key() -> bytes:
         return _RC4_KEY_CACHE
 
     compound_key = RC4_KEY_PART_B + RC4_KEY_PART_A
+    compound_matches_aes = (compound_key == AES_KEY)
+    _LOGGER.warning(
+        "=== RC4 KEY DERIVATION ===\n"
+        "  AES key source: compound(R3.g.f2460b+f2459a) = %d bytes, first4=%s\n"
+        "  AES_KEY constant (defined but unused): %d bytes, first4=%s\n"
+        "  compound == AES_KEY: %s\n"
+        "  IV: %d bytes, Encrypted data: %d bytes\n"
+        "  NOTE: If auth fails, try swapping to AES_KEY for decryption.",
+        len(compound_key), compound_key[:4].hex(),
+        len(AES_KEY), AES_KEY[:4].hex(),
+        compound_matches_aes,
+        len(IV_INIT), len(AES_ENCRYPTED_DATA),
+    )
     _LOGGER.debug(
-        "Deriving PRIMARY RC4 key: compound_key=%d bytes (%s), IV=%s, encrypted_data=%d bytes",
-        len(compound_key), compound_key.hex(), IV_INIT.hex(), len(AES_ENCRYPTED_DATA),
+        "RC4 KEY DERIVATION (full keys): compound=%s, AES_KEY=%s, IV=%s, data=%s",
+        compound_key.hex(), AES_KEY.hex(), IV_INIT.hex(), AES_ENCRYPTED_DATA.hex(),
     )
 
     rc4_key = _aes_cbc_decrypt(compound_key, IV_INIT, AES_ENCRYPTED_DATA)
 
     _RC4_KEY_CACHE = rc4_key
-    _LOGGER.info("RC4 key derived (primary): %d bytes", len(rc4_key))
-    _LOGGER.debug("RC4 primary key hex [SENSITIVE]: %s", rc4_key.hex())
+    _LOGGER.warning(
+        "=== RC4 KEY DERIVED ===\n"
+        "  RC4 key length: %d bytes, first4=%s",
+        len(rc4_key), rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
+    )
+    _LOGGER.debug("RC4 key hex [SENSITIVE]: %s", rc4_key.hex())
     return rc4_key
 
 

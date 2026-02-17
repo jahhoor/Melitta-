@@ -978,13 +978,33 @@ class MelittaDevice:
                 _LOGGER.warning("NOTIFICATIONS: StartNotify result: %s", start_ok)
 
                 if not start_ok:
-                    cccd_ok = await self._ensure_cccd_enabled(read_char_path)
                     _LOGGER.warning(
-                        "NOTIFICATIONS: StartNotify failed, manual CCCD write result: %s",
-                        cccd_ok,
+                        "NOTIFICATIONS: StartNotify failed - likely stale AcquireNotify from previous session.\n"
+                        "  Attempting NUCLEAR CLEANUP: D-Bus device disconnect + reconnect to clear ALL BlueZ state."
                     )
+                    nuclear_ok = await self._nuclear_notify_cleanup(read_char_path)
+                    if nuclear_ok:
+                        _LOGGER.warning("NOTIFICATIONS: Nuclear cleanup succeeded, StartNotify now works!")
+                        start_ok = True
+                        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                        if not read_char_path:
+                            _LOGGER.warning("NOTIFICATIONS: Lost char path after nuclear cleanup")
+                            start_ok = False
+                    else:
+                        _LOGGER.warning(
+                            "NOTIFICATIONS: Nuclear cleanup did not resolve 'Notify acquired'.\n"
+                            "  Falling back to manual CCCD + D-Bus handler (may not receive data)."
+                        )
+                        cccd_ok = await self._ensure_cccd_enabled(read_char_path)
+                        _LOGGER.warning(
+                            "NOTIFICATIONS: Manual CCCD write result: %s", cccd_ok,
+                        )
 
-                dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                if read_char_path:
+                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                else:
+                    dbus_ok = False
+
                 if dbus_ok and start_ok:
                     self._notifications_active = True
                     self._notify_mode = "dbus_startnotify"
@@ -1043,24 +1063,144 @@ class MelittaDevice:
 
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             try:
-                _LOGGER.warning("NOTIFICATIONS: Calling ReleaseNotify on %s to clean stale state", char_path)
-                release_reply = await bus.call(Message(
+                _LOGGER.warning("NOTIFICATIONS: Calling StopNotify on %s to clean stale state", char_path)
+                stop_reply = await bus.call(Message(
                     destination="org.bluez", path=char_path,
                     interface="org.bluez.GattCharacteristic1",
-                    member="ReleaseNotify",
+                    member="StopNotify",
                 ))
-                if release_reply.message_type == MessageType.ERROR:
+                if stop_reply.message_type == MessageType.ERROR:
+                    error_name = stop_reply.error_name or ""
                     _LOGGER.warning(
-                        "ReleaseNotify result: %s (expected if no stale state)",
-                        release_reply.error_name,
+                        "StopNotify result: %s (expected if no active StartNotify)",
+                        error_name,
                     )
                 else:
-                    _LOGGER.warning("ReleaseNotify succeeded - stale AcquireNotify state cleared")
+                    _LOGGER.warning("StopNotify succeeded - previous StartNotify state cleared")
                     await asyncio.sleep(0.3)
             finally:
                 bus.disconnect()
         except Exception as err:
-            _LOGGER.warning("ReleaseNotify error (non-fatal): %s (%s)", err, type(err).__name__)
+            _LOGGER.warning("StopNotify cleanup error (non-fatal): %s (%s)", err, type(err).__name__)
+
+    async def _nuclear_notify_cleanup(self, char_path: str) -> bool:
+        self._suppress_disconnect_callback = True
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+            import re
+
+            mac_path = self._address.replace(":", "_").upper()
+
+            if self._dbus_notify_bus:
+                try:
+                    self._dbus_notify_bus.disconnect()
+                except Exception:
+                    pass
+                self._dbus_notify_bus = None
+                self._dbus_notify_handler = None
+                self._dbus_match_rule = None
+
+            self._notifications_active = False
+            self._stop_polling()
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_root = Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_root)
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
+
+                disconnected = False
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+                    _LOGGER.warning(
+                        "NUCLEAR CLEANUP: Trying D-Bus Disconnect on %s to clear stale AcquireNotify state",
+                        device_path,
+                    )
+                    disc_reply = await bus.call(Message(
+                        destination="org.bluez", path=device_path,
+                        interface="org.bluez.Device1",
+                        member="Disconnect",
+                    ))
+                    if disc_reply.message_type == MessageType.ERROR:
+                        _LOGGER.warning(
+                            "NUCLEAR CLEANUP: Disconnect on %s: %s",
+                            device_path, disc_reply.error_name,
+                        )
+                    else:
+                        _LOGGER.warning("NUCLEAR CLEANUP: Disconnect succeeded on %s", device_path)
+                        disconnected = True
+                        break
+
+                if not disconnected:
+                    _LOGGER.warning("NUCLEAR CLEANUP: Could not disconnect device on any adapter")
+                    return False
+            finally:
+                bus.disconnect()
+
+            if self._client:
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+            self._is_connected = False
+            self._client = None
+
+            _LOGGER.warning("NUCLEAR CLEANUP: Waiting 3s for BlueZ to fully clean up GATT state...")
+            await asyncio.sleep(3.0)
+
+            _LOGGER.warning("NUCLEAR CLEANUP: Reconnecting to %s via HA BLE stack...", self._address)
+            ble_device = await self._get_ble_device()
+            if ble_device is None:
+                _LOGGER.warning("NUCLEAR CLEANUP: Device not found after disconnect - cleanup failed")
+                return False
+
+            await self._establish_ble_connection(ble_device)
+            self._is_connected = True
+            _LOGGER.warning("NUCLEAR CLEANUP: Reconnected to %s", self._address)
+
+            await asyncio.sleep(0.5)
+
+            if self._client and hasattr(self._client, 'get_services'):
+                try:
+                    await self._client.get_services()
+                    _LOGGER.warning("NUCLEAR CLEANUP: Service discovery completed after reconnect")
+                except Exception as svc_err:
+                    _LOGGER.warning("NUCLEAR CLEANUP: Service discovery error (may use cache): %s", svc_err)
+
+            write_ok = await self._test_ble_write()
+            if not write_ok:
+                _LOGGER.warning("NUCLEAR CLEANUP: Write probe failed after reconnect")
+                return False
+
+            new_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+            if not new_char_path:
+                _LOGGER.warning("NUCLEAR CLEANUP: Cannot find char path after reconnect")
+                return False
+
+            _LOGGER.warning("NUCLEAR CLEANUP: Trying StartNotify on fresh connection (char=%s)", new_char_path)
+            start_ok = await self._dbus_start_notify(new_char_path)
+            if start_ok:
+                _LOGGER.warning("NUCLEAR CLEANUP: StartNotify succeeded after reconnect!")
+                return True
+            else:
+                _LOGGER.warning(
+                    "NUCLEAR CLEANUP: StartNotify STILL failed after reconnect.\n"
+                    "  BlueZ may have persistent state. Falling back to D-Bus handler only."
+                )
+                return False
+
+        except Exception as err:
+            _LOGGER.warning("NUCLEAR CLEANUP error: %s (%s)", err, type(err).__name__)
+            return False
+        finally:
+            self._suppress_disconnect_callback = False
 
     async def _dbus_start_notify(self, char_path: str) -> bool:
         try:
@@ -1335,6 +1475,33 @@ class MelittaDevice:
             _LOGGER.info("Auth completed without success and disconnected - scheduling reconnect")
             self.schedule_reconnect()
 
+    async def _send_auth_frame(self, frame: bytes, desc: str) -> bool:
+        if not self._is_connected or self._client is None:
+            _LOGGER.warning("Connection lost before sending %s auth frame", desc)
+            return False
+
+        _LOGGER.warning(
+            "AUTH SEND (%s): writing %d bytes to %s (response=False)",
+            desc, len(frame), BLE_WRITE_UUID,
+        )
+        try:
+            await asyncio.wait_for(
+                self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False),
+                timeout=5.0,
+            )
+            _LOGGER.warning("AUTH WRITE OK (%s)", desc)
+            return True
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "AUTH WRITE HUNG (%s): write_gatt_char did not return within 5s! "
+                "BLE connection may be stale.",
+                desc,
+            )
+            return False
+        except Exception as err:
+            _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
+            return False
+
     async def _do_authenticate(self):
         self._auth_challenge = os.urandom(4)
         self._auth_got_frame = False
@@ -1343,7 +1510,7 @@ class MelittaDevice:
         auth_payload = self._auth_challenge + challenge_hash
 
         _LOGGER.warning(
-            "=== AUTH START ===\n"
+            "=== AUTH START (APK order: encrypted first, plaintext fallback) ===\n"
             "  challenge=%s, sbox_hash=%s, full_payload=%s (6 bytes)\n"
             "  connected=%s, notifications=%s, notify_mode=%s, shutting_down=%s",
             self._auth_challenge.hex(), challenge_hash.hex(), auth_payload.hex(),
@@ -1354,7 +1521,9 @@ class MelittaDevice:
         auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
 
         _LOGGER.warning(
-            "AUTH FRAMES: encrypted=%s (%d bytes), plaintext=%s (%d bytes)",
+            "AUTH FRAMES built:\n"
+            "  encrypted=%s (%d bytes)\n"
+            "  plaintext=%s (%d bytes)",
             auth_encrypted.hex(), len(auth_encrypted),
             auth_plaintext.hex(), len(auth_plaintext),
         )
@@ -1366,11 +1535,6 @@ class MelittaDevice:
         )
         self._notify_callbacks()
 
-        frames_to_send = [
-            (auth_plaintext, "plaintext"),
-            (auth_encrypted, "encrypted"),
-        ]
-
         if not self._is_connected or self._client is None:
             _LOGGER.warning("Connection lost before auth")
             return
@@ -1378,88 +1542,103 @@ class MelittaDevice:
         self._auth_event.clear()
         self._authenticated = False
 
-        for frame, desc in frames_to_send:
-            if not self._is_connected or self._client is None:
-                _LOGGER.warning("Connection lost before sending %s auth frame", desc)
+        encrypted_sent = await self._send_auth_frame(auth_encrypted, "ENCRYPTED (primary, matching APK)")
+        if not encrypted_sent:
+            _LOGGER.warning("AUTH: encrypted frame failed to send, trying plaintext directly")
+            plaintext_sent = await self._send_auth_frame(auth_plaintext, "PLAINTEXT (fallback)")
+            if not plaintext_sent:
+                _LOGGER.error("AUTH: both frame sends failed, aborting auth")
                 return
-
-            _LOGGER.warning(
-                "AUTH SEND (%s): writing %d bytes to %s (response=False)",
-                desc, len(frame), BLE_WRITE_UUID,
-            )
-            try:
-                await asyncio.wait_for(
-                    self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False),
-                    timeout=5.0,
-                )
-                _LOGGER.warning("AUTH WRITE OK (%s)", desc)
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "AUTH WRITE HUNG (%s): write_gatt_char did not return within 5s! "
-                    "BLE connection may be stale.",
-                    desc,
-                )
-                return
-            except Exception as err:
-                _LOGGER.warning("AUTH WRITE FAILED (%s): %s", desc, err)
-                if not self._is_connected or self._client is None:
-                    return
-                continue
-
-            await asyncio.sleep(0.1)
-
-        _LOGGER.warning(
-            "AUTH: both frames sent. Waiting up to %.0fs for response. "
-            "User should press 'Verbinden' on the machine display.",
-            AUTH_TIMEOUT,
-        )
 
         self._status = "authenticating"
         self._last_error = (
-            "Auth-frames verstuurd. Druk NU op 'Verbinden' op het display van het koffieapparaat! "
+            "Encrypted auth-frame verstuurd (zoals APK). Druk NU op 'Verbinden' op het display! "
             "Wachten op antwoord... (max %d seconden)" % int(AUTH_TIMEOUT)
         )
         self._notify_callbacks()
 
-        got_response = await self._poll_for_auth_response("both-frames")
+        _LOGGER.warning(
+            "AUTH: encrypted frame sent (matching APK). Waiting up to %.0fs for response.\n"
+            "  User should press 'Verbinden' on the machine display.",
+            AUTH_TIMEOUT,
+        )
+
+        got_response = await self._poll_for_auth_response("encrypted")
+
+        if self._authenticated:
+            _LOGGER.warning("=== AUTH SUCCEEDED (encrypted frame, matching APK) ===")
+            return
+
+        should_try_plaintext = False
+        if self._auth_got_frame:
+            _LOGGER.warning(
+                "AUTH: machine responded to encrypted frame but validation FAILED.\n"
+                "  Trying PLAINTEXT fallback in case machine uses unencrypted auth...",
+            )
+            should_try_plaintext = True
+        elif not self._auth_disconnect_reason and self._is_connected and encrypted_sent:
+            _LOGGER.warning(
+                "AUTH: no response to encrypted frame within %.0fs.\n"
+                "  Trying PLAINTEXT fallback (in case machine expects unencrypted auth)...",
+                AUTH_TIMEOUT,
+            )
+            should_try_plaintext = True
+
+        if should_try_plaintext and self._is_connected and not self._shutting_down:
+
+            self._auth_challenge = os.urandom(4)
+            self._auth_got_frame = False
+            self._auth_disconnect_reason = None
+            challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+            auth_payload = self._auth_challenge + challenge_hash
+            auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
+
+            _LOGGER.warning(
+                "AUTH PLAINTEXT FALLBACK: new challenge=%s, frame=%s (%d bytes)",
+                self._auth_challenge.hex(), auth_plaintext.hex(), len(auth_plaintext),
+            )
+
+            self._auth_event.clear()
+            plaintext_sent = await self._send_auth_frame(auth_plaintext, "PLAINTEXT (fallback)")
+
+            if plaintext_sent:
+                self._last_error = (
+                    "Plaintext auth-frame verstuurd (fallback). "
+                    "Wachten op antwoord... (max %d seconden)" % int(AUTH_TIMEOUT)
+                )
+                self._notify_callbacks()
+
+                got_response = await self._poll_for_auth_response("plaintext-fallback")
+
+                if self._authenticated:
+                    _LOGGER.warning("=== AUTH SUCCEEDED (plaintext fallback) ===")
+                    return
 
         _LOGGER.warning(
-            "=== AUTH RESULT ===\n"
-            "  authenticated=%s, got_response=%s, auth_got_frame=%s\n"
+            "=== AUTH RESULT (both attempts) ===\n"
+            "  authenticated=%s, auth_got_frame=%s\n"
             "  auth_disconnect_reason=%s\n"
             "  connected=%s, shutting_down=%s, status=%s",
-            self._authenticated, got_response, self._auth_got_frame,
+            self._authenticated, self._auth_got_frame,
             self._auth_disconnect_reason,
             self._is_connected, self._shutting_down, self._status,
         )
 
-        if self._authenticated:
-            _LOGGER.warning("=== AUTH SUCCEEDED ===")
-            return
-
-        if self._auth_got_frame:
+        if self._auth_disconnect_reason:
             _LOGGER.warning(
-                "AUTH: machine sent a response frame but validation FAILED.\n"
-                "  This means the machine IS responding but the frame content didn't match.\n"
-                "  Check AUTH RESPONSE logs above for details (echo mismatch? wrong length?).",
-            )
-        elif self._auth_disconnect_reason:
-            _LOGGER.warning(
-                "AUTH: connection dropped during auth wait (NO frame was received).\n"
+                "AUTH: connection dropped during auth wait.\n"
                 "  disconnect_reason: %s\n"
-                "  The 'auth response received' message was a FALSE POSITIVE caused by disconnect.\n"
-                "  The machine did NOT actually respond. Notifications may not be working.",
+                "  The machine did NOT respond. Notifications may not be working.",
                 self._auth_disconnect_reason,
             )
-        else:
+        elif not self._auth_got_frame:
             _LOGGER.warning(
-                "AUTH: no response received within %.0fs.\n"
+                "AUTH: no response to either encrypted or plaintext frame.\n"
                 "  Possible causes:\n"
-                "  1. User didn't press 'Verbinden' on machine display in time\n"
-                "  2. Notifications not working (start_notify failed?)\n"
-                "  3. Machine didn't accept the auth frame format\n"
-                "  Check NOTIFICATIONS logs above to verify notifications are active.",
-                AUTH_TIMEOUT,
+                "  1. User didn't press 'Verbinden' on machine display\n"
+                "  2. Notifications not working (check notification logs above)\n"
+                "  3. Wrong RC4 key (check RC4 KEY DERIVATION logs)\n"
+                "  4. Machine requires different auth frame format",
             )
 
         self._last_error = (
