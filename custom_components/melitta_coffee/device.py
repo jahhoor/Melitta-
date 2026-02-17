@@ -1031,8 +1031,123 @@ class MelittaDevice:
         self._notify_mode = "polling_only"
         return False
 
+    async def _dbus_stop_notify_on_char(self, char_path: str) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                stop_msg = Message(
+                    destination="org.bluez",
+                    path=char_path,
+                    interface="org.bluez.GattCharacteristic1",
+                    member="StopNotify",
+                )
+                reply = await bus.call(stop_msg)
+                if reply.message_type == MessageType.ERROR:
+                    _LOGGER.warning(
+                        "D-Bus StopNotify on %s: %s %s",
+                        char_path, reply.error_name, reply.body,
+                    )
+                    return False
+                _LOGGER.warning("D-Bus StopNotify on %s: OK", char_path)
+                return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.warning("dbus_fast not available for D-Bus StopNotify")
+            return False
+        except Exception as err:
+            _LOGGER.warning("D-Bus StopNotify error: %s (%s)", err, type(err).__name__)
+            return False
+
+    async def _dbus_start_notify_on_char(self, char_path: str) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                start_msg = Message(
+                    destination="org.bluez",
+                    path=char_path,
+                    interface="org.bluez.GattCharacteristic1",
+                    member="StartNotify",
+                )
+                reply = await bus.call(start_msg)
+                if reply.message_type == MessageType.ERROR:
+                    _LOGGER.warning(
+                        "D-Bus StartNotify on %s: %s %s",
+                        char_path, reply.error_name, reply.body,
+                    )
+                    return False
+                _LOGGER.warning(
+                    "D-Bus StartNotify on %s: OK - CCCD written to machine via D-Bus!\n"
+                    "  Notifications will arrive via PropertiesChanged signals.",
+                    char_path,
+                )
+                return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.warning("dbus_fast not available for D-Bus StartNotify")
+            return False
+        except Exception as err:
+            _LOGGER.warning("D-Bus StartNotify error: %s (%s)", err, type(err).__name__)
+            return False
+
+    async def _dbus_remove_device(self) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+            import re
+
+            mac_path = self._address.replace(":", "_").upper()
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_root = Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_root)
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
+
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+                    remove_msg = Message(
+                        destination="org.bluez",
+                        path=f"/org/bluez/{adapter}",
+                        interface="org.bluez.Adapter1",
+                        member="RemoveDevice",
+                        signature="o",
+                        body=[device_path],
+                    )
+                    rm_reply = await bus.call(remove_msg)
+                    if rm_reply.message_type == MessageType.ERROR:
+                        _LOGGER.warning(
+                            "D-Bus RemoveDevice %s on %s: %s %s",
+                            device_path, adapter, rm_reply.error_name, rm_reply.body,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "D-Bus RemoveDevice %s on %s: OK - device fully removed from BlueZ!",
+                            device_path, adapter,
+                        )
+                        return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.warning("dbus_fast not available for D-Bus RemoveDevice")
+        except Exception as err:
+            _LOGGER.warning("D-Bus RemoveDevice error: %s (%s)", err, type(err).__name__)
+        return False
+
     async def _start_notify_with_recovery(self) -> str:
-        max_cccd_attempts = 3
+        max_cccd_attempts = 5
         self._cccd_recovery_in_progress = True
 
         try:
@@ -1049,6 +1164,15 @@ class MelittaDevice:
                     "=== CCCD ATTEMPT %d/%d: calling start_notify on %s ===",
                     attempt, max_cccd_attempts, BLE_READ_UUID,
                 )
+
+                char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                if char_path:
+                    _LOGGER.warning(
+                        "CCCD ATTEMPT %d: Pre-clearing BlueZ notify state via D-Bus StopNotify on %s",
+                        attempt, char_path,
+                    )
+                    await self._dbus_stop_notify_on_char(char_path)
+                    await asyncio.sleep(0.3)
 
                 cccd_disconnect_detected = False
                 cccd_written_ok = False
@@ -1103,43 +1227,59 @@ class MelittaDevice:
                                 _LOGGER.warning("CCCD ATTEMPT %d: retry error: %s", attempt, retry_err)
 
                             if not cccd_written_ok and not cccd_disconnect_detected:
-                                _LOGGER.warning(
-                                    "CCCD ATTEMPT %d: start_notify still blocked. Writing CCCD descriptor directly to machine.",
-                                    attempt,
-                                )
-                                try:
-                                    cccd_uuid = "00002902-0000-1000-8000-00805f9b34fb"
-                                    read_char = self._client.services.get_characteristic(BLE_READ_UUID)
-                                    if read_char:
-                                        cccd_desc = None
-                                        for desc in read_char.descriptors:
-                                            if cccd_uuid in str(desc.uuid).lower():
-                                                cccd_desc = desc
-                                                break
-                                        if cccd_desc:
-                                            await self._client.write_gatt_descriptor(
-                                                cccd_desc.handle, b"\x01\x00",
-                                            )
-                                            cccd_written_ok = True
-                                            cccd_via_direct_write = True
-                                            _LOGGER.warning(
-                                                "CCCD ATTEMPT %d: DIRECT CCCD descriptor write OK (handle=%d).\n"
-                                                "  Machine should now receive CCCD and may enter pairing mode.\n"
-                                                "  Note: bleak callback NOT registered - D-Bus handler needed.",
-                                                attempt, cccd_desc.handle,
-                                            )
-                                        else:
-                                            _LOGGER.warning("CCCD ATTEMPT %d: CCCD descriptor (0x2902) not found", attempt)
-                                    else:
-                                        _LOGGER.warning("CCCD ATTEMPT %d: read char not found in services", attempt)
-                                except (EOFError, OSError) as desc_err:
-                                    cccd_disconnect_detected = True
+                                if char_path:
                                     _LOGGER.warning(
-                                        "CCCD ATTEMPT %d: direct CCCD write caused disconnect (good - was written): %s",
-                                        attempt, desc_err,
+                                        "CCCD ATTEMPT %d: Trying D-Bus StartNotify (bypasses AcquireNotify entirely).",
+                                        attempt,
                                     )
-                                except Exception as desc_err:
-                                    _LOGGER.warning("CCCD ATTEMPT %d: direct CCCD write error: %s", attempt, desc_err)
+                                    dbus_start_ok = await self._dbus_start_notify_on_char(char_path)
+                                    if dbus_start_ok:
+                                        cccd_written_ok = True
+                                        cccd_via_direct_write = True
+                                        _LOGGER.warning(
+                                            "CCCD ATTEMPT %d: D-Bus StartNotify succeeded!\n"
+                                            "  CCCD written to machine. Notifications via PropertiesChanged.",
+                                            attempt,
+                                        )
+
+                                if not cccd_written_ok and not cccd_disconnect_detected:
+                                    _LOGGER.warning(
+                                        "CCCD ATTEMPT %d: D-Bus StartNotify also failed. Trying direct CCCD descriptor write.",
+                                        attempt,
+                                    )
+                                    try:
+                                        cccd_uuid = "00002902-0000-1000-8000-00805f9b34fb"
+                                        read_char = self._client.services.get_characteristic(BLE_READ_UUID)
+                                        if read_char:
+                                            cccd_desc = None
+                                            for desc in read_char.descriptors:
+                                                if cccd_uuid in str(desc.uuid).lower():
+                                                    cccd_desc = desc
+                                                    break
+                                            if cccd_desc:
+                                                await self._client.write_gatt_descriptor(
+                                                    cccd_desc.handle, b"\x01\x00",
+                                                )
+                                                cccd_written_ok = True
+                                                cccd_via_direct_write = True
+                                                _LOGGER.warning(
+                                                    "CCCD ATTEMPT %d: DIRECT CCCD descriptor write OK (handle=%d).\n"
+                                                    "  Machine should now receive CCCD and may enter pairing mode.\n"
+                                                    "  Note: bleak callback NOT registered - D-Bus handler needed.",
+                                                    attempt, cccd_desc.handle,
+                                                )
+                                            else:
+                                                _LOGGER.warning("CCCD ATTEMPT %d: CCCD descriptor (0x2902) not found", attempt)
+                                        else:
+                                            _LOGGER.warning("CCCD ATTEMPT %d: read char not found in services", attempt)
+                                    except (EOFError, OSError) as desc_err:
+                                        cccd_disconnect_detected = True
+                                        _LOGGER.warning(
+                                            "CCCD ATTEMPT %d: direct CCCD write caused disconnect (good - was written): %s",
+                                            attempt, desc_err,
+                                        )
+                                    except Exception as desc_err:
+                                        _LOGGER.warning("CCCD ATTEMPT %d: direct CCCD write error: %s", attempt, desc_err)
                         elif any(w in err_str for w in ("not connected", "disconnected", "disconnect")):
                             cccd_disconnect_detected = True
                             _LOGGER.warning("CCCD ATTEMPT %d: disconnect error: %s", attempt, err)
@@ -1178,22 +1318,37 @@ class MelittaDevice:
 
                 if not cccd_written_ok and not cccd_disconnect_detected:
                     if notify_acquired_handled:
-                        _LOGGER.warning(
-                            "CCCD ATTEMPT %d: 'Notify acquired' could not be resolved on this connection.\n"
-                            "  Neither stop_notify+retry nor direct CCCD write worked.\n"
-                            "  Doing full disconnect+reconnect to clear BlueZ state...",
-                            attempt,
-                        )
+                        use_remove = attempt >= 3
+                        if use_remove:
+                            _LOGGER.warning(
+                                "CCCD ATTEMPT %d: 'Notify acquired' persists after %d attempts.\n"
+                                "  Using NUCLEAR option: RemoveDevice from BlueZ to fully clear all state.\n"
+                                "  This forces BlueZ to forget the device completely.\n"
+                                "  The device will be re-discovered on next connection attempt.",
+                                attempt, attempt,
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "CCCD ATTEMPT %d: 'Notify acquired' could not be resolved on this connection.\n"
+                                "  Neither D-Bus StopNotify + start_notify retry nor direct CCCD write worked.\n"
+                                "  Doing full disconnect+reconnect to clear BlueZ state...",
+                                attempt,
+                            )
                         await self._internal_disconnect()
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(1.0)
                         if self._shutting_down:
                             return "failed"
-                        if self._hass is not None:
-                            await self._force_bluez_disconnect()
+                        if use_remove:
+                            await self._dbus_remove_device()
+                            await asyncio.sleep(3.0)
+                        else:
+                            if self._hass is not None:
+                                await self._force_bluez_disconnect()
+                            await asyncio.sleep(2.0)
                         reconnect_ok = await self._internal_reconnect_ble()
                         if not reconnect_ok:
-                            _LOGGER.warning("CCCD ATTEMPT %d: reconnect after notify_acquired failed", attempt)
-                            await asyncio.sleep(2.0)
+                            _LOGGER.warning("CCCD ATTEMPT %d: reconnect failed, retrying...", attempt)
+                            await asyncio.sleep(3.0)
                             reconnect_ok = await self._internal_reconnect_ble()
                         if reconnect_ok:
                             _LOGGER.warning("CCCD ATTEMPT %d: reconnected. Will retry CCCD on fresh connection.", attempt)
