@@ -972,9 +972,9 @@ class MelittaDevice:
             BLE_READ_UUID, self._hass is not None, self._is_connected, type(self._client).__name__,
         )
 
-        notify_ok = await self._start_notify_with_recovery()
+        notify_result = await self._start_notify_with_recovery()
 
-        if notify_ok:
+        if notify_result == "bleak_notify":
             self._notifications_active = True
             self._notify_mode = "bleak_notify"
             _LOGGER.warning(
@@ -989,6 +989,28 @@ class MelittaDevice:
                     _LOGGER.warning("D-Bus handler also registered as backup")
 
             return True
+
+        if notify_result == "direct_cccd":
+            _LOGGER.warning(
+                "=== CCCD written directly (bleak callback NOT registered) ===\n"
+                "  D-Bus handler will be PRIMARY for notifications."
+            )
+            if self._hass is not None:
+                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                if read_char_path:
+                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                    if dbus_ok:
+                        self._notifications_active = True
+                        self._notify_mode = "dbus_direct_cccd"
+                        _LOGGER.warning(
+                            "=== NOTIFICATIONS ACTIVE on %s (mode=dbus_direct_cccd) ===",
+                            BLE_READ_UUID,
+                        )
+                        return True
+            _LOGGER.warning("CCCD written but D-Bus handler registration failed. Using polling.")
+            self._notifications_active = False
+            self._notify_mode = "polling_only"
+            return False
 
         _LOGGER.warning(
             "NOTIFICATIONS: start_notify failed after recovery attempts.\n"
@@ -1009,7 +1031,7 @@ class MelittaDevice:
         self._notify_mode = "polling_only"
         return False
 
-    async def _start_notify_with_recovery(self) -> bool:
+    async def _start_notify_with_recovery(self) -> str:
         max_cccd_attempts = 3
         self._cccd_recovery_in_progress = True
 
@@ -1017,11 +1039,11 @@ class MelittaDevice:
             for attempt in range(1, max_cccd_attempts + 1):
                 if not self._client or not self._is_connected:
                     _LOGGER.warning("CCCD attempt %d: no connection", attempt)
-                    return False
+                    return "failed"
 
                 if self._shutting_down:
                     _LOGGER.warning("CCCD attempt %d: shutting down", attempt)
-                    return False
+                    return "failed"
 
                 _LOGGER.warning(
                     "=== CCCD ATTEMPT %d/%d: calling start_notify on %s ===",
@@ -1029,29 +1051,96 @@ class MelittaDevice:
                 )
 
                 cccd_disconnect_detected = False
+                cccd_written_ok = False
+                cccd_via_direct_write = False
+                notify_acquired_handled = False
 
                 self._suppress_disconnect_callback = True
                 try:
                     try:
-                        start_notify_kwargs = {
-                            "char_specifier": BLE_READ_UUID,
-                            "callback": self._notification_callback,
-                        }
-                        try:
-                            from bleak.args.bluez import BlueZStartNotifyArgs
-                            start_notify_kwargs["bluez"] = BlueZStartNotifyArgs(use_start_notify=True)
-                            _LOGGER.debug("CCCD: using use_start_notify=True (bleak 2.1+)")
-                        except ImportError:
-                            _LOGGER.debug("CCCD: BlueZStartNotifyArgs not available (bleak <2.1)")
                         await asyncio.wait_for(
-                            self._client.start_notify(**start_notify_kwargs),
+                            self._client.start_notify(BLE_READ_UUID, self._notification_callback),
                             timeout=3.0,
                         )
+                        cccd_written_ok = True
                     except asyncio.TimeoutError:
                         _LOGGER.warning("CCCD ATTEMPT %d: start_notify timed out (3s)", attempt)
                     except BleakError as err:
                         err_str = str(err).lower()
-                        if any(w in err_str for w in ("not connected", "disconnected", "disconnect")):
+                        if "notify acquired" in err_str or "notpermitted" in err_str:
+                            notify_acquired_handled = True
+                            _LOGGER.warning(
+                                "CCCD ATTEMPT %d: 'Notify acquired' - BlueZ cached old state.\n"
+                                "  No CCCD written to machine! Trying stop_notify + retry, then direct write.",
+                                attempt,
+                            )
+                            try:
+                                await self._client.stop_notify(BLE_READ_UUID)
+                                _LOGGER.warning("CCCD ATTEMPT %d: stop_notify cleared cached state", attempt)
+                            except Exception as sn_err:
+                                _LOGGER.warning("CCCD ATTEMPT %d: stop_notify: %s", attempt, sn_err)
+                            await asyncio.sleep(0.3)
+                            try:
+                                await asyncio.wait_for(
+                                    self._client.start_notify(BLE_READ_UUID, self._notification_callback),
+                                    timeout=3.0,
+                                )
+                                cccd_written_ok = True
+                                _LOGGER.warning("CCCD ATTEMPT %d: start_notify retry after stop OK!", attempt)
+                            except (EOFError, OSError) as retry_err:
+                                cccd_disconnect_detected = True
+                                _LOGGER.warning("CCCD ATTEMPT %d: retry caused disconnect (good - CCCD was written): %s", attempt, retry_err)
+                            except BleakError as retry_err:
+                                retry_str = str(retry_err).lower()
+                                if any(w in retry_str for w in ("not connected", "disconnected", "disconnect")):
+                                    cccd_disconnect_detected = True
+                                    _LOGGER.warning("CCCD ATTEMPT %d: retry disconnect: %s", attempt, retry_err)
+                                else:
+                                    _LOGGER.warning("CCCD ATTEMPT %d: retry still blocked: %s", attempt, retry_err)
+                            except asyncio.TimeoutError:
+                                _LOGGER.warning("CCCD ATTEMPT %d: retry timed out", attempt)
+                            except Exception as retry_err:
+                                _LOGGER.warning("CCCD ATTEMPT %d: retry error: %s", attempt, retry_err)
+
+                            if not cccd_written_ok and not cccd_disconnect_detected:
+                                _LOGGER.warning(
+                                    "CCCD ATTEMPT %d: start_notify still blocked. Writing CCCD descriptor directly to machine.",
+                                    attempt,
+                                )
+                                try:
+                                    cccd_uuid = "00002902-0000-1000-8000-00805f9b34fb"
+                                    read_char = self._client.services.get_characteristic(BLE_READ_UUID)
+                                    if read_char:
+                                        cccd_desc = None
+                                        for desc in read_char.descriptors:
+                                            if cccd_uuid in str(desc.uuid).lower():
+                                                cccd_desc = desc
+                                                break
+                                        if cccd_desc:
+                                            await self._client.write_gatt_descriptor(
+                                                cccd_desc.handle, b"\x01\x00",
+                                            )
+                                            cccd_written_ok = True
+                                            cccd_via_direct_write = True
+                                            _LOGGER.warning(
+                                                "CCCD ATTEMPT %d: DIRECT CCCD descriptor write OK (handle=%d).\n"
+                                                "  Machine should now receive CCCD and may enter pairing mode.\n"
+                                                "  Note: bleak callback NOT registered - D-Bus handler needed.",
+                                                attempt, cccd_desc.handle,
+                                            )
+                                        else:
+                                            _LOGGER.warning("CCCD ATTEMPT %d: CCCD descriptor (0x2902) not found", attempt)
+                                    else:
+                                        _LOGGER.warning("CCCD ATTEMPT %d: read char not found in services", attempt)
+                                except (EOFError, OSError) as desc_err:
+                                    cccd_disconnect_detected = True
+                                    _LOGGER.warning(
+                                        "CCCD ATTEMPT %d: direct CCCD write caused disconnect (good - was written): %s",
+                                        attempt, desc_err,
+                                    )
+                                except Exception as desc_err:
+                                    _LOGGER.warning("CCCD ATTEMPT %d: direct CCCD write error: %s", attempt, desc_err)
+                        elif any(w in err_str for w in ("not connected", "disconnected", "disconnect")):
                             cccd_disconnect_detected = True
                             _LOGGER.warning("CCCD ATTEMPT %d: disconnect error: %s", attempt, err)
                         else:
@@ -1064,7 +1153,7 @@ class MelittaDevice:
                 finally:
                     self._suppress_disconnect_callback = False
 
-                if not cccd_disconnect_detected:
+                if cccd_written_ok and not cccd_disconnect_detected:
                     for check_ms in (100, 200, 300, 500, 750):
                         await asyncio.sleep(0.1 if check_ms <= 200 else 0.2)
                         try:
@@ -1074,17 +1163,50 @@ class MelittaDevice:
                         if not still_connected:
                             cccd_disconnect_detected = True
                             _LOGGER.warning(
-                                "CCCD ATTEMPT %d: connection dropped %dms after start_notify",
+                                "CCCD ATTEMPT %d: connection dropped %dms after CCCD write",
                                 attempt, check_ms,
                             )
                             break
 
                     if not cccd_disconnect_detected:
+                        result_mode = "direct_cccd" if cccd_via_direct_write else "bleak_notify"
                         _LOGGER.warning(
-                            "CCCD ATTEMPT %d: start_notify SUCCEEDED! Connection stable after 750ms.",
+                            "CCCD ATTEMPT %d: CCCD write + connection stable after 750ms. SUCCESS! (mode=%s)",
+                            attempt, result_mode,
+                        )
+                        return result_mode
+
+                if not cccd_written_ok and not cccd_disconnect_detected:
+                    if notify_acquired_handled:
+                        _LOGGER.warning(
+                            "CCCD ATTEMPT %d: 'Notify acquired' could not be resolved on this connection.\n"
+                            "  Neither stop_notify+retry nor direct CCCD write worked.\n"
+                            "  Doing full disconnect+reconnect to clear BlueZ state...",
                             attempt,
                         )
-                        return True
+                        await self._internal_disconnect()
+                        await asyncio.sleep(2.0)
+                        if self._shutting_down:
+                            return "failed"
+                        if self._hass is not None:
+                            await self._force_bluez_disconnect()
+                        reconnect_ok = await self._internal_reconnect_ble()
+                        if not reconnect_ok:
+                            _LOGGER.warning("CCCD ATTEMPT %d: reconnect after notify_acquired failed", attempt)
+                            await asyncio.sleep(2.0)
+                            reconnect_ok = await self._internal_reconnect_ble()
+                        if reconnect_ok:
+                            _LOGGER.warning("CCCD ATTEMPT %d: reconnected. Will retry CCCD on fresh connection.", attempt)
+                        else:
+                            _LOGGER.warning("CCCD ATTEMPT %d: reconnect failed. Giving up this attempt.", attempt)
+                        continue
+                    else:
+                        _LOGGER.warning(
+                            "CCCD ATTEMPT %d: start_notify failed but no disconnect. Retrying...",
+                            attempt,
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
 
                 _LOGGER.warning(
                     "CCCD ATTEMPT %d: machine disconnected after CCCD write (expected).\n"
@@ -1118,12 +1240,12 @@ class MelittaDevice:
                     reconnect_ok = await self._internal_reconnect_ble()
                     if reconnect_ok:
                         _LOGGER.warning("CCCD: final reconnect OK - will use polling only")
-                    return False
+                    return "failed"
 
                 await asyncio.sleep(2.0)
 
                 if self._shutting_down:
-                    return False
+                    return "failed"
 
                 if self._hass is not None:
                     await self._force_bluez_disconnect()
@@ -1137,14 +1259,24 @@ class MelittaDevice:
                     reconnect_ok = await self._internal_reconnect_ble()
                     if not reconnect_ok:
                         _LOGGER.warning("CCCD ATTEMPT %d: reconnect failed twice", attempt)
-                        return False
+                        return "failed"
 
                 _LOGGER.warning(
-                    "CCCD ATTEMPT %d: reconnected. Trying start_notify again...", attempt,
+                    "CCCD ATTEMPT %d: reconnected. Clearing BlueZ notify state before retry...",
+                    attempt,
                 )
+
+                try:
+                    await self._client.stop_notify(BLE_READ_UUID)
+                    _LOGGER.warning("CCCD ATTEMPT %d: stop_notify OK (cleared old state)", attempt)
+                except Exception as sn_err:
+                    _LOGGER.warning(
+                        "CCCD ATTEMPT %d: stop_notify returned: %s (may be OK)", attempt, sn_err,
+                    )
+
                 await asyncio.sleep(0.5)
 
-            return False
+            return "failed"
 
         finally:
             self._cccd_recovery_in_progress = False
@@ -1476,7 +1608,7 @@ class MelittaDevice:
         if client is None:
             return False
 
-        if self._notify_mode == "bleak_notify" and self._notifications_active:
+        if self._notify_mode in ("bleak_notify", "dbus_direct_cccd", "dbus_handler_only") and self._notifications_active:
             _LOGGER.warning(
                 "AUTH WAIT: %s - notifications ACTIVE (mode=%s).\n"
                 "  Waiting for notification callback + polling as backup.",
