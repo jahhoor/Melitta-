@@ -39,6 +39,8 @@ class MelittaDevice:
         self._session_key: bytes | None = None
         self._auth_challenge: bytes | None = None
         self._auth_event = asyncio.Event()
+        self._auth_got_frame = False
+        self._auth_disconnect_reason: str | None = None
         self._authenticated = False
         self._is_connected = False
         self._shutting_down = False
@@ -155,14 +157,26 @@ class MelittaDevice:
                 _LOGGER.exception("Error in callback")
 
     def _on_disconnect(self, client: BleakClient):
+        import traceback
+        caller_info = "".join(traceback.format_stack(limit=5))
+
         if self._suppress_disconnect_callback:
-            _LOGGER.debug("Ignoring disconnect callback (suppressed during internal disconnect)")
+            _LOGGER.warning(
+                "DISCONNECT CALLBACK (suppressed) for %s - ignoring (called during internal disconnect)",
+                self._address,
+            )
             return
         if client is not self._client:
-            _LOGGER.debug("Ignoring disconnect callback from stale client")
+            _LOGGER.warning(
+                "DISCONNECT CALLBACK from stale client for %s - ignoring",
+                self._address,
+            )
             return
         if self._disconnect_in_progress:
-            _LOGGER.debug("Ignoring duplicate disconnect callback (already processing)")
+            _LOGGER.warning(
+                "DISCONNECT CALLBACK duplicate for %s - ignoring (already processing)",
+                self._address,
+            )
             return
 
         self._disconnect_in_progress = True
@@ -181,6 +195,7 @@ class MelittaDevice:
             if was_auth:
                 self._status = "auth_dropped"
                 self._last_error = "Machine heeft verbinding verbroken tijdens authenticatie. Wacht op automatische herverbinding."
+                self._auth_disconnect_reason = f"disconnect during auth (prev={prev_status}, shutting_down={self._shutting_down})"
                 self._auth_event.set()
             elif prev_status == "connecting":
                 self._status = "offline"
@@ -190,13 +205,23 @@ class MelittaDevice:
                 self._last_error = "Connection lost"
 
             _LOGGER.warning(
-                "DISCONNECTED from %s: prev_status=%s, was_auth=%s, shutting_down=%s, new_status=%s",
+                "=== DISCONNECTED from %s ===\n"
+                "  prev_status=%s, was_auth=%s, shutting_down=%s, new_status=%s\n"
+                "  auth_event_set=%s, auth_got_frame=%s, auth_lock_locked=%s\n"
+                "  caller_stack:\n%s",
                 self._address, prev_status, was_auth, self._shutting_down, self._status,
+                self._auth_event.is_set(), self._auth_got_frame, self._auth_lock.locked(),
+                caller_info,
             )
             self._notify_callbacks()
 
             if not self._shutting_down:
                 self.schedule_reconnect(fast=use_fast_reconnect)
+            else:
+                _LOGGER.warning(
+                    "NOT scheduling reconnect because shutting_down=True for %s",
+                    self._address,
+                )
         finally:
             self._disconnect_in_progress = False
 
@@ -276,15 +301,33 @@ class MelittaDevice:
                 self.schedule_reconnect()
 
     def _on_notification(self, sender, data: bytes):
-        _LOGGER.info("BLE RX notification: %d bytes, raw_hex=%s, sender=%s", len(data), data.hex(), sender)
+        _LOGGER.warning(
+            ">>> BLE NOTIFICATION RX (bleak callback): %d bytes, hex=%s, sender=%s",
+            len(data), data.hex(), sender,
+        )
         self._process_incoming_data(data)
 
     def _process_incoming_data(self, data: bytes):
+        _LOGGER.warning(
+            "PROCESS_INCOMING_DATA: %d bytes, hex=%s, connected=%s, authenticated=%s, status=%s",
+            len(data), data.hex(), self._is_connected, self._authenticated, self._status,
+        )
         frames = self._parser.feed(data)
         if not frames:
-            _LOGGER.debug("No complete frames parsed (buffering)")
+            buf_pos = getattr(self._parser, '_pos', 0)
+            buf_data = bytes(self._parser._buffer[:buf_pos]) if buf_pos > 0 else b""
+            _LOGGER.warning(
+                "PARSER: no complete frames yet (buffering). Buffer pos=%d, buffered_hex=%s",
+                buf_pos, buf_data.hex() if buf_data else "empty",
+            )
+        else:
+            _LOGGER.warning("PARSER: got %d complete frame(s)", len(frames))
         for frame in frames:
-            _LOGGER.info("Parsed frame: %s", frame)
+            _LOGGER.warning(
+                "PARSED FRAME: command=%r, payload_len=%d, payload_hex=%s, encrypted=%s, raw_hex=%s",
+                frame.command, len(frame.payload), frame.payload.hex(), frame.encrypted,
+                frame.raw.hex() if hasattr(frame, 'raw') and frame.raw else "n/a",
+            )
             self._handle_frame(frame)
 
     async def _start_polling(self):
@@ -340,37 +383,49 @@ class MelittaDevice:
             self._polling_task = None
 
     def _handle_frame(self, frame: EfComFrame):
-        _LOGGER.debug("Received frame: %s", frame)
+        try:
+            cmd_hex = "0x%02x" % ord(frame.command) if isinstance(frame.command, str) and len(frame.command) == 1 else repr(frame.command)
+        except Exception:
+            cmd_hex = repr(frame.command)
+        _LOGGER.warning(
+            "HANDLE_FRAME: command=%r (%s), payload_len=%d, encrypted=%s",
+            frame.command, cmd_hex, len(frame.payload), frame.encrypted,
+        )
 
         if frame.command == CMD_AUTH:
+            _LOGGER.warning(">>> AUTH FRAME RECEIVED - calling _handle_auth_response")
             self._handle_auth_response(frame)
         elif frame.command == CMD_STATUS:
             self._handle_status_response(frame)
         elif frame.command == CMD_KEEPALIVE:
-            if len(frame.payload) >= 11:
-                _LOGGER.debug(
-                    "Version/keepalive response: payload=%s (%d bytes)",
-                    frame.payload.hex(), len(frame.payload),
-                )
-            else:
-                _LOGGER.debug("Keepalive acknowledged")
+            _LOGGER.warning(
+                "KEEPALIVE response: payload=%s (%d bytes)",
+                frame.payload.hex(), len(frame.payload),
+            )
         elif frame.command == "A":
-            _LOGGER.debug("ACK received")
+            _LOGGER.warning("ACK received: payload=%s", frame.payload.hex())
         elif frame.command == "N":
-            _LOGGER.warning("NACK received")
+            _LOGGER.warning("NACK received: payload=%s", frame.payload.hex())
         else:
-            _LOGGER.debug("Unhandled frame: %s", frame)
+            _LOGGER.warning(
+                "UNHANDLED FRAME: command=%r (%s), payload=%s",
+                frame.command, cmd_hex, frame.payload.hex(),
+            )
 
     def _handle_auth_response(self, frame: EfComFrame):
         payload = frame.payload
+        self._auth_got_frame = True
         _LOGGER.warning(
-            "AUTH RESPONSE: %d bytes, hex=%s, encrypted=%s",
+            "=== AUTH RESPONSE FRAME RECEIVED ===\n"
+            "  payload_length=%d, payload_hex=%s, encrypted=%s\n"
+            "  current_state: connected=%s, authenticated=%s, status=%s, shutting_down=%s",
             len(payload), payload.hex(), frame.encrypted,
+            self._is_connected, self._authenticated, self._status, self._shutting_down,
         )
         if len(payload) != 8:
             _LOGGER.warning(
                 "AUTH FAIL: unexpected payload length %d (expected 8). "
-                "Raw payload hex: %s",
+                "Raw payload hex: %s. This might mean decryption failed or wrong frame format.",
                 len(payload), payload.hex(),
             )
             self._auth_event.set()
@@ -381,25 +436,29 @@ class MelittaDevice:
         hash_received = payload[6:8]
 
         _LOGGER.warning(
-            "AUTH FIELDS: echo=%s, session_key=%s, hash=%s",
+            "AUTH RESPONSE FIELDS:\n"
+            "  echo (4 bytes)     = %s\n"
+            "  session_key (2 bytes) = %s\n"
+            "  hash (2 bytes)     = %s",
             echo.hex(), session.hex(), hash_received.hex(),
         )
 
         if self._auth_challenge is None:
-            _LOGGER.warning("AUTH FAIL: no pending challenge")
+            _LOGGER.warning("AUTH FAIL: no pending challenge (self._auth_challenge is None)")
             self._auth_event.set()
             return
 
         _LOGGER.warning(
-            "AUTH ECHO CHECK: sent=%s, received=%s, match=%s",
+            "AUTH ECHO CHECK: sent_challenge=%s, received_echo=%s, MATCH=%s",
             self._auth_challenge.hex(), echo.hex(), echo == self._auth_challenge,
         )
 
         if echo != self._auth_challenge:
             _LOGGER.warning(
-                "AUTH FAIL: echo mismatch. We sent challenge=%s but machine echoed=%s. "
-                "This means the machine is responding to a different auth request, "
-                "or decryption produced wrong bytes.",
+                "AUTH FAIL: echo mismatch!\n"
+                "  We sent challenge = %s\n"
+                "  Machine echoed    = %s\n"
+                "  This could mean: wrong encryption, different auth request, or machine sent old response.",
                 self._auth_challenge.hex(), echo.hex(),
             )
             self._auth_event.set()
@@ -409,23 +468,26 @@ class MelittaDevice:
         expected_hash = sbox_hash(verify_data, len(verify_data))
         hash_match = hash_received == expected_hash
         _LOGGER.warning(
-            "AUTH HASH CHECK: expected=%s, received=%s, match=%s, verify_data=%s",
-            expected_hash.hex(), hash_received.hex(), hash_match, verify_data.hex(),
+            "AUTH HASH CHECK:\n"
+            "  verify_data = %s\n"
+            "  expected_hash = %s\n"
+            "  received_hash = %s\n"
+            "  MATCH = %s",
+            verify_data.hex(), expected_hash.hex(), hash_received.hex(), hash_match,
         )
 
         if not hash_match:
             _LOGGER.warning(
                 "AUTH: SBOX hash mismatch but echo matched! "
-                "Accepting session anyway (SBOX table may differ per model). "
-                "expected_hash=%s, received_hash=%s",
-                expected_hash.hex(), hash_received.hex(),
+                "Accepting session anyway (SBOX table may differ per model).",
             )
 
         self._session_key = session
         self._authenticated = True
         _LOGGER.warning(
-            "AUTH SUCCESS: session_key=%s, echo_match=%s, hash_match=%s, encrypted=%s",
-            session.hex(), True, hash_match, frame.encrypted,
+            "=== AUTH SUCCESS ===\n"
+            "  session_key=%s, echo_match=True, hash_match=%s, encrypted=%s",
+            session.hex(), hash_match, frame.encrypted,
         )
         self._auth_event.set()
 
@@ -892,79 +954,122 @@ class MelittaDevice:
 
     async def _enable_notifications(self):
         if not self._client or not self._is_connected:
-            _LOGGER.warning("Cannot enable notifications: no client/connection")
+            _LOGGER.warning("NOTIFICATIONS: Cannot enable - no client/connection")
             return False
-
-        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-        _LOGGER.info("Read characteristic D-Bus path: %s", read_char_path)
-
-        if self._hass is not None:
-            if read_char_path:
-                _LOGGER.info(
-                    "Running inside Home Assistant - using D-Bus PropertiesChanged handler "
-                    "(start_notify skipped to prevent D-Bus crash)."
-                )
-                dbus_ok = await self._register_dbus_notification_handler(read_char_path)
-                if dbus_ok:
-                    self._notifications_active = True
-                    _LOGGER.warning(
-                        "NOTIFICATIONS via D-Bus PropertiesChanged on %s "
-                        "(safe mode - no start_notify called)",
-                        BLE_READ_UUID,
-                    )
-                    cccd_ok = await self._ensure_cccd_enabled(read_char_path)
-                    if cccd_ok:
-                        _LOGGER.warning("CCCD confirmed enabled - machine will send notifications")
-                    else:
-                        _LOGGER.warning("CCCD status unknown - notifications may or may not work")
-                    await asyncio.sleep(0.3)
-                    return True
-                _LOGGER.warning("D-Bus PropertiesChanged handler registration failed")
-            else:
-                _LOGGER.warning(
-                    "Could not find read characteristic D-Bus path from service cache. "
-                    "Services may not be fully resolved yet. Retrying after brief delay..."
-                )
-                await asyncio.sleep(1.0)
-                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-                if read_char_path:
-                    _LOGGER.info("Found char path on retry: %s", read_char_path)
-                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
-                    if dbus_ok:
-                        self._notifications_active = True
-                        _LOGGER.warning(
-                            "NOTIFICATIONS via D-Bus PropertiesChanged on %s (after retry)",
-                            BLE_READ_UUID,
-                        )
-                        cccd_ok = await self._ensure_cccd_enabled(read_char_path)
-                        if cccd_ok:
-                            _LOGGER.warning("CCCD confirmed enabled")
-                        await asyncio.sleep(0.3)
-                        return True
-                _LOGGER.warning(
-                    "Cannot find characteristic path in HA mode. "
-                    "Notifications unavailable - auth will use polling fallback."
-                )
-
-            self._notifications_active = False
-            return False
-
-        if self._client and self._is_connected:
-            try:
-                await self._client.start_notify(BLE_READ_UUID, self._on_notification)
-                self._notifications_active = True
-                _LOGGER.warning("NOTIFICATIONS ENABLED via bleak start_notify on %s", BLE_READ_UUID)
-                await asyncio.sleep(0.3)
-                return True
-            except Exception as err:
-                _LOGGER.warning("start_notify failed (non-HA mode): %s", err)
 
         _LOGGER.warning(
-            "All notification methods failed. "
-            "Auth will use polling fallback (unlikely to work - machine sends via notification only).",
+            "=== ENABLING NOTIFICATIONS on %s ===\n"
+            "  hass=%s, connected=%s, client=%s",
+            BLE_READ_UUID, self._hass is not None, self._is_connected, type(self._client).__name__,
+        )
+
+        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+        _LOGGER.warning("NOTIFICATIONS: D-Bus char path = %s", read_char_path)
+
+        start_notify_ok = False
+        try:
+            _LOGGER.warning(
+                "NOTIFICATIONS: Calling start_notify on %s "
+                "(this tells BlueZ to write CCCD + subscribe to notifications)",
+                BLE_READ_UUID,
+            )
+            await self._client.start_notify(BLE_READ_UUID, self._on_notification)
+            start_notify_ok = True
+            self._notifications_active = True
+            _LOGGER.warning(
+                "NOTIFICATIONS: start_notify SUCCEEDED on %s - "
+                "BlueZ will now forward Value notifications via callback!",
+                BLE_READ_UUID,
+            )
+        except Exception as err:
+            _LOGGER.warning(
+                "NOTIFICATIONS: start_notify FAILED: %s (%s). Will try D-Bus StartNotify fallback.",
+                err, type(err).__name__,
+            )
+
+        if not start_notify_ok and self._hass is not None:
+            if not read_char_path:
+                _LOGGER.warning("NOTIFICATIONS: Char D-Bus path not found, retrying after 1s delay...")
+                await asyncio.sleep(1.0)
+                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                _LOGGER.warning("NOTIFICATIONS: Char D-Bus path after retry: %s", read_char_path)
+
+            if read_char_path:
+                dbus_start_ok = await self._call_dbus_start_notify(read_char_path)
+                if dbus_start_ok:
+                    self._notifications_active = True
+                    _LOGGER.warning("NOTIFICATIONS: D-Bus StartNotify SUCCEEDED on %s", read_char_path)
+                else:
+                    _LOGGER.warning("NOTIFICATIONS: D-Bus StartNotify FAILED on %s", read_char_path)
+            else:
+                _LOGGER.warning("NOTIFICATIONS: Cannot call D-Bus StartNotify - no char path available")
+
+        if self._hass is not None and read_char_path and self._notifications_active:
+            dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+            if dbus_ok:
+                _LOGGER.warning(
+                    "NOTIFICATIONS: D-Bus PropertiesChanged handler also registered on %s",
+                    read_char_path,
+                )
+            else:
+                _LOGGER.warning("NOTIFICATIONS: D-Bus PropertiesChanged handler registration failed")
+
+        if self._notifications_active:
+            _LOGGER.warning(
+                "=== NOTIFICATIONS ACTIVE on %s ===\n"
+                "  method: %s\n"
+                "  Machine notifications should now be received via callback.",
+                BLE_READ_UUID,
+                "start_notify" if start_notify_ok else "D-Bus StartNotify",
+            )
+            await asyncio.sleep(0.3)
+            return True
+
+        _LOGGER.error(
+            "=== ALL NOTIFICATION METHODS FAILED on %s ===\n"
+            "  start_notify_ok=%s, read_char_path=%s, hass=%s\n"
+            "  Machine auth response will NOT be received!\n"
+            "  Auth will use polling fallback but machine only sends via notifications.",
+            BLE_READ_UUID, start_notify_ok, read_char_path, self._hass is not None,
         )
         self._notifications_active = False
         return False
+
+    async def _call_dbus_start_notify(self, char_path: str) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                _LOGGER.info("Calling org.bluez.GattCharacteristic1.StartNotify on %s", char_path)
+                reply = await bus.call(Message(
+                    destination="org.bluez",
+                    path=char_path,
+                    interface="org.bluez.GattCharacteristic1",
+                    member="StartNotify",
+                ))
+                if reply.message_type == MessageType.ERROR:
+                    error_msg = reply.error_name
+                    error_body = reply.body if reply.body else []
+                    if "InProgress" in str(error_msg) or "Already notifying" in str(error_body):
+                        _LOGGER.warning(
+                            "StartNotify: already active (%s) - notifications are working",
+                            error_msg,
+                        )
+                        return True
+                    _LOGGER.warning("StartNotify failed: %s %s", error_msg, error_body)
+                    return False
+                _LOGGER.warning("StartNotify succeeded on %s", char_path)
+                return True
+            finally:
+                bus.disconnect()
+        except ImportError:
+            _LOGGER.warning("dbus_fast not available for StartNotify")
+            return False
+        except Exception as err:
+            _LOGGER.warning("StartNotify error: %s (%s)", err, type(err).__name__)
+            return False
 
     async def _ensure_cccd_enabled(self, char_path: str) -> bool:
         try:
@@ -1095,12 +1200,23 @@ class MelittaDevice:
                 if msg_path != char_path:
                     return
                 if not msg.body or len(msg.body) < 2:
+                    _LOGGER.warning(
+                        "D-Bus PropertiesChanged: empty body, path=%s", msg_path,
+                    )
                     return
                 iface = msg.body[0]
                 changed = msg.body[1]
                 if iface != "org.bluez.GattCharacteristic1":
+                    _LOGGER.warning(
+                        "D-Bus PropertiesChanged: wrong interface=%s (expected GattCharacteristic1), path=%s",
+                        iface, msg_path,
+                    )
                     return
                 if "Value" not in changed:
+                    _LOGGER.warning(
+                        "D-Bus PropertiesChanged: no Value key, keys=%s, path=%s",
+                        list(changed.keys()), msg_path,
+                    )
                     return
 
                 value = changed["Value"]
@@ -1108,10 +1224,11 @@ class MelittaDevice:
                     value = value.value
                 data = bytes(value)
                 if len(data) == 0:
+                    _LOGGER.warning("D-Bus PropertiesChanged: empty Value data, path=%s", msg_path)
                     return
 
                 _LOGGER.warning(
-                    "D-Bus NOTIFICATION RX: %d bytes, hex=%s, path=%s",
+                    ">>> D-Bus NOTIFICATION RX: %d bytes, hex=%s, path=%s",
                     len(data), data.hex(), msg_path,
                 )
                 self._process_incoming_data(data)
@@ -1137,6 +1254,16 @@ class MelittaDevice:
             return False
 
     async def _stop_notifications(self):
+        import traceback
+        caller = "".join(traceback.format_stack(limit=4))
+        _LOGGER.warning(
+            "=== STOPPING NOTIFICATIONS ===\n"
+            "  notifications_active=%s, status=%s, shutting_down=%s, auth_lock=%s\n"
+            "  caller:\n%s",
+            self._notifications_active, self._status, self._shutting_down,
+            self._auth_lock.locked(), caller,
+        )
+
         if self._dbus_notify_bus is not None:
             try:
                 if self._dbus_notify_handler:
@@ -1156,21 +1283,25 @@ class MelittaDevice:
                     except Exception:
                         pass
                 self._dbus_notify_bus.disconnect()
-                _LOGGER.debug("D-Bus notification bus disconnected")
+                _LOGGER.warning("D-Bus notification bus disconnected")
             except Exception as err:
-                _LOGGER.debug("D-Bus cleanup error (non-fatal): %s", err)
+                _LOGGER.warning("D-Bus cleanup error (non-fatal): %s", err)
             self._dbus_notify_bus = None
             self._dbus_notify_handler = None
             self._dbus_match_rule = None
 
         if not self._notifications_active or not self._client:
+            _LOGGER.warning(
+                "STOP_NOTIFICATIONS: skipping stop_notify (active=%s, client=%s)",
+                self._notifications_active, self._client is not None,
+            )
             self._notifications_active = False
             return
         try:
             await self._client.stop_notify(BLE_READ_UUID)
-            _LOGGER.warning("NOTIFICATIONS STOPPED on %s", BLE_READ_UUID)
+            _LOGGER.warning("NOTIFICATIONS STOPPED via stop_notify on %s", BLE_READ_UUID)
         except Exception as err:
-            _LOGGER.debug("stop_notify failed (non-fatal): %s", err)
+            _LOGGER.warning("stop_notify failed (non-fatal): %s (%s)", err, type(err).__name__)
         self._notifications_active = False
 
     async def _authenticate(self):
@@ -1187,12 +1318,17 @@ class MelittaDevice:
 
     async def _do_authenticate(self):
         self._auth_challenge = os.urandom(4)
+        self._auth_got_frame = False
+        self._auth_disconnect_reason = None
         challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
         auth_payload = self._auth_challenge + challenge_hash
 
         _LOGGER.warning(
-            "AUTH START: challenge=%s, sbox_hash=%s, full_payload=%s (6 bytes)",
+            "=== AUTH START ===\n"
+            "  challenge=%s, sbox_hash=%s, full_payload=%s (6 bytes)\n"
+            "  connected=%s, notifications=%s, notify_mode=%s, shutting_down=%s",
             self._auth_challenge.hex(), challenge_hash.hex(), auth_payload.hex(),
+            self._is_connected, self._notifications_active, self._notify_mode, self._shutting_down,
         )
 
         auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
@@ -1268,16 +1404,42 @@ class MelittaDevice:
 
         got_response = await self._poll_for_auth_response("both-frames")
 
+        _LOGGER.warning(
+            "=== AUTH RESULT ===\n"
+            "  authenticated=%s, got_response=%s, auth_got_frame=%s\n"
+            "  auth_disconnect_reason=%s\n"
+            "  connected=%s, shutting_down=%s, status=%s",
+            self._authenticated, got_response, self._auth_got_frame,
+            self._auth_disconnect_reason,
+            self._is_connected, self._shutting_down, self._status,
+        )
+
         if self._authenticated:
-            _LOGGER.warning("AUTH SUCCEEDED after sending both frames!")
+            _LOGGER.warning("=== AUTH SUCCEEDED ===")
             return
 
-        if got_response:
-            _LOGGER.warning("AUTH got a response but validation FAILED")
+        if self._auth_got_frame:
+            _LOGGER.warning(
+                "AUTH: machine sent a response frame but validation FAILED.\n"
+                "  This means the machine IS responding but the frame content didn't match.\n"
+                "  Check AUTH RESPONSE logs above for details (echo mismatch? wrong length?).",
+            )
+        elif self._auth_disconnect_reason:
+            _LOGGER.warning(
+                "AUTH: connection dropped during auth wait (NO frame was received).\n"
+                "  disconnect_reason: %s\n"
+                "  The 'auth response received' message was a FALSE POSITIVE caused by disconnect.\n"
+                "  The machine did NOT actually respond. Notifications may not be working.",
+                self._auth_disconnect_reason,
+            )
         else:
             _LOGGER.warning(
-                "AUTH: no response within %.0fs. "
-                "Machine button may not have been pressed in time.",
+                "AUTH: no response received within %.0fs.\n"
+                "  Possible causes:\n"
+                "  1. User didn't press 'Verbinden' on machine display in time\n"
+                "  2. Notifications not working (start_notify failed?)\n"
+                "  3. Machine didn't accept the auth frame format\n"
+                "  Check NOTIFICATIONS logs above to verify notifications are active.",
                 AUTH_TIMEOUT,
             )
 
@@ -1287,9 +1449,10 @@ class MelittaDevice:
             "druk op 'Verbinden' zodra de status verandert."
         )
         _LOGGER.error(
-            "Auth FAILED for %s - machine button may not have been pressed. "
-            "Sent both plaintext and encrypted frames with response=False.",
-            self._address,
+            "=== AUTH FAILED for %s ===\n"
+            "  auth_got_frame=%s, disconnect_reason=%s, notifications_active=%s",
+            self._address, self._auth_got_frame, self._auth_disconnect_reason,
+            self._notifications_active,
         )
 
     async def _poll_for_auth_response(self, desc: str) -> bool:
@@ -1304,8 +1467,10 @@ class MelittaDevice:
 
     async def _wait_for_auth_via_notifications(self, desc: str) -> bool:
         _LOGGER.warning(
-            "AUTH WAIT (notifications): waiting up to %.1fs for auth response on %s",
+            "AUTH WAIT (notifications): waiting up to %.1fs for auth response on %s\n"
+            "  notifications_active=%s, auth_event_cleared=%s, auth_got_frame=%s",
             AUTH_TIMEOUT, BLE_READ_UUID,
+            self._notifications_active, not self._auth_event.is_set(), self._auth_got_frame,
         )
 
         try:
@@ -1313,13 +1478,44 @@ class MelittaDevice:
         except asyncio.TimeoutError:
             pass
 
-        if self._authenticated or self._auth_event.is_set():
-            _LOGGER.warning("AUTH WAIT: auth response received via notification!")
+        _LOGGER.warning(
+            "AUTH WAIT: event check:\n"
+            "  auth_event.is_set=%s, authenticated=%s, auth_got_frame=%s\n"
+            "  auth_disconnect_reason=%s, connected=%s, shutting_down=%s",
+            self._auth_event.is_set(), self._authenticated, self._auth_got_frame,
+            self._auth_disconnect_reason, self._is_connected, self._shutting_down,
+        )
+
+        if self._authenticated:
+            _LOGGER.warning("AUTH WAIT: AUTHENTICATED via notification callback!")
             return True
 
+        if self._auth_got_frame:
+            _LOGGER.warning(
+                "AUTH WAIT: got auth frame via notification but validation failed. "
+                "Returning True so caller can inspect the failure reason.",
+            )
+            return True
+
+        if self._auth_disconnect_reason:
+            _LOGGER.warning(
+                "AUTH WAIT: auth_event was set by DISCONNECT handler, NOT by a real response.\n"
+                "  Reason: %s\n"
+                "  No actual data was received from the machine.",
+                self._auth_disconnect_reason,
+            )
+            return False
+
+        if self._auth_event.is_set():
+            _LOGGER.warning(
+                "AUTH WAIT: auth_event is set but no frame and no disconnect reason. "
+                "This should not happen. Treating as no response.",
+            )
+            return False
+
         _LOGGER.warning(
-            "AUTH WAIT (notifications): no auth response within %.1fs, "
-            "trying polling fallback",
+            "AUTH WAIT: TIMEOUT - no auth response within %.1fs.\n"
+            "  Trying polling fallback (unlikely to work - machine only sends via notifications).",
             AUTH_TIMEOUT,
         )
         return await self._wait_for_auth_via_polling(desc, short=True)
@@ -1481,8 +1677,26 @@ class MelittaDevice:
             return False
 
     async def disconnect(self):
-        _LOGGER.info("Disconnecting from %s...", self._address)
+        import traceback
+        caller = "".join(traceback.format_stack(limit=5))
+        _LOGGER.warning(
+            "=== PUBLIC DISCONNECT() CALLED for %s ===\n"
+            "  current_status=%s, connected=%s, authenticated=%s, auth_lock=%s\n"
+            "  Setting shutting_down=True\n"
+            "  caller:\n%s",
+            self._address, self._status, self._is_connected, self._authenticated,
+            self._auth_lock.locked(), caller,
+        )
+        if self._auth_lock.locked():
+            _LOGGER.warning(
+                "!!! DISCONNECT() CALLED WHILE AUTH IS IN PROGRESS !!!\n"
+                "  This will kill the current auth attempt. Setting shutting_down=True\n"
+                "  and signaling auth_event so auth wait exits cleanly.",
+            )
+            self._auth_disconnect_reason = "disconnect() called externally during auth (likely HA unload/reload)"
+
         self._shutting_down = True
+        self._auth_event.set()
         self._cancel_reconnect()
         self._stop_polling()
 
@@ -1498,11 +1712,10 @@ class MelittaDevice:
 
         if self._client:
             if self._is_connected:
-
                 try:
-                    _LOGGER.debug("Disconnecting BLE client...")
+                    _LOGGER.warning("Disconnecting BLE client for %s...", self._address)
                     await asyncio.wait_for(self._client.disconnect(), timeout=DISCONNECT_TIMEOUT)
-                    _LOGGER.info("BLE disconnected cleanly from %s", self._address)
+                    _LOGGER.warning("BLE disconnected cleanly from %s", self._address)
                 except (BleakError, asyncio.TimeoutError, OSError) as err:
                     _LOGGER.warning("Disconnect error: %s", err)
 
@@ -1514,4 +1727,4 @@ class MelittaDevice:
         self._status = "offline"
         self._shutting_down = False
         self._notify_callbacks()
-        _LOGGER.info("Disconnect complete for %s", self._address)
+        _LOGGER.warning("=== DISCONNECT COMPLETE for %s ===", self._address)
