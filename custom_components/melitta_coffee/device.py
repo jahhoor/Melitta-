@@ -958,21 +958,41 @@ class MelittaDevice:
             return False
 
         _LOGGER.warning(
-            "=== ENABLING NOTIFICATIONS on %s (FAST MODE) ===\n"
-            "  Strategy: CCCD write + D-Bus handler ONLY (no StartNotify/AcquireNotify)\n"
-            "  Machine drops connection if BlueZ notification management is used.\n"
+            "=== ENABLING NOTIFICATIONS on %s ===\n"
+            "  Strategy: bleak start_notify PRIMARY (matches APK behavior)\n"
+            "  APK uses setCharacteristicNotification + writeDescriptor(CCCD)\n"
+            "  which maps to bleak start_notify on Linux/BlueZ.\n"
+            "  D-Bus PropertiesChanged handler as additional backup.\n"
             "  hass=%s, connected=%s, client=%s",
             BLE_READ_UUID, self._hass is not None, self._is_connected, type(self._client).__name__,
         )
 
-        if self._hass is not None:
-            read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-            _LOGGER.warning("NOTIFICATIONS: D-Bus char path = %s", read_char_path)
+        try:
+            _LOGGER.warning(
+                "NOTIFICATIONS: Calling start_notify on %s (BlueZ will write CCCD + enable notifications)",
+                BLE_READ_UUID,
+            )
+            await asyncio.wait_for(
+                self._client.start_notify(BLE_READ_UUID, self._on_notification),
+                timeout=3.0,
+            )
+            self._notifications_active = True
+            self._notify_mode = "notifications"
+            _LOGGER.warning(
+                "=== NOTIFICATIONS READY (start_notify) on %s ===\n"
+                "  BlueZ has written CCCD and enabled notifications.\n"
+                "  Proceeding to auth immediately.",
+                BLE_READ_UUID,
+            )
+        except Exception as err:
+            _LOGGER.warning(
+                "NOTIFICATIONS: start_notify failed: %s (%s) - trying D-Bus fallback",
+                err, type(err).__name__,
+            )
 
-            if not read_char_path:
-                await asyncio.sleep(0.5)
-                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-                _LOGGER.warning("NOTIFICATIONS: D-Bus char path after retry: %s", read_char_path)
+        if self._hass is not None and not self._notifications_active:
+            read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+            _LOGGER.warning("NOTIFICATIONS: D-Bus fallback - char path = %s", read_char_path)
 
             if read_char_path:
                 cccd_ok = await self._ensure_cccd_enabled(read_char_path)
@@ -983,36 +1003,23 @@ class MelittaDevice:
                     self._notifications_active = True
                     self._notify_mode = "dbus_handler"
                     _LOGGER.warning(
-                        "=== NOTIFICATIONS READY (CCCD + D-Bus handler) on %s ===\n"
+                        "=== NOTIFICATIONS READY (D-Bus fallback) on %s ===\n"
                         "  CCCD=%s, D-Bus handler=True\n"
-                        "  No StartNotify/AcquireNotify used (machine rejects those).\n"
                         "  Proceeding to auth immediately.",
                         BLE_READ_UUID, cccd_ok,
                     )
                     return True
-                else:
-                    _LOGGER.warning("NOTIFICATIONS: D-Bus handler registration failed")
-            else:
-                _LOGGER.warning("NOTIFICATIONS: No D-Bus char path found")
 
-        if not self._notifications_active:
-            try:
-                _LOGGER.warning(
-                    "NOTIFICATIONS: Trying bleak start_notify as last resort on %s",
-                    BLE_READ_UUID,
-                )
-                await asyncio.wait_for(
-                    self._client.start_notify(BLE_READ_UUID, self._on_notification),
-                    timeout=2.0,
-                )
-                self._notifications_active = True
-                _LOGGER.warning("NOTIFICATIONS: bleak start_notify SUCCEEDED on %s", BLE_READ_UUID)
-                return True
-            except Exception as err:
-                _LOGGER.warning(
-                    "NOTIFICATIONS: bleak start_notify failed: %s (%s) - will use polling",
-                    err, type(err).__name__,
-                )
+        if self._notifications_active:
+            if self._hass is not None:
+                read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                if read_char_path:
+                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                    if dbus_ok:
+                        _LOGGER.warning(
+                            "NOTIFICATIONS: D-Bus handler also registered as backup alongside start_notify"
+                        )
+            return True
 
         _LOGGER.error(
             "=== NOTIFICATION SETUP FAILED on %s ===\n"
