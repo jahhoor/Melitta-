@@ -960,9 +960,10 @@ class MelittaDevice:
 
         _LOGGER.warning(
             "=== ENABLING NOTIFICATIONS on %s ===\n"
-            "  Strategy: D-Bus StartNotify (NOT AcquireNotify) - like Jura integration approach\n"
-            "  AcquireNotify (bleak default) causes machine disconnect after 2s.\n"
-            "  StartNotify is lighter: just CCCD write + PropertiesChanged signals.\n"
+            "  Strategy: Manual CCCD write (matching APK A3/l0.java) + StartNotify for BlueZ forwarding.\n"
+            "  APK uses BluetoothGatt.writeDescriptor(CCCD, 0x0100) then listens for onCharacteristicChanged.\n"
+            "  We write CCCD first, then StartNotify (so BlueZ doesn't re-write CCCD).\n"
+            "  Polling fallback always available.\n"
             "  hass=%s, connected=%s, client=%s",
             BLE_READ_UUID, self._hass is not None, self._is_connected, type(self._client).__name__,
         )
@@ -972,237 +973,80 @@ class MelittaDevice:
             _LOGGER.warning("NOTIFICATIONS: D-Bus char path = %s", read_char_path)
 
             if read_char_path:
-                await self._release_stale_notify(read_char_path)
+                cccd_ok = await self._write_cccd_descriptor(read_char_path)
+                _LOGGER.warning("NOTIFICATIONS: Manual CCCD write result: %s", cccd_ok)
 
-                start_ok = await self._dbus_start_notify(read_char_path)
-                _LOGGER.warning("NOTIFICATIONS: StartNotify result: %s", start_ok)
+                if cccd_ok:
+                    await asyncio.sleep(0.3)
 
-                if not start_ok:
+                still_alive = await self._test_ble_write()
+                if not still_alive:
                     _LOGGER.warning(
-                        "NOTIFICATIONS: StartNotify failed - likely stale AcquireNotify from previous session.\n"
-                        "  Attempting NUCLEAR CLEANUP: D-Bus device disconnect + reconnect to clear ALL BlueZ state."
+                        "NOTIFICATIONS: Connection lost after CCCD write (write probe failed).\n"
+                        "  Machine may have rejected the CCCD descriptor write."
                     )
-                    nuclear_ok = await self._nuclear_notify_cleanup(read_char_path)
-                    if nuclear_ok:
-                        _LOGGER.warning("NOTIFICATIONS: Nuclear cleanup succeeded, StartNotify now works!")
-                        start_ok = True
-                        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-                        if not read_char_path:
-                            _LOGGER.warning("NOTIFICATIONS: Lost char path after nuclear cleanup")
-                            start_ok = False
-                    else:
+                    return False
+
+                start_ok = await self._dbus_start_notify_safe(read_char_path)
+                _LOGGER.warning("NOTIFICATIONS: StartNotify (after CCCD) result: %s", start_ok)
+
+                if start_ok:
+                    notifying = await self._check_notifying_property(read_char_path)
+                    _LOGGER.warning("NOTIFICATIONS: BlueZ Notifying property = %s", notifying)
+                    if not notifying:
                         _LOGGER.warning(
-                            "NOTIFICATIONS: Nuclear cleanup did not resolve 'Notify acquired'.\n"
-                            "  Falling back to manual CCCD + D-Bus handler (may not receive data)."
-                        )
-                        cccd_ok = await self._ensure_cccd_enabled(read_char_path)
-                        _LOGGER.warning(
-                            "NOTIFICATIONS: Manual CCCD write result: %s", cccd_ok,
+                            "NOTIFICATIONS: StartNotify returned OK but Notifying=False.\n"
+                            "  BlueZ may not be forwarding. Continuing but polling will be primary."
                         )
 
-                if read_char_path:
-                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
-                else:
-                    dbus_ok = False
+                still_alive2 = await self._test_ble_write()
+                if not still_alive2:
+                    _LOGGER.warning(
+                        "NOTIFICATIONS: Connection lost after StartNotify (write probe failed).\n"
+                        "  Machine may have disconnected due to StartNotify."
+                    )
+                    return False
+
+                dbus_ok = await self._register_dbus_notification_handler(read_char_path)
 
                 if dbus_ok and start_ok:
                     self._notifications_active = True
-                    self._notify_mode = "dbus_startnotify"
+                    self._notify_mode = "cccd_startnotify"
                     _LOGGER.warning(
-                        "=== NOTIFICATIONS READY (D-Bus StartNotify) on %s ===\n"
-                        "  StartNotify=%s, D-Bus handler=True\n"
-                        "  Proceeding to auth immediately.",
-                        BLE_READ_UUID, start_ok,
+                        "=== NOTIFICATIONS READY (CCCD + StartNotify + D-Bus handler) on %s ===\n"
+                        "  CCCD written=%s, StartNotify=%s, D-Bus handler=True\n"
+                        "  BlueZ will forward PropertiesChanged signals.\n"
+                        "  Polling also available as fallback.",
+                        BLE_READ_UUID, cccd_ok, start_ok,
                     )
                     return True
                 elif dbus_ok:
                     self._notifications_active = True
-                    self._notify_mode = "dbus_handler"
+                    self._notify_mode = "cccd_dbus_only"
                     _LOGGER.warning(
-                        "=== NOTIFICATIONS READY (D-Bus handler + manual CCCD) on %s ===\n"
-                        "  StartNotify failed but D-Bus handler registered with manual CCCD.\n"
-                        "  Proceeding to auth - may or may not receive notifications.",
-                        BLE_READ_UUID,
+                        "=== NOTIFICATIONS PARTIAL (CCCD + D-Bus handler, no StartNotify) on %s ===\n"
+                        "  CCCD written=%s, StartNotify=False, D-Bus handler=True\n"
+                        "  BlueZ may NOT forward signals without StartNotify.\n"
+                        "  Polling will be primary method for receiving auth response.",
+                        BLE_READ_UUID, cccd_ok,
                     )
                     return True
+                else:
+                    _LOGGER.warning(
+                        "NOTIFICATIONS: D-Bus handler registration failed.\n"
+                        "  Will rely on polling the read characteristic."
+                    )
 
-        _LOGGER.warning(
-            "NOTIFICATIONS: D-Bus StartNotify path not available, trying bleak start_notify as fallback"
-        )
-        try:
-            await asyncio.wait_for(
-                self._client.start_notify(BLE_READ_UUID, self._on_notification),
-                timeout=3.0,
-            )
-            self._notifications_active = True
-            self._notify_mode = "notifications"
-            _LOGGER.warning(
-                "=== NOTIFICATIONS READY (bleak fallback) on %s ===",
-                BLE_READ_UUID,
-            )
-            return True
-        except Exception as err:
-            _LOGGER.warning(
-                "NOTIFICATIONS: bleak start_notify also failed: %s (%s)",
-                err, type(err).__name__,
-            )
-
-        _LOGGER.error(
-            "=== NOTIFICATION SETUP FAILED on %s ===\n"
-            "  Will use polling fallback, but machine may not respond to auth.\n"
-            "  hass=%s",
-            BLE_READ_UUID, self._hass is not None,
-        )
         self._notifications_active = False
+        self._notify_mode = "polling"
+        _LOGGER.warning(
+            "=== NOTIFICATIONS: using polling mode on %s ===\n"
+            "  Will poll read characteristic after sending auth frames.",
+            BLE_READ_UUID,
+        )
         return False
 
-    async def _release_stale_notify(self, char_path: str):
-        try:
-            from dbus_fast.aio import MessageBus
-            from dbus_fast import Message, MessageType, BusType
-
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            try:
-                _LOGGER.warning("NOTIFICATIONS: Calling StopNotify on %s to clean stale state", char_path)
-                stop_reply = await bus.call(Message(
-                    destination="org.bluez", path=char_path,
-                    interface="org.bluez.GattCharacteristic1",
-                    member="StopNotify",
-                ))
-                if stop_reply.message_type == MessageType.ERROR:
-                    error_name = stop_reply.error_name or ""
-                    _LOGGER.warning(
-                        "StopNotify result: %s (expected if no active StartNotify)",
-                        error_name,
-                    )
-                else:
-                    _LOGGER.warning("StopNotify succeeded - previous StartNotify state cleared")
-                    await asyncio.sleep(0.3)
-            finally:
-                bus.disconnect()
-        except Exception as err:
-            _LOGGER.warning("StopNotify cleanup error (non-fatal): %s (%s)", err, type(err).__name__)
-
-    async def _nuclear_notify_cleanup(self, char_path: str) -> bool:
-        self._suppress_disconnect_callback = True
-        try:
-            from dbus_fast.aio import MessageBus
-            from dbus_fast import Message, MessageType, BusType
-            import re
-
-            mac_path = self._address.replace(":", "_").upper()
-
-            if self._dbus_notify_bus:
-                try:
-                    self._dbus_notify_bus.disconnect()
-                except Exception:
-                    pass
-                self._dbus_notify_bus = None
-                self._dbus_notify_handler = None
-                self._dbus_match_rule = None
-
-            self._notifications_active = False
-            self._stop_polling()
-
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            try:
-                introspect_root = Message(
-                    destination="org.bluez", path="/org/bluez",
-                    interface="org.freedesktop.DBus.Introspectable",
-                    member="Introspect",
-                )
-                reply = await bus.call(introspect_root)
-                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
-                if not adapters:
-                    adapters = ["hci0"]
-
-                disconnected = False
-                for adapter in adapters:
-                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
-                    _LOGGER.warning(
-                        "NUCLEAR CLEANUP: Trying D-Bus Disconnect on %s to clear stale AcquireNotify state",
-                        device_path,
-                    )
-                    disc_reply = await bus.call(Message(
-                        destination="org.bluez", path=device_path,
-                        interface="org.bluez.Device1",
-                        member="Disconnect",
-                    ))
-                    if disc_reply.message_type == MessageType.ERROR:
-                        _LOGGER.warning(
-                            "NUCLEAR CLEANUP: Disconnect on %s: %s",
-                            device_path, disc_reply.error_name,
-                        )
-                    else:
-                        _LOGGER.warning("NUCLEAR CLEANUP: Disconnect succeeded on %s", device_path)
-                        disconnected = True
-                        break
-
-                if not disconnected:
-                    _LOGGER.warning("NUCLEAR CLEANUP: Could not disconnect device on any adapter")
-                    return False
-            finally:
-                bus.disconnect()
-
-            if self._client:
-                try:
-                    await self._client.disconnect()
-                except Exception:
-                    pass
-            self._is_connected = False
-            self._client = None
-
-            _LOGGER.warning("NUCLEAR CLEANUP: Waiting 3s for BlueZ to fully clean up GATT state...")
-            await asyncio.sleep(3.0)
-
-            _LOGGER.warning("NUCLEAR CLEANUP: Reconnecting to %s via HA BLE stack...", self._address)
-            ble_device = await self._get_ble_device()
-            if ble_device is None:
-                _LOGGER.warning("NUCLEAR CLEANUP: Device not found after disconnect - cleanup failed")
-                return False
-
-            await self._establish_ble_connection(ble_device)
-            self._is_connected = True
-            _LOGGER.warning("NUCLEAR CLEANUP: Reconnected to %s", self._address)
-
-            await asyncio.sleep(0.5)
-
-            if self._client and hasattr(self._client, 'get_services'):
-                try:
-                    await self._client.get_services()
-                    _LOGGER.warning("NUCLEAR CLEANUP: Service discovery completed after reconnect")
-                except Exception as svc_err:
-                    _LOGGER.warning("NUCLEAR CLEANUP: Service discovery error (may use cache): %s", svc_err)
-
-            write_ok = await self._test_ble_write()
-            if not write_ok:
-                _LOGGER.warning("NUCLEAR CLEANUP: Write probe failed after reconnect")
-                return False
-
-            new_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
-            if not new_char_path:
-                _LOGGER.warning("NUCLEAR CLEANUP: Cannot find char path after reconnect")
-                return False
-
-            _LOGGER.warning("NUCLEAR CLEANUP: Trying StartNotify on fresh connection (char=%s)", new_char_path)
-            start_ok = await self._dbus_start_notify(new_char_path)
-            if start_ok:
-                _LOGGER.warning("NUCLEAR CLEANUP: StartNotify succeeded after reconnect!")
-                return True
-            else:
-                _LOGGER.warning(
-                    "NUCLEAR CLEANUP: StartNotify STILL failed after reconnect.\n"
-                    "  BlueZ may have persistent state. Falling back to D-Bus handler only."
-                )
-                return False
-
-        except Exception as err:
-            _LOGGER.warning("NUCLEAR CLEANUP error: %s (%s)", err, type(err).__name__)
-            return False
-        finally:
-            self._suppress_disconnect_callback = False
-
-    async def _dbus_start_notify(self, char_path: str) -> bool:
+    async def _dbus_start_notify_safe(self, char_path: str) -> bool:
         try:
             from dbus_fast.aio import MessageBus
             from dbus_fast import Message, MessageType, BusType
@@ -1211,36 +1055,67 @@ class MelittaDevice:
             try:
                 _LOGGER.warning(
                     "NOTIFICATIONS: Calling StartNotify on %s\n"
-                    "  This uses PropertiesChanged signals (NOT file descriptors like AcquireNotify).\n"
-                    "  BlueZ will write CCCD 0x0100 to the machine.",
+                    "  CCCD already written - StartNotify should only enable BlueZ forwarding.\n"
+                    "  Using 3s timeout to prevent hang.",
                     char_path,
                 )
-                start_reply = await bus.call(Message(
-                    destination="org.bluez", path=char_path,
-                    interface="org.bluez.GattCharacteristic1",
-                    member="StartNotify",
-                ))
+                start_reply = await asyncio.wait_for(
+                    bus.call(Message(
+                        destination="org.bluez", path=char_path,
+                        interface="org.bluez.GattCharacteristic1",
+                        member="StartNotify",
+                    )),
+                    timeout=3.0,
+                )
                 if start_reply.message_type == MessageType.ERROR:
                     error_name = start_reply.error_name or ""
                     _LOGGER.warning(
-                        "StartNotify error: %s %s",
+                        "StartNotify error: %s %s (non-fatal, continuing with polling fallback)",
                         error_name, start_reply.body,
                     )
                     if "InProgress" in error_name or "Already" in error_name:
-                        _LOGGER.warning("StartNotify already active - this is OK, continuing")
                         return True
                     return False
                 else:
-                    _LOGGER.warning("StartNotify succeeded - BlueZ wrote CCCD and will send PropertiesChanged signals")
+                    _LOGGER.warning("StartNotify succeeded - BlueZ will forward PropertiesChanged signals")
                     return True
             finally:
                 bus.disconnect()
+        except asyncio.TimeoutError:
+            _LOGGER.warning("StartNotify timed out after 3s (non-fatal, continuing with polling)")
+            return False
         except Exception as err:
-            _LOGGER.warning("StartNotify D-Bus error: %s (%s)", err, type(err).__name__)
+            _LOGGER.warning("StartNotify error: %s (%s) (non-fatal, continuing with polling)", err, type(err).__name__)
             return False
 
+    async def _check_notifying_property(self, char_path: str) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType
 
-    async def _ensure_cccd_enabled(self, char_path: str) -> bool:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                reply = await asyncio.wait_for(
+                    bus.call(Message(
+                        destination="org.bluez", path=char_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get", signature="ss",
+                        body=["org.bluez.GattCharacteristic1", "Notifying"],
+                    )),
+                    timeout=2.0,
+                )
+                if reply.message_type == MessageType.ERROR:
+                    _LOGGER.debug("Cannot read Notifying property: %s", reply.error_name)
+                    return False
+                val = reply.body[0].value if reply.body else False
+                return bool(val)
+            finally:
+                bus.disconnect()
+        except Exception as err:
+            _LOGGER.debug("Notifying property check error: %s", err)
+            return False
+
+    async def _write_cccd_descriptor(self, char_path: str) -> bool:
         try:
             from dbus_fast.aio import MessageBus
             from dbus_fast import Message, MessageType, BusType, Variant
@@ -1397,14 +1272,10 @@ class MelittaDevice:
             return False
 
     async def _stop_notifications(self):
-        import traceback
-        caller = "".join(traceback.format_stack(limit=4))
         _LOGGER.warning(
             "=== STOPPING NOTIFICATIONS ===\n"
-            "  notifications_active=%s, notify_mode=%s, status=%s, shutting_down=%s\n"
-            "  caller:\n%s",
+            "  notifications_active=%s, notify_mode=%s, status=%s, shutting_down=%s",
             self._notifications_active, self._notify_mode, self._status, self._shutting_down,
-            caller,
         )
 
         if self._dbus_notify_bus is not None:
@@ -1433,7 +1304,7 @@ class MelittaDevice:
             self._dbus_notify_handler = None
             self._dbus_match_rule = None
 
-        if self._notify_mode == "dbus_startnotify":
+        if self._notify_mode == "cccd_startnotify":
             read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
             if read_char_path:
                 try:
@@ -1441,25 +1312,19 @@ class MelittaDevice:
                     from dbus_fast import Message, MessageType, BusType
                     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
                     try:
-                        stop_reply = await bus.call(Message(
-                            destination="org.bluez", path=read_char_path,
-                            interface="org.bluez.GattCharacteristic1",
-                            member="StopNotify",
-                        ))
-                        if stop_reply.message_type == MessageType.ERROR:
-                            _LOGGER.warning("StopNotify error (non-fatal): %s", stop_reply.error_name)
-                        else:
-                            _LOGGER.warning("StopNotify succeeded on %s", read_char_path)
+                        await asyncio.wait_for(
+                            bus.call(Message(
+                                destination="org.bluez", path=read_char_path,
+                                interface="org.bluez.GattCharacteristic1",
+                                member="StopNotify",
+                            )),
+                            timeout=2.0,
+                        )
+                        _LOGGER.warning("StopNotify succeeded on %s", read_char_path)
                     finally:
                         bus.disconnect()
                 except Exception as err:
-                    _LOGGER.warning("StopNotify D-Bus error (non-fatal): %s", err)
-        elif self._notifications_active and self._client and self._notify_mode == "notifications":
-            try:
-                await self._client.stop_notify(BLE_READ_UUID)
-                _LOGGER.warning("NOTIFICATIONS STOPPED via bleak stop_notify on %s", BLE_READ_UUID)
-            except Exception as err:
-                _LOGGER.warning("stop_notify failed (non-fatal): %s (%s)", err, type(err).__name__)
+                    _LOGGER.warning("StopNotify error (non-fatal): %s", err)
 
         self._notifications_active = False
 
@@ -1659,9 +1524,20 @@ class MelittaDevice:
             return False
 
         if self._notifications_active:
-            return await self._wait_for_auth_via_notifications(desc)
-        else:
+            result = await self._wait_for_auth_via_notifications(desc)
+            if result:
+                return True
+            if self._authenticated or self._auth_got_frame:
+                return True
+
+        if not self._authenticated and not self._auth_got_frame:
+            _LOGGER.warning(
+                "AUTH POLL: %s - trying read polling (notifications %s)",
+                desc, "didn't deliver" if self._notifications_active else "not active",
+            )
             return await self._wait_for_auth_via_polling(desc)
+
+        return False
 
     async def _wait_for_auth_via_notifications(self, desc: str) -> bool:
         _LOGGER.warning(
@@ -1712,11 +1588,11 @@ class MelittaDevice:
             return False
 
         _LOGGER.warning(
-            "AUTH WAIT: TIMEOUT - no auth response within %.1fs.\n"
-            "  Trying polling fallback (unlikely to work - machine only sends via notifications).",
+            "AUTH WAIT: TIMEOUT - no auth response within %.1fs via D-Bus notifications.\n"
+            "  Returning False - caller will try read polling as fallback.",
             AUTH_TIMEOUT,
         )
-        return await self._wait_for_auth_via_polling(desc, short=True)
+        return False
 
     async def _wait_for_auth_via_polling(self, desc: str, short: bool = False) -> bool:
         client = self._client
