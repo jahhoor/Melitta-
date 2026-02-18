@@ -996,6 +996,166 @@ class MelittaDevice:
             await self._client.connect()
 
 
+    async def _try_concurrent_start_notify_auth(
+        self,
+        p_attempt: int,
+        t_cccd_start: float,
+        t_pipeline_start: float,
+        auth_encrypted: bytes,
+    ) -> bool:
+        _LOGGER.warning(
+            "FAST PIPELINE %d: CONCURRENT start_notify + auth on %s (t=%.1fms since pipeline start)\n"
+            "  Strategy: Launch start_notify as background task (writes CCCD),\n"
+            "  wait ~50ms for CCCD to reach machine, then send auth immediately.\n"
+            "  This matches the APK's atomic CCCD+auth approach.",
+            p_attempt, BLE_READ_UUID, (t_cccd_start - t_pipeline_start) * 1000,
+        )
+
+        if self._dbus_notify_bus is not None:
+            try:
+                if self._dbus_notify_handler:
+                    self._dbus_notify_bus.remove_message_handler(self._dbus_notify_handler)
+                self._dbus_notify_bus.disconnect()
+            except Exception:
+                pass
+            self._dbus_notify_bus = None
+            self._dbus_notify_handler = None
+            self._dbus_match_rule = None
+            _LOGGER.warning(
+                "FAST PIPELINE %d: D-Bus handler removed (Bleak callback will handle notifications)",
+                p_attempt,
+            )
+
+        notify_task = asyncio.ensure_future(
+            self._client.start_notify(BLE_READ_UUID, self._on_notification)
+        )
+        t_notify_launched = time.monotonic()
+        _LOGGER.warning(
+            "FAST PIPELINE %d: start_notify launched as background task (t=%.1fms since CCCD start)",
+            p_attempt, (t_notify_launched - t_cccd_start) * 1000,
+        )
+
+        try:
+            await asyncio.sleep(0.05)
+            t_after_delay = time.monotonic()
+
+            if notify_task.done() and notify_task.exception():
+                ne = notify_task.exception()
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: start_notify failed DURING delay: %s (%s). Aborting concurrent approach.",
+                    p_attempt, ne, type(ne).__name__,
+                )
+                return False
+
+            _LOGGER.warning(
+                "FAST PIPELINE %d: 50ms delay done (actual=%.1fms). connected=%s, notify_task_done=%s\n"
+                "  Now sending auth frame IMMEDIATELY (CCCD should be written to machine by now).",
+                p_attempt, (t_after_delay - t_notify_launched) * 1000,
+                self._is_connected, notify_task.done(),
+            )
+
+            if not self._is_connected or self._client is None:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: Connection lost during start_notify delay! Machine entered pairing mode.",
+                    p_attempt,
+                )
+                return False
+
+            self._notifications_active = True
+            self._notify_mode = "bleak_start_notify"
+
+            t_auth_write = time.monotonic()
+            _LOGGER.warning(
+                "FAST PIPELINE %d: Writing encrypted auth frame NOW (t=%.1fms since CCCD start, %.1fms since pipeline start)...",
+                p_attempt, (t_auth_write - t_cccd_start) * 1000, (t_auth_write - t_pipeline_start) * 1000,
+            )
+            self._pipeline_auth_write_time = t_auth_write
+            await asyncio.wait_for(
+                self._client.write_gatt_char(BLE_WRITE_UUID, auth_encrypted, response=False),
+                timeout=3.0,
+            )
+            t_auth_done = time.monotonic()
+            _LOGGER.warning(
+                "FAST PIPELINE %d: Auth write OK! (auth_write took %.1fms, total CCCD→auth_done=%.1fms, connected=%s)",
+                p_attempt, (t_auth_done - t_auth_write) * 1000,
+                (t_auth_done - t_cccd_start) * 1000, self._is_connected,
+            )
+
+            self._suppress_disconnect_callback = False
+
+            self._status = "waiting_for_machine_button"
+            self._last_error = (
+                "Auth-frame verstuurd! Druk NU op 'Verbinden' op het display van het koffieapparaat."
+            )
+            self._notify_callbacks()
+
+            await self._pipeline_wait_for_auth(p_attempt)
+
+            if self._authenticated:
+                t_success = time.monotonic()
+                _LOGGER.warning(
+                    "=== FAST PIPELINE %d: AUTH SUCCEEDED (concurrent start_notify+auth)! ===\n"
+                    "  method=bleak_start_notify, total_pipeline_time=%.1fms\n"
+                    "  session_key=%s",
+                    p_attempt,
+                    (t_success - t_pipeline_start) * 1000,
+                    self._session_key.hex() if self._session_key else "None",
+                )
+                return True
+
+            if self._auth_got_frame and not self._authenticated:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: Got frame but encrypted auth failed. Trying plaintext...",
+                    p_attempt,
+                )
+                if self._is_connected and self._client is not None:
+                    self._auth_challenge = os.urandom(4)
+                    challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+                    auth_payload2 = self._auth_challenge + challenge_hash
+                    auth_plaintext2 = build_frame(CMD_AUTH, None, auth_payload2, encrypt=False)
+                    self._auth_event.clear()
+                    self._auth_got_frame = False
+                    try:
+                        await asyncio.wait_for(
+                            self._client.write_gatt_char(BLE_WRITE_UUID, auth_plaintext2, response=False),
+                            timeout=3.0,
+                        )
+                        await self._pipeline_wait_for_auth(p_attempt)
+                        if self._authenticated:
+                            _LOGGER.warning(
+                                "=== FAST PIPELINE %d: AUTH SUCCEEDED (plaintext after concurrent)! ===\n"
+                                "  total_pipeline_time=%.1fms, session_key=%s",
+                                p_attempt, (time.monotonic() - t_pipeline_start) * 1000,
+                                self._session_key.hex() if self._session_key else "None",
+                            )
+                            return True
+                    except Exception as pt_err:
+                        _LOGGER.warning("FAST PIPELINE %d: plaintext auth error: %s", p_attempt, pt_err)
+
+            if not self._is_connected:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: disconnected during concurrent auth wait.\n"
+                    "  disconnect_reason=%s",
+                    p_attempt, self._auth_disconnect_reason,
+                )
+            else:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: no auth response from concurrent approach.",
+                    p_attempt,
+                )
+            return False
+
+        finally:
+            if not notify_task.done():
+                notify_task.cancel()
+            try:
+                await notify_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            if not self._authenticated:
+                self._notifications_active = False
+                self._notify_mode = None
+
     async def _fast_pipeline_cccd_and_auth(self) -> bool:
         t_pipeline_start = time.monotonic()
         _LOGGER.warning(
@@ -1117,56 +1277,19 @@ class MelittaDevice:
             t_cccd_start = time.monotonic()
             try:
                 if method == "bleak_start_notify":
-                    _LOGGER.warning(
-                        "FAST PIPELINE %d: Bleak start_notify on %s (t=%.1fms since pipeline start)\n"
-                        "  This uses Bleak's standard CCCD write mechanism.",
-                        p_attempt, BLE_READ_UUID, (t_cccd_start - t_pipeline_start) * 1000,
-                    )
-                    if self._dbus_notify_bus is not None:
-                        try:
-                            if self._dbus_notify_handler:
-                                self._dbus_notify_bus.remove_message_handler(self._dbus_notify_handler)
-                            self._dbus_notify_bus.disconnect()
-                        except Exception:
-                            pass
-                        self._dbus_notify_bus = None
-                        self._dbus_notify_handler = None
-                        self._dbus_match_rule = None
-                        _LOGGER.warning(
-                            "FAST PIPELINE %d: D-Bus handler removed (Bleak callback will handle notifications)",
-                            p_attempt,
-                        )
                     try:
-                        await asyncio.wait_for(
-                            self._client.start_notify(BLE_READ_UUID, self._on_notification),
-                            timeout=2.0,
+                        concurrent_result = await self._try_concurrent_start_notify_auth(
+                            p_attempt, t_cccd_start, t_pipeline_start, auth_encrypted,
                         )
-                        t_cccd_done = time.monotonic()
-                        cccd_ok = True
-                        self._notifications_active = True
-                        self._notify_mode = "bleak_start_notify"
+                        if concurrent_result:
+                            return True
+                    except Exception as conc_err:
                         _LOGGER.warning(
-                            "FAST PIPELINE %d: Bleak start_notify OK (took %.1fms, connected=%s)\n"
-                            "  CCCD successfully written - machine should accept auth now!",
-                            p_attempt, (t_cccd_done - t_cccd_start) * 1000, self._is_connected,
+                            "FAST PIPELINE %d: concurrent start_notify+auth unexpected error: %s (%s)",
+                            p_attempt, conc_err, type(conc_err).__name__,
                         )
-                    except asyncio.TimeoutError:
-                        t_cccd_done = time.monotonic()
-                        _LOGGER.warning(
-                            "FAST PIPELINE %d: Bleak start_notify TIMEOUT after %.1fms (connected=%s)\n"
-                            "  Machine may have disconnected during CCCD write.",
-                            p_attempt, (t_cccd_done - t_cccd_start) * 1000, self._is_connected,
-                        )
-                    except (EOFError, OSError, BleakError) as sn_err:
-                        t_cccd_done = time.monotonic()
-                        _LOGGER.warning(
-                            "FAST PIPELINE %d: Bleak start_notify error after %.1fms: %s (%s)\n"
-                            "  connected=%s. Will try auth anyway if still connected.",
-                            p_attempt, (t_cccd_done - t_cccd_start) * 1000,
-                            sn_err, type(sn_err).__name__, self._is_connected,
-                        )
-                        if self._is_connected:
-                            cccd_ok = True
+                    await asyncio.sleep(1.0)
+                    continue
 
                 elif method == "direct_cccd_descriptor":
                     _LOGGER.warning(
