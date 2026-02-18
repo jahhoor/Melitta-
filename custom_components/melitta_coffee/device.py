@@ -811,11 +811,109 @@ class MelittaDevice:
         try:
             from dbus_fast.aio import MessageBus
             from dbus_fast import Message, MessageType, BusType, Variant
+            from dbus_fast.service import ServiceInterface, method as dbus_method
             import re
+
+            AGENT_PATH = "/org/melitta/agent"
+            AGENT_CAPABILITY = "NoInputNoOutput"
+
+            class MelittaPairingAgent(ServiceInterface):
+                def __init__(self):
+                    super().__init__("org.bluez.Agent1")
+                    self._released = False
+
+                @dbus_method()
+                def Release(self) -> "":
+                    _LOGGER.warning("BLE AGENT: Release() called")
+                    self._released = True
+
+                @dbus_method()
+                def RequestPinCode(self, device: "o") -> "s":
+                    _LOGGER.warning("BLE AGENT: RequestPinCode for %s -> returning '0000'", device)
+                    return "0000"
+
+                @dbus_method()
+                def DisplayPinCode(self, device: "o", pincode: "s") -> "":
+                    _LOGGER.warning("BLE AGENT: DisplayPinCode for %s: %s", device, pincode)
+
+                @dbus_method()
+                def RequestPasskey(self, device: "o") -> "u":
+                    _LOGGER.warning("BLE AGENT: RequestPasskey for %s -> returning 0", device)
+                    return 0
+
+                @dbus_method()
+                def DisplayPasskey(self, device: "o", passkey: "u", entered: "q") -> "":
+                    _LOGGER.warning("BLE AGENT: DisplayPasskey for %s: %d (entered=%d)", device, passkey, entered)
+
+                @dbus_method()
+                def RequestConfirmation(self, device: "o", passkey: "u") -> "":
+                    _LOGGER.warning("BLE AGENT: RequestConfirmation for %s passkey=%d -> AUTO-ACCEPTING", device, passkey)
+
+                @dbus_method()
+                def RequestAuthorization(self, device: "o") -> "":
+                    _LOGGER.warning("BLE AGENT: RequestAuthorization for %s -> AUTO-ACCEPTING", device)
+
+                @dbus_method()
+                def AuthorizeService(self, device: "o", uuid: "s") -> "":
+                    _LOGGER.warning("BLE AGENT: AuthorizeService for %s uuid=%s -> AUTO-ACCEPTING", device, uuid)
+
+                @dbus_method()
+                def Cancel(self) -> "":
+                    _LOGGER.warning("BLE AGENT: Cancel() called")
 
             mac_path = self._address.replace(":", "_").upper()
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            agent = MelittaPairingAgent()
+            agent_registered = False
             try:
+                try:
+                    await bus.request_name("org.melitta.agent")
+                    _LOGGER.warning("BLE AGENT: acquired bus name org.melitta.agent")
+                except Exception as name_err:
+                    _LOGGER.warning(
+                        "BLE AGENT: could not acquire bus name (non-fatal, using unique name): %s",
+                        name_err,
+                    )
+
+                bus.export(AGENT_PATH, agent)
+
+                reg_reply = await bus.call(Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.bluez.AgentManager1",
+                    member="RegisterAgent",
+                    signature="os",
+                    body=[AGENT_PATH, AGENT_CAPABILITY],
+                ))
+                if reg_reply.message_type == MessageType.ERROR:
+                    error_name = reg_reply.error_name or ""
+                    if "AlreadyExists" in error_name:
+                        _LOGGER.warning("BLE AGENT: agent already registered (OK)")
+                        agent_registered = True
+                    else:
+                        _LOGGER.warning(
+                            "BLE AGENT: RegisterAgent FAILED: %s %s",
+                            reg_reply.error_name, reg_reply.body,
+                        )
+                        return False
+                else:
+                    agent_registered = True
+                    _LOGGER.warning("BLE AGENT: registered at %s (capability=%s)", AGENT_PATH, AGENT_CAPABILITY)
+
+                default_reply = await bus.call(Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.bluez.AgentManager1",
+                    member="RequestDefaultAgent",
+                    signature="o",
+                    body=[AGENT_PATH],
+                ))
+                if default_reply.message_type == MessageType.ERROR:
+                    _LOGGER.warning(
+                        "BLE AGENT: RequestDefaultAgent failed (non-fatal): %s",
+                        default_reply.error_name,
+                    )
+                else:
+                    _LOGGER.warning("BLE AGENT: set as default agent")
+
                 introspect_root = Message(
                     destination="org.bluez", path="/org/bluez",
                     interface="org.freedesktop.DBus.Introspectable",
@@ -855,9 +953,10 @@ class MelittaDevice:
                         return True
 
                     _LOGGER.warning(
-                        "BLE PAIR: device %s NOT paired on %s - calling Pair()...\n"
-                        "  Zorg dat de machine in 'Verbinden' modus staat (druk Verbinden knop op machine)!",
-                        self._address, adapter,
+                        "BLE PAIR: device %s NOT paired on %s - calling Pair() WITH AGENT...\n"
+                        "  Agent geregistreerd op %s - accepteert koppelverzoek automatisch.\n"
+                        "  Zorg dat de machine in 'Verbinden' modus staat!",
+                        self._address, adapter, AGENT_PATH,
                     )
                     self._status = "pairing"
                     self._last_error = (
@@ -884,13 +983,15 @@ class MelittaDevice:
                             )
                             return True
                         _LOGGER.warning(
-                            "BLE PAIR: Pair() FAILED: %s %s",
-                            error_name, error_body,
+                            "BLE PAIR: Pair() FAILED (with agent): %s %s\n"
+                            "  Agent was registered at %s - but pairing still failed.\n"
+                            "  Machine moet in 'Verbinden' modus staan!",
+                            error_name, error_body, AGENT_PATH,
                         )
                         return False
 
                     _LOGGER.warning(
-                        "BLE PAIR: Pair() SUCCEEDED for %s on %s!",
+                        "BLE PAIR: Pair() SUCCEEDED for %s on %s (with agent)!",
                         self._address, adapter,
                     )
 
@@ -912,6 +1013,25 @@ class MelittaDevice:
                 _LOGGER.warning("BLE PAIR: no adapter found with device %s", self._address)
                 return False
             finally:
+                if agent_registered:
+                    try:
+                        unreg_reply = await bus.call(Message(
+                            destination="org.bluez", path="/org/bluez",
+                            interface="org.bluez.AgentManager1",
+                            member="UnregisterAgent",
+                            signature="o",
+                            body=[AGENT_PATH],
+                        ))
+                        if unreg_reply.message_type == MessageType.ERROR:
+                            _LOGGER.warning("BLE AGENT: UnregisterAgent failed: %s", unreg_reply.error_name)
+                        else:
+                            _LOGGER.warning("BLE AGENT: unregistered")
+                    except Exception as ue:
+                        _LOGGER.warning("BLE AGENT: unregister error (non-fatal): %s", ue)
+                try:
+                    bus.unexport(AGENT_PATH, agent)
+                except Exception:
+                    pass
                 try:
                     bus.disconnect()
                 except Exception:
