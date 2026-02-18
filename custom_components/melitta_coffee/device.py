@@ -1178,9 +1178,30 @@ class MelittaDevice:
                 is_already_paired = await self._dbus_check_paired()
                 if is_already_paired:
                     _LOGGER.warning(
-                        "BLE PAIR CHECK: device already paired (%.1fms) - proceeding to auth",
+                        "BLE PAIR CHECK: device already paired (%.1fms) - doing disconnect+reconnect to activate encrypted BLE link",
                         (time.monotonic() - t_pair_start) * 1000,
                     )
+                    self._suppress_disconnect_callback = True
+                    try:
+                        await self._internal_disconnect()
+                    except Exception:
+                        pass
+                    self._suppress_disconnect_callback = False
+                    await asyncio.sleep(1.0)
+
+                    reconnected = await self._internal_reconnect_ble()
+                    if not reconnected:
+                        await asyncio.sleep(2.0)
+                        reconnected = await self._internal_reconnect_ble()
+                    if not reconnected:
+                        _LOGGER.warning(
+                            "BLE PAIR: reconnect after existing bond FAILED - trying without reconnect"
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "BLE PAIR: reconnected with encrypted link after existing bond (total=%.1fms)",
+                            (time.monotonic() - t_pair_start) * 1000,
+                        )
                 else:
                     _LOGGER.warning(
                         "BLE PAIR CHECK: device NOT paired (%.1fms) - initiating pairing...\n"
@@ -1265,15 +1286,96 @@ class MelittaDevice:
                 )
                 await self._request_status()
             else:
+                _LOGGER.warning(
+                    "Auth failed for %s - trying NUCLEAR option: remove old bond and fresh pair...",
+                    self._address,
+                )
+                self._status = "re_pairing"
+                self._last_error = "Auth mislukt met bestaand bond. Oud bond verwijderen en opnieuw koppelen..."
+                self._notify_callbacks()
+
+                await self._internal_disconnect()
+                await asyncio.sleep(0.5)
+
+                removed = await self._dbus_remove_device()
+                if removed:
+                    _LOGGER.warning("NUCLEAR: old bond removed. Waiting 2s then fresh pair+connect...")
+                    await asyncio.sleep(2.0)
+
+                    ble_device = await self._get_ble_device()
+                    if ble_device is None:
+                        _LOGGER.warning("NUCLEAR: device not found after RemoveDevice")
+                        self._status = "offline"
+                        self._last_error = "Apparaat niet gevonden na verwijderen bond"
+                        self._notify_callbacks()
+                        return False
+
+                    try:
+                        await self._establish_ble_connection(ble_device)
+                        self._is_connected = True
+                        _LOGGER.warning("NUCLEAR: reconnected after RemoveDevice")
+                    except Exception as err:
+                        _LOGGER.warning("NUCLEAR: reconnect failed: %s", err)
+                        self._status = "offline"
+                        self._last_error = f"Herverbinding mislukt: {err}"
+                        self._notify_callbacks()
+                        return False
+
+                    await asyncio.sleep(0.5)
+
+                    pair_ok = await self._dbus_pair_device()
+                    if pair_ok:
+                        _LOGGER.warning("NUCLEAR: fresh Pair() succeeded! Disconnect+reconnect for encrypted link...")
+                        self._suppress_disconnect_callback = True
+                        try:
+                            await self._internal_disconnect()
+                        except Exception:
+                            pass
+                        self._suppress_disconnect_callback = False
+                        await asyncio.sleep(1.0)
+
+                        reconnected = await self._internal_reconnect_ble()
+                        if not reconnected:
+                            await asyncio.sleep(2.0)
+                            reconnected = await self._internal_reconnect_ble()
+
+                        if reconnected:
+                            _LOGGER.warning("NUCLEAR: reconnected with fresh bond. Retrying auth...")
+                            self._status = "authenticating"
+                            self._notify_callbacks()
+
+                            pipeline_ok = await self._fast_pipeline_cccd_and_auth()
+                            if pipeline_ok and self._authenticated:
+                                self._status = "ready"
+                                self._start_keepalive()
+                                _LOGGER.warning(
+                                    "NUCLEAR: AUTH SUCCEEDED after fresh pair! session_key=%s",
+                                    self._session_key.hex() if self._session_key else "None",
+                                )
+                                await self._request_status()
+                                self._notify_callbacks()
+                                return True
+                            else:
+                                _LOGGER.warning("NUCLEAR: auth still failed after fresh pair")
+                        else:
+                            _LOGGER.warning("NUCLEAR: reconnect after fresh pair failed")
+                    else:
+                        _LOGGER.warning("NUCLEAR: fresh Pair() failed")
+                else:
+                    _LOGGER.warning("NUCLEAR: RemoveDevice failed - old bond could not be cleared")
+
                 self._status = "connected_not_auth"
                 _LOGGER.warning(
                     "Connected but NOT authenticated to %s - "
-                    "machine may need pairing button press",
+                    "machine may need pairing button press (Verbinden modus)",
                     self._address,
+                )
+                self._last_error = (
+                    "Authenticatie mislukt. Zorg dat de machine in 'Verbinden' modus staat "
+                    "(blauw knipperend display) en herlaad de integratie."
                 )
                 if not self._notifications_active:
                     self._notify_mode = "polling"
-                    _LOGGER.info("Starting polling despite auth failure (for retry)")
                     self._polling_task = asyncio.ensure_future(self._start_polling())
 
             self._notify_callbacks()
