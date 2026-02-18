@@ -807,6 +807,182 @@ class MelittaDevice:
         except Exception as err:
             _LOGGER.debug("BlueZ force disconnect error (non-fatal): %s", err)
 
+    async def _dbus_pair_device(self) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType, Variant
+            import re
+
+            mac_path = self._address.replace(":", "_").upper()
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_root = Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_root)
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
+
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+
+                    paired_reply = await bus.call(Message(
+                        destination="org.bluez", path=device_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get", signature="ss",
+                        body=["org.bluez.Device1", "Paired"],
+                    ))
+                    if paired_reply.message_type == MessageType.ERROR:
+                        _LOGGER.warning(
+                            "BLE PAIR: device %s not found on %s: %s",
+                            self._address, adapter, paired_reply.error_name,
+                        )
+                        continue
+
+                    is_paired = False
+                    if paired_reply.body:
+                        val = paired_reply.body[0]
+                        is_paired = val.value if isinstance(val, Variant) else bool(val)
+
+                    if is_paired:
+                        _LOGGER.warning(
+                            "BLE PAIR: device %s already paired on %s - skipping Pair()",
+                            self._address, adapter,
+                        )
+                        return True
+
+                    _LOGGER.warning(
+                        "BLE PAIR: device %s NOT paired on %s - calling Pair()...\n"
+                        "  Zorg dat de machine in 'Verbinden' modus staat (druk Verbinden knop op machine)!",
+                        self._address, adapter,
+                    )
+                    self._status = "pairing"
+                    self._last_error = (
+                        "Bluetooth-koppeling bezig... Zorg dat de machine in 'Verbinden' modus staat "
+                        "(druk de Verbinden knop in het Bluetooth menu op de machine)."
+                    )
+                    self._notify_callbacks()
+
+                    pair_reply = await asyncio.wait_for(
+                        bus.call(Message(
+                            destination="org.bluez", path=device_path,
+                            interface="org.bluez.Device1",
+                            member="Pair",
+                        )),
+                        timeout=30.0,
+                    )
+
+                    if pair_reply.message_type == MessageType.ERROR:
+                        error_name = pair_reply.error_name or ""
+                        error_body = str(pair_reply.body) if pair_reply.body else ""
+                        if "AlreadyExists" in error_name:
+                            _LOGGER.warning(
+                                "BLE PAIR: Pair() returned AlreadyExists - device already paired",
+                            )
+                            return True
+                        _LOGGER.warning(
+                            "BLE PAIR: Pair() FAILED: %s %s",
+                            error_name, error_body,
+                        )
+                        return False
+
+                    _LOGGER.warning(
+                        "BLE PAIR: Pair() SUCCEEDED for %s on %s!",
+                        self._address, adapter,
+                    )
+
+                    await asyncio.sleep(0.5)
+
+                    trust_reply = await bus.call(Message(
+                        destination="org.bluez", path=device_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Set", signature="ssv",
+                        body=["org.bluez.Device1", "Trusted", Variant("b", True)],
+                    ))
+                    if trust_reply.message_type == MessageType.ERROR:
+                        _LOGGER.warning("BLE PAIR: Trust set failed (non-fatal): %s", trust_reply.error_name)
+                    else:
+                        _LOGGER.warning("BLE PAIR: Device trusted")
+
+                    return True
+
+                _LOGGER.warning("BLE PAIR: no adapter found with device %s", self._address)
+                return False
+            finally:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "BLE PAIR: Pair() timed out (30s) for %s.\n"
+                "  De machine reageerde niet op het koppelverzoek.\n"
+                "  Zorg dat de machine in 'Verbinden' modus staat.",
+                self._address,
+            )
+            self._last_error = (
+                "Bluetooth-koppeling verlopen (30s). Zorg dat de machine in 'Verbinden' modus staat "
+                "en probeer opnieuw."
+            )
+            self._notify_callbacks()
+            return False
+        except ImportError:
+            _LOGGER.warning("BLE PAIR: dbus_fast not available - cannot pair")
+            return False
+        except Exception as err:
+            _LOGGER.warning("BLE PAIR: error: %s (%s)", err, type(err).__name__)
+            return False
+
+    async def _dbus_check_paired(self) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType, Variant
+            import re
+
+            mac_path = self._address.replace(":", "_").upper()
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspect_root = Message(
+                    destination="org.bluez", path="/org/bluez",
+                    interface="org.freedesktop.DBus.Introspectable",
+                    member="Introspect",
+                )
+                reply = await bus.call(introspect_root)
+                adapters = re.findall(r'<node name="(hci\d+)"', reply.body[0]) if reply.body else ["hci0"]
+                if not adapters:
+                    adapters = ["hci0"]
+
+                for adapter in adapters:
+                    device_path = f"/org/bluez/{adapter}/dev_{mac_path}"
+                    paired_reply = await asyncio.wait_for(
+                        bus.call(Message(
+                            destination="org.bluez", path=device_path,
+                            interface="org.freedesktop.DBus.Properties",
+                            member="Get", signature="ss",
+                            body=["org.bluez.Device1", "Paired"],
+                        )),
+                        timeout=2.0,
+                    )
+                    if paired_reply.message_type == MessageType.ERROR:
+                        continue
+                    val = paired_reply.body[0] if paired_reply.body else None
+                    if isinstance(val, Variant):
+                        val = val.value
+                    if bool(val):
+                        _LOGGER.warning("BLE PAIR CHECK: device paired on %s", adapter)
+                        return True
+                return False
+            finally:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+        except Exception:
+            return False
+
     async def _test_ble_write(self) -> bool:
         if not self._client or not self._is_connected:
             return False
@@ -876,6 +1052,54 @@ class MelittaDevice:
                 self._last_error = "BLE verbinding was niet bruikbaar (stale). Opnieuw proberen..."
                 self._notify_callbacks()
                 return False
+
+            if self._hass is not None:
+                t_pair_start = time.monotonic()
+                is_already_paired = await self._dbus_check_paired()
+                if is_already_paired:
+                    _LOGGER.warning(
+                        "BLE PAIR CHECK: device already paired (%.1fms) - proceeding to auth",
+                        (time.monotonic() - t_pair_start) * 1000,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "BLE PAIR CHECK: device NOT paired (%.1fms) - initiating pairing...\n"
+                        "  Machine MOET in 'Verbinden' modus staan!",
+                        (time.monotonic() - t_pair_start) * 1000,
+                    )
+                    pair_ok = await self._dbus_pair_device()
+                    t_pair_done = time.monotonic()
+                    if pair_ok:
+                        _LOGGER.warning(
+                            "BLE PAIR: pairing succeeded (%.1fms total).\n"
+                            "  Disconnecting and reconnecting to activate encrypted BLE link...",
+                            (t_pair_done - t_pair_start) * 1000,
+                        )
+                        self._suppress_disconnect_callback = True
+                        try:
+                            await self._internal_disconnect()
+                        except Exception:
+                            pass
+                        self._suppress_disconnect_callback = False
+                        await asyncio.sleep(1.0)
+
+                        reconnected = await self._internal_reconnect_ble()
+                        if not reconnected:
+                            await asyncio.sleep(2.0)
+                            reconnected = await self._internal_reconnect_ble()
+                        if not reconnected:
+                            _LOGGER.warning("BLE PAIR: reconnect after pairing FAILED")
+                            return False
+                        _LOGGER.warning(
+                            "BLE PAIR: reconnected with encrypted link (total=%.1fms)",
+                            (time.monotonic() - t_pair_start) * 1000,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "BLE PAIR: pairing FAILED (%.1fms total).\n"
+                            "  Ga door met auth zonder pairing (kan werken als machine al eerder gepaird was).",
+                            (t_pair_done - t_pair_start) * 1000,
+                        )
 
             self._status = "authenticating"
             self._notify_callbacks()
@@ -1010,21 +1234,6 @@ class MelittaDevice:
             "  This matches the APK's atomic CCCD+auth approach.",
             p_attempt, BLE_READ_UUID, (t_cccd_start - t_pipeline_start) * 1000,
         )
-
-        if self._dbus_notify_bus is not None:
-            try:
-                if self._dbus_notify_handler:
-                    self._dbus_notify_bus.remove_message_handler(self._dbus_notify_handler)
-                self._dbus_notify_bus.disconnect()
-            except Exception:
-                pass
-            self._dbus_notify_bus = None
-            self._dbus_notify_handler = None
-            self._dbus_match_rule = None
-            _LOGGER.warning(
-                "FAST PIPELINE %d: D-Bus handler removed (Bleak callback will handle notifications)",
-                p_attempt,
-            )
 
         notify_task = asyncio.ensure_future(
             self._client.start_notify(BLE_READ_UUID, self._on_notification)
@@ -1176,6 +1385,8 @@ class MelittaDevice:
             (time.monotonic() - t_pipeline_start) * 1000, read_char_path,
         )
 
+        dbus_ok = False
+        cccd_confirmed = False
         if read_char_path and self._hass is not None:
             t_dbus_reg = time.monotonic()
             dbus_ok = await self._register_dbus_notification_handler(read_char_path)
@@ -1187,14 +1398,122 @@ class MelittaDevice:
                 _LOGGER.warning("FAST PIPELINE: D-Bus notification handler registered BEFORE CCCD write (total elapsed=%.1fms)", (time.monotonic() - t_pipeline_start) * 1000)
                 self._notifications_active = True
                 self._notify_mode = "dbus_handler_only"
+
+                t_start_notify = time.monotonic()
+                sn_ok = await self._dbus_start_notify_on_char(read_char_path)
+                t_sn_done = time.monotonic()
+
+                notifying = await self._dbus_check_notifying(read_char_path)
+                cccd_confirmed = sn_ok or notifying
+
+                if sn_ok:
+                    _LOGGER.warning(
+                        "FAST PIPELINE: D-Bus StartNotify OK (%.1fms) - CCCD written! Notifying=%s",
+                        (t_sn_done - t_start_notify) * 1000, notifying,
+                    )
+                elif notifying:
+                    _LOGGER.warning(
+                        "FAST PIPELINE: D-Bus StartNotify failed (%.1fms) but Notifying=True - CCCD already active!",
+                        (t_sn_done - t_start_notify) * 1000,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "FAST PIPELINE: D-Bus StartNotify failed (%.1fms) and Notifying=False.\n"
+                        "  CCCD NOT confirmed. Skipping D-Bus auth path, will use pipeline methods.",
+                        (t_sn_done - t_start_notify) * 1000,
+                    )
+
+                if cccd_confirmed and self._is_connected and self._client is not None:
+                    auth_payload = self._build_auth_payload()
+                    auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
+
+                    t_auth_w = time.monotonic()
+                    _LOGGER.warning(
+                        "FAST PIPELINE: D-Bus path - writing auth immediately (t=%.1fms since pipeline start)...",
+                        (t_auth_w - t_pipeline_start) * 1000,
+                    )
+                    self._pipeline_auth_write_time = t_auth_w
+                    try:
+                        await asyncio.wait_for(
+                            self._client.write_gatt_char(BLE_WRITE_UUID, auth_encrypted, response=False),
+                            timeout=3.0,
+                        )
+                        t_auth_d = time.monotonic()
+                        _LOGGER.warning(
+                            "FAST PIPELINE: D-Bus path auth write OK (%.1fms, total=%.1fms since pipeline)",
+                            (t_auth_d - t_auth_w) * 1000, (t_auth_d - t_pipeline_start) * 1000,
+                        )
+
+                        self._status = "waiting_for_machine_button"
+                        self._last_error = (
+                            "Auth-frame verstuurd! Druk NU op 'Verbinden' op het display van het koffieapparaat."
+                        )
+                        self._notify_callbacks()
+
+                        await self._pipeline_wait_for_auth(0)
+
+                        if self._authenticated:
+                            _LOGGER.warning(
+                                "=== FAST PIPELINE: AUTH SUCCEEDED (D-Bus StartNotify + auth)! ===\n"
+                                "  total_pipeline_time=%.1fms, session_key=%s",
+                                (time.monotonic() - t_pipeline_start) * 1000,
+                                self._session_key.hex() if self._session_key else "None",
+                            )
+                            return True
+
+                        if self._auth_got_frame and not self._authenticated:
+                            _LOGGER.warning(
+                                "FAST PIPELINE: D-Bus path got frame but encrypted auth failed. Trying plaintext..."
+                            )
+                            self._auth_challenge = os.urandom(4)
+                            challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+                            auth_payload2 = self._auth_challenge + challenge_hash
+                            auth_plaintext2 = build_frame(CMD_AUTH, None, auth_payload2, encrypt=False)
+                            self._auth_event.clear()
+                            self._auth_got_frame = False
+                            try:
+                                await asyncio.wait_for(
+                                    self._client.write_gatt_char(BLE_WRITE_UUID, auth_plaintext2, response=False),
+                                    timeout=3.0,
+                                )
+                                await self._pipeline_wait_for_auth(0)
+                                if self._authenticated:
+                                    _LOGGER.warning(
+                                        "=== FAST PIPELINE: AUTH SUCCEEDED (D-Bus + plaintext)! ===\n"
+                                        "  total=%.1fms, session_key=%s",
+                                        (time.monotonic() - t_pipeline_start) * 1000,
+                                        self._session_key.hex() if self._session_key else "None",
+                                    )
+                                    return True
+                            except Exception as pt_err:
+                                _LOGGER.warning("FAST PIPELINE: D-Bus path plaintext auth error: %s", pt_err)
+
+                        _LOGGER.warning(
+                            "FAST PIPELINE: D-Bus path auth failed (got_frame=%s, connected=%s). Falling through to pipeline methods.",
+                            self._auth_got_frame, self._is_connected,
+                        )
+                    except Exception as auth_err:
+                        _LOGGER.warning(
+                            "FAST PIPELINE: D-Bus path auth write error: %s (%s). Falling through to pipeline methods.",
+                            auth_err, type(auth_err).__name__,
+                        )
             else:
                 _LOGGER.warning("FAST PIPELINE: D-Bus handler registration failed, will use polling")
 
-        pipeline_methods = [
-            "bleak_start_notify",
-            "direct_cccd_descriptor",
-            "auth_only_no_cccd",
-        ]
+        if dbus_ok and cccd_confirmed:
+            pipeline_methods = [
+                "auth_only_no_cccd",
+            ]
+            _LOGGER.warning(
+                "FAST PIPELINE: D-Bus CCCD confirmed (Notifying=True), skipping CCCD methods.\n"
+                "  Only trying auth_only_no_cccd as fallback.",
+            )
+        else:
+            pipeline_methods = [
+                "bleak_start_notify",
+                "direct_cccd_descriptor",
+                "auth_only_no_cccd",
+            ]
 
         for p_attempt, method in enumerate(pipeline_methods, 1):
             t_attempt_start = time.monotonic()
@@ -1692,6 +2011,40 @@ class MelittaDevice:
             return False
         except Exception as err:
             _LOGGER.warning("D-Bus StopNotify error: %s (%s)", err, type(err).__name__)
+            return False
+
+    async def _dbus_check_notifying(self, char_path: str) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType, Variant
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                get_msg = Message(
+                    destination="org.bluez",
+                    path=char_path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get",
+                    signature="ss",
+                    body=["org.bluez.GattCharacteristic1", "Notifying"],
+                )
+                reply = await asyncio.wait_for(bus.call(get_msg), timeout=1.0)
+                if reply.message_type == MessageType.ERROR:
+                    _LOGGER.warning("D-Bus Notifying check error: %s %s", reply.error_name, reply.body)
+                    return False
+                val = reply.body[0] if reply.body else None
+                if isinstance(val, Variant):
+                    val = val.value
+                result = bool(val)
+                _LOGGER.warning("D-Bus Notifying property on %s: %s", char_path, result)
+                return result
+            finally:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+        except Exception as err:
+            _LOGGER.warning("D-Bus Notifying check failed: %s (%s)", err, type(err).__name__)
             return False
 
     async def _dbus_start_notify_on_char(self, char_path: str) -> bool:
