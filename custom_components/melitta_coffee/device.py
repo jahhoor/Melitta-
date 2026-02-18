@@ -164,9 +164,11 @@ class MelittaDevice:
         caller_info = "".join(traceback.format_stack(limit=5))
 
         if self._suppress_disconnect_callback or self._cccd_recovery_in_progress:
+            self._is_connected = False
             _LOGGER.warning(
-                "DISCONNECT CALLBACK (suppressed) for %s - ignoring (suppress=%s, cccd_recovery=%s)",
-                self._address, self._suppress_disconnect_callback, self._cccd_recovery_in_progress,
+                "DISCONNECT CALLBACK (suppressed) for %s - set _is_connected=False but NOT running reconnect logic\n"
+                "  (suppress=%s, cccd_recovery=%s, prev_connected=True, status=%s)",
+                self._address, self._suppress_disconnect_callback, self._cccd_recovery_in_progress, self._status,
             )
             return
         if client is not self._client:
@@ -1149,7 +1151,7 @@ class MelittaDevice:
                                 t_desc_write = time.monotonic()
                                 await asyncio.wait_for(
                                     self._client.write_gatt_descriptor(cccd_desc.handle, b"\x01\x00"),
-                                    timeout=2.0,
+                                    timeout=1.0,
                                 )
                                 t_cccd_done = time.monotonic()
                                 cccd_ok = True
@@ -1539,6 +1541,7 @@ class MelittaDevice:
             from dbus_fast.aio import MessageBus
             from dbus_fast import Message, MessageType, BusType
 
+            t_start = time.monotonic()
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             try:
                 start_msg = Message(
@@ -1547,26 +1550,42 @@ class MelittaDevice:
                     interface="org.bluez.GattCharacteristic1",
                     member="StartNotify",
                 )
-                reply = await bus.call(start_msg)
-                if reply.message_type == MessageType.ERROR:
+                try:
+                    reply = await asyncio.wait_for(bus.call(start_msg), timeout=1.0)
+                except asyncio.TimeoutError:
+                    elapsed = (time.monotonic() - t_start) * 1000
                     _LOGGER.warning(
-                        "D-Bus StartNotify on %s: %s %s",
-                        char_path, reply.error_name, reply.body,
+                        "D-Bus StartNotify on %s: TIMEOUT after %.1fms (machine likely disconnected during CCCD write).\n"
+                        "  This is expected - machine enters pairing mode after CCCD.\n"
+                        "  connected=%s",
+                        char_path, elapsed, self._is_connected,
                     )
                     return False
+                if reply.message_type == MessageType.ERROR:
+                    elapsed = (time.monotonic() - t_start) * 1000
+                    _LOGGER.warning(
+                        "D-Bus StartNotify on %s: ERROR after %.1fms: %s %s",
+                        char_path, elapsed, reply.error_name, reply.body,
+                    )
+                    return False
+                elapsed = (time.monotonic() - t_start) * 1000
                 _LOGGER.warning(
-                    "D-Bus StartNotify on %s: OK - CCCD written to machine via D-Bus!\n"
+                    "D-Bus StartNotify on %s: OK after %.1fms - CCCD written to machine via D-Bus!\n"
                     "  Notifications will arrive via PropertiesChanged signals.",
-                    char_path,
+                    char_path, elapsed,
                 )
                 return True
             finally:
-                bus.disconnect()
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
         except ImportError:
             _LOGGER.warning("dbus_fast not available for D-Bus StartNotify")
             return False
         except Exception as err:
-            _LOGGER.warning("D-Bus StartNotify error: %s (%s)", err, type(err).__name__)
+            elapsed = (time.monotonic() - t_start) * 1000
+            _LOGGER.warning("D-Bus StartNotify error after %.1fms: %s (%s)", elapsed, err, type(err).__name__)
             return False
 
     async def _dbus_remove_device(self) -> bool:
