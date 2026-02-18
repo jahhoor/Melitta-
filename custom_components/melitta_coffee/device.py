@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import struct
+import time
 from datetime import datetime
 from typing import Callable, Any
 
@@ -41,6 +42,7 @@ class MelittaDevice:
         self._auth_event = asyncio.Event()
         self._auth_got_frame = False
         self._auth_disconnect_reason: str | None = None
+        self._pipeline_auth_write_time: float | None = None
         self._authenticated = False
         self._is_connected = False
         self._shutting_down = False
@@ -597,20 +599,33 @@ class MelittaDevice:
             self._suppress_disconnect_callback = False
 
     async def _internal_reconnect_ble(self) -> bool:
+        t_reconn_start = time.monotonic()
         ble_device = None
         if self._hass is not None:
             try:
                 from homeassistant.components.bluetooth import async_ble_device_from_address
                 ble_device = async_ble_device_from_address(self._hass, self._address, connectable=True)
                 if not ble_device:
-                    _LOGGER.warning("Device not found during internal reconnect")
+                    _LOGGER.warning(
+                        "RECONNECT: Device %s not found via HA Bluetooth (took %.1fms)",
+                        self._address, (time.monotonic() - t_reconn_start) * 1000,
+                    )
                     return False
+                _LOGGER.warning(
+                    "RECONNECT: Got BLEDevice from HA: name=%s, rssi=%s (took %.1fms)",
+                    ble_device.name, getattr(ble_device, 'rssi', 'N/A'),
+                    (time.monotonic() - t_reconn_start) * 1000,
+                )
             except Exception as e:
-                _LOGGER.error("Failed to get BLEDevice during internal reconnect: %s", e)
+                _LOGGER.error(
+                    "RECONNECT: Failed to get BLEDevice: %s (took %.1fms)",
+                    e, (time.monotonic() - t_reconn_start) * 1000,
+                )
                 return False
         else:
             ble_device = self._address
 
+        t_connect_start = time.monotonic()
         try:
             if self._hass is not None and not isinstance(ble_device, str):
                 self._client = await establish_connection(
@@ -628,11 +643,24 @@ class MelittaDevice:
                 )
                 await self._client.connect()
             self._is_connected = True
-            _LOGGER.info("Internal BLE reconnect succeeded for %s", self._address)
+            t_connected = time.monotonic()
+            _LOGGER.warning(
+                "RECONNECT: BLE reconnect SUCCEEDED for %s (connect took %.1fms, total %.1fms)\n"
+                "  mtu=%s, services=%d",
+                self._address,
+                (t_connected - t_connect_start) * 1000,
+                (t_connected - t_reconn_start) * 1000,
+                getattr(self._client, 'mtu_size', 'N/A'),
+                len(self._client.services) if self._client.services else 0,
+            )
             await asyncio.sleep(0.3)
             return True
         except Exception as err:
-            _LOGGER.error("Internal BLE reconnect failed: %s", err)
+            _LOGGER.error(
+                "RECONNECT: BLE reconnect FAILED for %s: %s (%s) (took %.1fms)",
+                self._address, err, type(err).__name__,
+                (time.monotonic() - t_reconn_start) * 1000,
+            )
             self._client = None
             self._is_connected = False
             return False
@@ -850,16 +878,24 @@ class MelittaDevice:
             self._status = "authenticating"
             self._notify_callbacks()
 
-            notifications_ok = await self._enable_notifications()
-            if not notifications_ok:
-                self._notify_mode = "polling"
+            pipeline_ok = await self._fast_pipeline_cccd_and_auth()
 
-            if not self._is_connected or self._client is None:
-                _LOGGER.warning("Connection lost during notification setup for %s", self._address)
-                return False
+            if pipeline_ok and self._authenticated:
+                pass
+            elif not self._authenticated and self._is_connected and not self._shutting_down:
+                _LOGGER.warning(
+                    "Fast pipeline did not authenticate. Trying traditional flow..."
+                )
+                notifications_ok = await self._enable_notifications()
+                if not notifications_ok:
+                    self._notify_mode = "polling"
 
-            if not self._shutting_down:
-                await self._authenticate()
+                if not self._is_connected or self._client is None:
+                    _LOGGER.warning("Connection lost during notification setup for %s", self._address)
+                    return False
+
+                if not self._shutting_down:
+                    await self._authenticate()
 
             if not self._is_connected:
                 _LOGGER.warning("Connection lost during auth for %s", self._address)
@@ -957,6 +993,442 @@ class MelittaDevice:
             )
             await self._client.connect()
 
+
+    async def _fast_pipeline_cccd_and_auth(self) -> bool:
+        t_pipeline_start = time.monotonic()
+        _LOGGER.warning(
+            "=== FAST PIPELINE: CCCD + AUTH in one atomic operation ===\n"
+            "  Strategy: Register D-Bus handler FIRST, then write CCCD + auth\n"
+            "  within the machine's ~370ms disconnect window.\n"
+            "  3 pipeline attempts with different CCCD methods.\n"
+            "  TIMER START: t=0ms"
+        )
+
+        if not self._client or not self._is_connected:
+            _LOGGER.warning("FAST PIPELINE: no connection (elapsed=%.1fms)", (time.monotonic() - t_pipeline_start) * 1000)
+            return False
+
+        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+        _LOGGER.warning(
+            "FAST PIPELINE: char_path lookup took %.1fms, path=%s",
+            (time.monotonic() - t_pipeline_start) * 1000, read_char_path,
+        )
+
+        if read_char_path and self._hass is not None:
+            t_dbus_reg = time.monotonic()
+            dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+            _LOGGER.warning(
+                "FAST PIPELINE: D-Bus handler registration took %.1fms, ok=%s",
+                (time.monotonic() - t_dbus_reg) * 1000, dbus_ok,
+            )
+            if dbus_ok:
+                _LOGGER.warning("FAST PIPELINE: D-Bus notification handler registered BEFORE CCCD write (total elapsed=%.1fms)", (time.monotonic() - t_pipeline_start) * 1000)
+                self._notifications_active = True
+                self._notify_mode = "dbus_handler_only"
+            else:
+                _LOGGER.warning("FAST PIPELINE: D-Bus handler registration failed, will use polling")
+
+        pipeline_methods = [
+            "dbus_start_notify",
+            "direct_cccd_descriptor",
+            "auth_only_no_cccd",
+        ]
+
+        for p_attempt, method in enumerate(pipeline_methods, 1):
+            t_attempt_start = time.monotonic()
+            if self._shutting_down:
+                return False
+
+            if self._authenticated:
+                return True
+
+            if not self._is_connected or self._client is None:
+                t_reconn = time.monotonic()
+                _LOGGER.warning(
+                    "FAST PIPELINE attempt %d: no connection, reconnecting... (pipeline elapsed=%.1fms)",
+                    p_attempt, (t_reconn - t_pipeline_start) * 1000,
+                )
+                reconnected = await self._internal_reconnect_ble()
+                if not reconnected:
+                    await asyncio.sleep(2.0)
+                    reconnected = await self._internal_reconnect_ble()
+                _LOGGER.warning(
+                    "FAST PIPELINE attempt %d: reconnect %s (took %.1fms)",
+                    p_attempt, "OK" if reconnected else "FAILED",
+                    (time.monotonic() - t_reconn) * 1000,
+                )
+                if not reconnected:
+                    continue
+
+                new_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+                if new_char_path:
+                    read_char_path = new_char_path
+                if read_char_path and self._hass is not None:
+                    if self._dbus_notify_bus is not None:
+                        try:
+                            if self._dbus_notify_handler:
+                                self._dbus_notify_bus.remove_message_handler(self._dbus_notify_handler)
+                            self._dbus_notify_bus.disconnect()
+                        except Exception:
+                            pass
+                        self._dbus_notify_bus = None
+                        self._dbus_notify_handler = None
+                        self._dbus_match_rule = None
+                    t_re_dbus = time.monotonic()
+                    dbus_ok = await self._register_dbus_notification_handler(read_char_path)
+                    _LOGGER.warning(
+                        "FAST PIPELINE attempt %d: D-Bus re-registration took %.1fms, ok=%s",
+                        p_attempt, (time.monotonic() - t_re_dbus) * 1000, dbus_ok,
+                    )
+                    if dbus_ok:
+                        self._notifications_active = True
+                        self._notify_mode = "dbus_handler_only"
+
+            auth_payload = self._build_auth_payload()
+            auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
+            auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
+
+            _LOGGER.warning(
+                "=== FAST PIPELINE ATTEMPT %d/%d: method=%s ===\n"
+                "  auth_encrypted=%s (%d bytes)\n"
+                "  auth_plaintext=%s (%d bytes)\n"
+                "  connected=%s, notifications=%s, notify_mode=%s\n"
+                "  pipeline_elapsed=%.1fms, attempt_elapsed=%.1fms\n"
+                "  challenge=%s",
+                p_attempt, len(pipeline_methods), method,
+                auth_encrypted.hex(), len(auth_encrypted),
+                auth_plaintext.hex(), len(auth_plaintext),
+                self._is_connected, self._notifications_active, self._notify_mode,
+                (time.monotonic() - t_pipeline_start) * 1000,
+                (time.monotonic() - t_attempt_start) * 1000,
+                self._auth_challenge.hex() if self._auth_challenge else "None",
+            )
+
+            self._auth_event.clear()
+            self._auth_got_frame = False
+            self._auth_disconnect_reason = None
+            self._authenticated = False
+            self._status = "authenticating"
+
+            self._suppress_disconnect_callback = True
+            cccd_ok = False
+            t_cccd_start = time.monotonic()
+            try:
+                if method == "dbus_start_notify":
+                    if read_char_path:
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d: D-Bus StartNotify on %s (t=%.1fms since pipeline start)",
+                            p_attempt, read_char_path, (t_cccd_start - t_pipeline_start) * 1000,
+                        )
+                        cccd_ok = await self._dbus_start_notify_on_char(read_char_path)
+                        t_cccd_done = time.monotonic()
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d: D-Bus StartNotify %s (took %.1fms, connected=%s)",
+                            p_attempt, "OK" if cccd_ok else "FAILED",
+                            (t_cccd_done - t_cccd_start) * 1000, self._is_connected,
+                        )
+                    else:
+                        _LOGGER.warning("FAST PIPELINE %d: no char path for D-Bus StartNotify, skipping", p_attempt)
+                        continue
+
+                elif method == "direct_cccd_descriptor":
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d: Direct CCCD descriptor write (t=%.1fms since pipeline start)",
+                        p_attempt, (t_cccd_start - t_pipeline_start) * 1000,
+                    )
+                    try:
+                        read_char = self._client.services.get_characteristic(BLE_READ_UUID)
+                        if read_char:
+                            cccd_uuid = "00002902-0000-1000-8000-00805f9b34fb"
+                            cccd_desc = None
+                            for desc in read_char.descriptors:
+                                if cccd_uuid in str(desc.uuid).lower():
+                                    cccd_desc = desc
+                                    break
+                            if cccd_desc:
+                                t_desc_write = time.monotonic()
+                                await asyncio.wait_for(
+                                    self._client.write_gatt_descriptor(cccd_desc.handle, b"\x01\x00"),
+                                    timeout=2.0,
+                                )
+                                t_cccd_done = time.monotonic()
+                                cccd_ok = True
+                                _LOGGER.warning(
+                                    "FAST PIPELINE %d: CCCD descriptor write OK (handle=%d, took %.1fms, connected=%s)",
+                                    p_attempt, cccd_desc.handle,
+                                    (t_cccd_done - t_desc_write) * 1000, self._is_connected,
+                                )
+                            else:
+                                _LOGGER.warning(
+                                    "FAST PIPELINE %d: CCCD descriptor (0x2902) not found on char %s.\n"
+                                    "  Available descriptors: %s",
+                                    p_attempt, BLE_READ_UUID,
+                                    [(str(d.uuid), d.handle) for d in read_char.descriptors] if read_char.descriptors else "none",
+                                )
+                        else:
+                            _LOGGER.warning(
+                                "FAST PIPELINE %d: read characteristic %s not found in services.\n"
+                                "  Available chars: %s",
+                                p_attempt, BLE_READ_UUID,
+                                [str(c.uuid) for s in self._client.services for c in s.characteristics][:10] if self._client.services else "none",
+                            )
+                    except (EOFError, OSError, BleakError) as cccd_err:
+                        t_cccd_done = time.monotonic()
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d: CCCD write error after %.1fms: %s (%s). Trying auth anyway...",
+                            p_attempt, (t_cccd_done - t_cccd_start) * 1000,
+                            cccd_err, type(cccd_err).__name__,
+                        )
+                        cccd_ok = True
+
+                elif method == "auth_only_no_cccd":
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d: Skipping CCCD entirely - sending auth without CCCD.\n"
+                        "  Machine may have CCCD from previous connection or may accept auth directly.\n"
+                        "  pipeline_elapsed=%.1fms",
+                        p_attempt, (time.monotonic() - t_pipeline_start) * 1000,
+                    )
+                    cccd_ok = True
+
+            except Exception as err:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: CCCD method error after %.1fms: %s (%s)",
+                    p_attempt, (time.monotonic() - t_cccd_start) * 1000,
+                    err, type(err).__name__,
+                )
+            finally:
+                self._suppress_disconnect_callback = False
+
+            t_after_cccd = time.monotonic()
+            cccd_elapsed_ms = (t_after_cccd - t_cccd_start) * 1000
+
+            if not self._is_connected or self._client is None:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: CONNECTION LOST during CCCD (method=%s, cccd_took=%.1fms).\n"
+                    "  Machine likely entered pairing mode (blue display).\n"
+                    "  This is EXPECTED for method 1 - machine disconnects after CCCD.",
+                    p_attempt, method, cccd_elapsed_ms,
+                )
+                await asyncio.sleep(2.0)
+                continue
+
+            if not cccd_ok and method != "auth_only_no_cccd":
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: CCCD method %s failed without disconnect (took %.1fms). Trying next method.",
+                    p_attempt, method, cccd_elapsed_ms,
+                )
+                continue
+
+            _LOGGER.warning(
+                "FAST PIPELINE %d: CCCD done, connection ALIVE! Gap CCCD→auth: %.1fms (target: <370ms)",
+                p_attempt, cccd_elapsed_ms,
+            )
+
+            t_auth_write = time.monotonic()
+            try:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: Writing encrypted auth frame NOW (t=%.1fms since CCCD start, %.1fms since pipeline start)...",
+                    p_attempt, (t_auth_write - t_cccd_start) * 1000, (t_auth_write - t_pipeline_start) * 1000,
+                )
+                self._pipeline_auth_write_time = t_auth_write
+                await asyncio.wait_for(
+                    self._client.write_gatt_char(BLE_WRITE_UUID, auth_encrypted, response=False),
+                    timeout=3.0,
+                )
+                t_auth_done = time.monotonic()
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: Auth write OK! (auth_write took %.1fms, total CCCD→auth_done=%.1fms, connected=%s)",
+                    p_attempt, (t_auth_done - t_auth_write) * 1000,
+                    (t_auth_done - t_cccd_start) * 1000, self._is_connected,
+                )
+            except Exception as auth_err:
+                t_auth_fail = time.monotonic()
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: auth write FAILED after %.1fms: %s (%s)\n"
+                    "  connected=%s, total_elapsed=%.1fms",
+                    p_attempt, (t_auth_fail - t_auth_write) * 1000,
+                    auth_err, type(auth_err).__name__,
+                    self._is_connected, (t_auth_fail - t_pipeline_start) * 1000,
+                )
+                await asyncio.sleep(2.0)
+                continue
+
+            self._status = "waiting_for_machine_button"
+            self._last_error = (
+                "Auth-frame verstuurd! Druk NU op 'Verbinden' op het display van het koffieapparaat."
+            )
+            self._notify_callbacks()
+
+            got_response = await self._pipeline_wait_for_auth(p_attempt)
+
+            if self._authenticated:
+                t_success = time.monotonic()
+                _LOGGER.warning(
+                    "=== FAST PIPELINE %d: AUTH SUCCEEDED! ===\n"
+                    "  method=%s, total_pipeline_time=%.1fms\n"
+                    "  session_key=%s",
+                    p_attempt, method,
+                    (t_success - t_pipeline_start) * 1000,
+                    self._session_key.hex() if self._session_key else "None",
+                )
+                return True
+
+            if self._auth_got_frame and not self._authenticated:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: Got frame but encrypted auth failed. Trying plaintext...\n"
+                    "  pipeline_elapsed=%.1fms",
+                    p_attempt, (time.monotonic() - t_pipeline_start) * 1000,
+                )
+                if self._is_connected and self._client is not None:
+                    self._auth_challenge = os.urandom(4)
+                    challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+                    auth_payload2 = self._auth_challenge + challenge_hash
+                    auth_plaintext2 = build_frame(CMD_AUTH, None, auth_payload2, encrypt=False)
+                    self._auth_event.clear()
+                    self._auth_got_frame = False
+                    try:
+                        await asyncio.wait_for(
+                            self._client.write_gatt_char(BLE_WRITE_UUID, auth_plaintext2, response=False),
+                            timeout=3.0,
+                        )
+                        got_pt = await self._pipeline_wait_for_auth(p_attempt)
+                        if self._authenticated:
+                            _LOGGER.warning(
+                                "=== FAST PIPELINE %d: AUTH SUCCEEDED (plaintext)! ===\n"
+                                "  total_pipeline_time=%.1fms, session_key=%s",
+                                p_attempt, (time.monotonic() - t_pipeline_start) * 1000,
+                                self._session_key.hex() if self._session_key else "None",
+                            )
+                            return True
+                    except Exception as pt_err:
+                        _LOGGER.warning("FAST PIPELINE %d: plaintext auth error: %s", p_attempt, pt_err)
+
+            if not self._is_connected:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: disconnected during auth wait (method=%s).\n"
+                    "  disconnect_reason=%s",
+                    p_attempt, method, self._auth_disconnect_reason,
+                )
+            else:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d: no auth response (method=%s). Will try next method.",
+                    p_attempt, method,
+                )
+
+            await asyncio.sleep(1.0)
+
+        _LOGGER.warning("=== FAST PIPELINE: all %d attempts exhausted ===", len(pipeline_methods))
+        return False
+
+    def _build_auth_payload(self) -> bytes:
+        self._auth_challenge = os.urandom(4)
+        challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+        return self._auth_challenge + challenge_hash
+
+    async def _pipeline_wait_for_auth(self, attempt: int) -> bool:
+        t_wait_start = time.monotonic()
+        _LOGGER.warning(
+            "FAST PIPELINE %d: Waiting for auth response (%.0fs timeout)\n"
+            "  notify_mode=%s, notifications_active=%s\n"
+            "  auth_write_time=%s\n"
+            "  Druk op 'Verbinden' op het koffieapparaat!",
+            attempt, AUTH_TIMEOUT, self._notify_mode, self._notifications_active,
+            "set" if getattr(self, '_pipeline_auth_write_time', None) else "not_set",
+        )
+
+        client = self._client
+        if client is None:
+            return False
+
+        poll_interval = 0.15
+        max_polls = int(AUTH_TIMEOUT / poll_interval)
+        last_data = None
+
+        for i in range(max_polls):
+            t_poll = time.monotonic()
+            wait_elapsed_ms = (t_poll - t_wait_start) * 1000
+
+            if self._authenticated or self._auth_got_frame:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d WAIT [#%d]: AUTH RESULT! authenticated=%s, got_frame=%s (waited %.1fms)",
+                    attempt, i + 1, self._authenticated, self._auth_got_frame, wait_elapsed_ms,
+                )
+                return True
+
+            if self._auth_event.is_set():
+                _LOGGER.warning(
+                    "FAST PIPELINE %d WAIT [#%d]: auth_event SET! (waited %.1fms)",
+                    attempt, i + 1, wait_elapsed_ms,
+                )
+                return True
+
+            if not self._is_connected or self._client is None:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d WAIT [#%d]: CONNECTION LOST after %.1fms of waiting\n"
+                    "  disconnect_reason=%s",
+                    attempt, i + 1, wait_elapsed_ms,
+                    self._auth_disconnect_reason,
+                )
+                return False
+
+            try:
+                data = await asyncio.wait_for(
+                    client.read_gatt_char(BLE_READ_UUID),
+                    timeout=2.0,
+                )
+                if data and len(data) > 0 and data != last_data:
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d POLL [#%d]: NEW data %d bytes (waited %.1fms)\n"
+                        "  hex=%s\n"
+                        "  raw_bytes=[%s]\n"
+                        "  first_byte=0x%02x, last_byte=0x%02x",
+                        attempt, i + 1, len(data), wait_elapsed_ms,
+                        data.hex(),
+                        " ".join(f"0x{b:02x}" for b in data),
+                        data[0], data[-1],
+                    )
+                    last_data = data
+                    self._process_incoming_data(data)
+                    if self._authenticated or self._auth_event.is_set():
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d POLL [#%d]: Auth succeeded after processing! (total wait %.1fms)",
+                            attempt, i + 1, (time.monotonic() - t_wait_start) * 1000,
+                        )
+                        return True
+                elif i < 3 or i % 20 == 0:
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d WAIT [#%d/%.0f]: still waiting... (%.1fms elapsed, connected=%s, same_data=%s)",
+                        attempt, i + 1, max_polls, wait_elapsed_ms, self._is_connected,
+                        "yes" if data == last_data else "no/empty",
+                    )
+            except asyncio.TimeoutError:
+                if i < 3 or i % 20 == 0:
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d WAIT [#%d]: read timeout (%.1fms elapsed, connected=%s)",
+                        attempt, i + 1, wait_elapsed_ms, self._is_connected,
+                    )
+            except (BleakError, EOFError) as err:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d WAIT [#%d]: BLE read error after %.1fms: %s (%s)",
+                    attempt, i + 1, wait_elapsed_ms, err, type(err).__name__,
+                )
+                return False
+            except Exception as err:
+                _LOGGER.warning(
+                    "FAST PIPELINE %d WAIT [#%d]: unexpected error after %.1fms: %s: %s",
+                    attempt, i + 1, wait_elapsed_ms, type(err).__name__, err,
+                )
+
+            await asyncio.sleep(poll_interval)
+
+        _LOGGER.warning(
+            "FAST PIPELINE %d: auth wait TIMEOUT after %.1fms (%.0fs configured)\n"
+            "  connected=%s, authenticated=%s, got_frame=%s, disconnect_reason=%s",
+            attempt, (time.monotonic() - t_wait_start) * 1000, AUTH_TIMEOUT,
+            self._is_connected, self._authenticated, self._auth_got_frame,
+            self._auth_disconnect_reason,
+        )
+        return False
 
     async def _enable_notifications(self):
         if not self._client or not self._is_connected:
@@ -1473,7 +1945,11 @@ class MelittaDevice:
             )
             await bus.call(add_match_msg)
 
+            t_handler_registered = time.monotonic()
+            self._pipeline_auth_write_time = None
+
             def on_dbus_message(msg):
+                t_rx = time.monotonic()
                 if msg.member != "PropertiesChanged":
                     return
                 msg_path = msg.path if hasattr(msg, 'path') else ""
@@ -1481,7 +1957,8 @@ class MelittaDevice:
                     return
                 if not msg.body or len(msg.body) < 2:
                     _LOGGER.warning(
-                        "D-Bus PropertiesChanged: empty body, path=%s", msg_path,
+                        "D-Bus PropertiesChanged: empty body, path=%s, t=%.1fms since handler registered",
+                        msg_path, (t_rx - t_handler_registered) * 1000,
                     )
                     return
                 iface = msg.body[0]
@@ -1494,8 +1971,8 @@ class MelittaDevice:
                     return
                 if "Value" not in changed:
                     _LOGGER.warning(
-                        "D-Bus PropertiesChanged: no Value key, keys=%s, path=%s",
-                        list(changed.keys()), msg_path,
+                        "D-Bus PropertiesChanged: no Value key, keys=%s, path=%s, t=%.1fms",
+                        list(changed.keys()), msg_path, (t_rx - t_handler_registered) * 1000,
                     )
                     return
 
@@ -1507,9 +1984,20 @@ class MelittaDevice:
                     _LOGGER.warning("D-Bus PropertiesChanged: empty Value data, path=%s", msg_path)
                     return
 
+                latency_from_auth = ""
+                if self._pipeline_auth_write_time is not None:
+                    latency_from_auth = ", latency_since_auth_write=%.1fms" % ((t_rx - self._pipeline_auth_write_time) * 1000)
+
                 _LOGGER.warning(
-                    ">>> D-Bus NOTIFICATION RX: %d bytes, hex=%s, path=%s",
+                    ">>> D-Bus NOTIFICATION RX: %d bytes, hex=%s, path=%s\n"
+                    "  t=%.1fms since handler registered%s\n"
+                    "  first_byte=0x%02x, authenticated=%s, status=%s\n"
+                    "  raw_bytes=[%s]",
                     len(data), data.hex(), msg_path,
+                    (t_rx - t_handler_registered) * 1000, latency_from_auth,
+                    data[0] if len(data) > 0 else 0,
+                    self._authenticated, self._status,
+                    " ".join(f"0x{b:02x}" for b in data),
                 )
                 self._process_incoming_data(data)
 
