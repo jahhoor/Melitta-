@@ -653,7 +653,7 @@ class MelittaDevice:
                 (t_connected - t_connect_start) * 1000,
                 (t_connected - t_reconn_start) * 1000,
                 getattr(self._client, 'mtu_size', 'N/A'),
-                len(self._client.services) if self._client.services else 0,
+                sum(1 for _ in self._client.services) if self._client.services else 0,
             )
             await asyncio.sleep(0.3)
             return True
@@ -1031,7 +1031,7 @@ class MelittaDevice:
                 _LOGGER.warning("FAST PIPELINE: D-Bus handler registration failed, will use polling")
 
         pipeline_methods = [
-            "dbus_start_notify",
+            "bleak_start_notify",
             "direct_cccd_descriptor",
             "auth_only_no_cccd",
         ]
@@ -1116,22 +1116,57 @@ class MelittaDevice:
             cccd_ok = False
             t_cccd_start = time.monotonic()
             try:
-                if method == "dbus_start_notify":
-                    if read_char_path:
+                if method == "bleak_start_notify":
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d: Bleak start_notify on %s (t=%.1fms since pipeline start)\n"
+                        "  This uses Bleak's standard CCCD write mechanism.",
+                        p_attempt, BLE_READ_UUID, (t_cccd_start - t_pipeline_start) * 1000,
+                    )
+                    if self._dbus_notify_bus is not None:
+                        try:
+                            if self._dbus_notify_handler:
+                                self._dbus_notify_bus.remove_message_handler(self._dbus_notify_handler)
+                            self._dbus_notify_bus.disconnect()
+                        except Exception:
+                            pass
+                        self._dbus_notify_bus = None
+                        self._dbus_notify_handler = None
+                        self._dbus_match_rule = None
                         _LOGGER.warning(
-                            "FAST PIPELINE %d: D-Bus StartNotify on %s (t=%.1fms since pipeline start)",
-                            p_attempt, read_char_path, (t_cccd_start - t_pipeline_start) * 1000,
+                            "FAST PIPELINE %d: D-Bus handler removed (Bleak callback will handle notifications)",
+                            p_attempt,
                         )
-                        cccd_ok = await self._dbus_start_notify_on_char(read_char_path)
+                    try:
+                        await asyncio.wait_for(
+                            self._client.start_notify(BLE_READ_UUID, self._on_notification),
+                            timeout=2.0,
+                        )
+                        t_cccd_done = time.monotonic()
+                        cccd_ok = True
+                        self._notifications_active = True
+                        self._notify_mode = "bleak_start_notify"
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d: Bleak start_notify OK (took %.1fms, connected=%s)\n"
+                            "  CCCD successfully written - machine should accept auth now!",
+                            p_attempt, (t_cccd_done - t_cccd_start) * 1000, self._is_connected,
+                        )
+                    except asyncio.TimeoutError:
                         t_cccd_done = time.monotonic()
                         _LOGGER.warning(
-                            "FAST PIPELINE %d: D-Bus StartNotify %s (took %.1fms, connected=%s)",
-                            p_attempt, "OK" if cccd_ok else "FAILED",
-                            (t_cccd_done - t_cccd_start) * 1000, self._is_connected,
+                            "FAST PIPELINE %d: Bleak start_notify TIMEOUT after %.1fms (connected=%s)\n"
+                            "  Machine may have disconnected during CCCD write.",
+                            p_attempt, (t_cccd_done - t_cccd_start) * 1000, self._is_connected,
                         )
-                    else:
-                        _LOGGER.warning("FAST PIPELINE %d: no char path for D-Bus StartNotify, skipping", p_attempt)
-                        continue
+                    except (EOFError, OSError, BleakError) as sn_err:
+                        t_cccd_done = time.monotonic()
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d: Bleak start_notify error after %.1fms: %s (%s)\n"
+                            "  connected=%s. Will try auth anyway if still connected.",
+                            p_attempt, (t_cccd_done - t_cccd_start) * 1000,
+                            sn_err, type(sn_err).__name__, self._is_connected,
+                        )
+                        if self._is_connected:
+                            cccd_ok = True
 
                 elif method == "direct_cccd_descriptor":
                     _LOGGER.warning(
