@@ -1369,6 +1369,236 @@ class MelittaDevice:
             _LOGGER.warning("BLE write probe FAILED: %s - connection may be stale", err)
             return False
 
+    async def _dbus_test_cccd_write(self) -> bool | None:
+        if not self._client or not self._is_connected:
+            return None
+
+        read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+        if not read_char_path:
+            _LOGGER.warning("CCCD TEST: kon char path niet vinden - test overslaan")
+            return None
+
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType, Variant
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                t_test = time.monotonic()
+                reply = await asyncio.wait_for(
+                    bus.call(Message(
+                        destination="org.bluez",
+                        path=read_char_path,
+                        interface="org.bluez.GattCharacteristic1",
+                        member="StartNotify",
+                    )),
+                    timeout=3.0,
+                )
+                elapsed = (time.monotonic() - t_test) * 1000
+
+                if reply.message_type == MessageType.ERROR:
+                    err_name = reply.error_name or ""
+                    _LOGGER.warning(
+                        "CCCD TEST: D-Bus StartNotify FAILED (%.1fms): %s %s",
+                        elapsed, err_name, reply.body,
+                    )
+                    if "NotPermitted" in err_name:
+                        return False
+                    return None
+
+                _LOGGER.warning(
+                    "CCCD TEST: D-Bus StartNotify OK (%.1fms) - checking Notifying property (max 5 polls)...",
+                    elapsed,
+                )
+
+                notifying = False
+                for poll_i in range(5):
+                    await asyncio.sleep(0.15)
+                    notifying_reply = await bus.call(Message(
+                        destination="org.bluez", path=read_char_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get", signature="ss",
+                        body=["org.bluez.GattCharacteristic1", "Notifying"],
+                    ))
+                    if notifying_reply.message_type != MessageType.ERROR:
+                        val = notifying_reply.body[0] if notifying_reply.body else None
+                        if isinstance(val, Variant):
+                            val = val.value
+                        if val is True:
+                            notifying = True
+                            _LOGGER.warning(
+                                "CCCD TEST: Notifying=True na poll %d (%.1fms) - bond werkt!",
+                                poll_i + 1, (time.monotonic() - t_test) * 1000,
+                            )
+                            break
+                    _LOGGER.debug("CCCD TEST: poll %d - Notifying nog niet True", poll_i + 1)
+
+                try:
+                    await bus.call(Message(
+                        destination="org.bluez", path=read_char_path,
+                        interface="org.bluez.GattCharacteristic1",
+                        member="StopNotify",
+                    ))
+                except Exception:
+                    pass
+
+                if notifying:
+                    return True
+                else:
+                    _LOGGER.warning(
+                        "CCCD TEST: StartNotify OK maar Notifying bleef False na 5 polls (%.1fms) - STALE BOND!\n"
+                        "  BlueZ accepteert het commando maar de machine reageert niet.\n"
+                        "  Versleutelingssleutels komen niet overeen.",
+                        (time.monotonic() - t_test) * 1000,
+                    )
+                    return False
+            finally:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+        except ImportError:
+            _LOGGER.warning("CCCD TEST: dbus_fast niet beschikbaar - test overslaan")
+            return None
+        except asyncio.TimeoutError:
+            _LOGGER.warning("CCCD TEST: timeout - test onbepaald")
+            return None
+        except Exception as err:
+            _LOGGER.warning("CCCD TEST: onverwachte fout: %s (%s) - test overslaan", err, type(err).__name__)
+            return None
+
+    async def _nuclear_remove_and_repair(self, t_start=None) -> bool:
+        if t_start is None:
+            t_start = time.monotonic()
+
+        _LOGGER.warning(
+            "=== NUCLEAR: Oude bond verwijderen en vers koppelen ===\n"
+            "  Machine MOET in 'Verbinden' modus staan (blauw knipperend display).\n"
+            "  Druk op 'Verbinden' als dat nog niet gedaan is!",
+        )
+        self._status = "re_pairing"
+        self._last_error = "Oude koppeling kapot. Bezig met verwijderen en opnieuw koppelen..."
+        self._notify_callbacks()
+
+        self._suppress_disconnect_callback = True
+        try:
+            await self._internal_disconnect()
+        except Exception:
+            pass
+        self._suppress_disconnect_callback = False
+        await asyncio.sleep(0.5)
+
+        removed = await self._dbus_remove_device()
+        if not removed:
+            _LOGGER.warning("NUCLEAR: RemoveDevice mislukt - oude bond kon niet verwijderd worden")
+            return False
+
+        _LOGGER.warning(
+            "NUCLEAR: oude bond verwijderd (%.1fms). Wacht 2s en dan opnieuw verbinden...",
+            (time.monotonic() - t_start) * 1000,
+        )
+        await asyncio.sleep(2.0)
+
+        ble_device = await self._get_ble_device()
+        if ble_device is None:
+            _LOGGER.warning("NUCLEAR: apparaat niet gevonden na RemoveDevice")
+            self._status = "offline"
+            self._last_error = "Machine niet gevonden na verwijderen oude koppeling. Staat de machine aan?"
+            self._notify_callbacks()
+            return False
+
+        try:
+            await self._establish_ble_connection(ble_device)
+            self._is_connected = True
+            _LOGGER.warning(
+                "NUCLEAR: verbonden na RemoveDevice (%.1fms)",
+                (time.monotonic() - t_start) * 1000,
+            )
+        except Exception as err:
+            _LOGGER.warning("NUCLEAR: herverbinding mislukt: %s", err)
+            self._status = "offline"
+            self._last_error = f"Herverbinding mislukt na bond verwijderen: {err}"
+            self._notify_callbacks()
+            return False
+
+        await asyncio.sleep(0.5)
+
+        _LOGGER.warning(
+            "NUCLEAR: starten verse Pair() - machine MOET in Verbinden modus staan!\n"
+            "  Zonder Verbinden modus zal Pair() mislukken.",
+        )
+        pair_ok = await self._dbus_pair_device()
+        if not pair_ok:
+            _LOGGER.warning(
+                "NUCLEAR: verse Pair() MISLUKT (%.1fms).\n"
+                "  Waarschijnlijk staat de machine niet in 'Verbinden' modus.\n"
+                "  Druk op 'Verbinden' op het display en herlaad de integratie.",
+                (time.monotonic() - t_start) * 1000,
+            )
+            self._status = "offline"
+            self._last_error = (
+                "Verse koppeling mislukt. Druk op 'Verbinden' op de machine "
+                "en herlaad de integratie."
+            )
+            self._notify_callbacks()
+            return False
+
+        _LOGGER.warning(
+            "NUCLEAR: verse Pair() GELUKT! (%.1fms) Disconnect+reconnect voor versleutelde link...",
+            (time.monotonic() - t_start) * 1000,
+        )
+        self._suppress_disconnect_callback = True
+        try:
+            await self._internal_disconnect()
+        except Exception:
+            pass
+        self._suppress_disconnect_callback = False
+        await asyncio.sleep(1.0)
+
+        reconnected = await self._internal_reconnect_ble()
+        if not reconnected:
+            await asyncio.sleep(2.0)
+            reconnected = await self._internal_reconnect_ble()
+
+        if not reconnected:
+            _LOGGER.warning("NUCLEAR: herverbinding na verse pair mislukt")
+            self._status = "offline"
+            self._last_error = "Herverbinding mislukt na verse koppeling"
+            self._notify_callbacks()
+            return False
+
+        _LOGGER.warning(
+            "NUCLEAR: herverbonden met verse bond (%.1fms). Versleuteling activeren...",
+            (time.monotonic() - t_start) * 1000,
+        )
+        await self._dbus_force_encryption()
+
+        _LOGGER.warning(
+            "NUCLEAR: starten auth pipeline (%.1fms sinds start)...",
+            (time.monotonic() - t_start) * 1000,
+        )
+        self._status = "authenticating"
+        self._notify_callbacks()
+
+        pipeline_ok = await self._fast_pipeline_cccd_and_auth()
+        if pipeline_ok and self._authenticated:
+            self._status = "ready"
+            self._start_keepalive()
+            _LOGGER.warning(
+                "=== NUCLEAR GELUKT! Auth succesvol na verse koppeling (%.1fms) ===\n"
+                "  session_key=%s",
+                (time.monotonic() - t_start) * 1000,
+                self._session_key.hex() if self._session_key else "None",
+            )
+            await self._request_status()
+            return True
+
+        _LOGGER.warning(
+            "NUCLEAR: auth pipeline mislukt na verse koppeling (%.1fms)",
+            (time.monotonic() - t_start) * 1000,
+        )
+        return False
+
     async def _do_connect(self) -> bool:
         self._cancel_reconnect()
 
@@ -1429,9 +1659,34 @@ class MelittaDevice:
                     enc_ok = await self._dbus_force_encryption()
                     if enc_ok:
                         _LOGGER.warning(
-                            "BLE PAIR: encryption activated on existing bond (total=%.1fms)",
+                            "BLE PAIR: encryption activated on existing bond (total=%.1fms) - testing CCCD write...",
                             (time.monotonic() - t_pair_start) * 1000,
                         )
+                        cccd_test_result = await self._dbus_test_cccd_write()
+                        if cccd_test_result is True:
+                            _LOGGER.warning(
+                                "BLE PAIR: CCCD test PASSED - bestaande bond werkt! (total=%.1fms)",
+                                (time.monotonic() - t_pair_start) * 1000,
+                            )
+                        elif cccd_test_result is False:
+                            _LOGGER.warning(
+                                "=== STALE BOND GEDETECTEERD ===\n"
+                                "  Pair() zegt AlreadyExists maar CCCD schrijven mislukt.\n"
+                                "  De oude koppeling is kapot (versleutelingssleutels kloppen niet meer).\n"
+                                "  Oplossing: oude bond verwijderen en vers koppelen.\n"
+                                "  >>> DIRECT naar RemoveDevice (pipeline overslaan) <<<",
+                            )
+                            nuclear_ok = await self._nuclear_remove_and_repair(t_pair_start)
+                            if nuclear_ok and self._authenticated:
+                                self._notify_callbacks()
+                                return True
+                            elif not nuclear_ok:
+                                _LOGGER.warning("STALE BOND FIX: mislukt - ga door met normale pipeline als laatste kans")
+                        else:
+                            _LOGGER.warning(
+                                "BLE PAIR: CCCD test onbepaald (total=%.1fms) - ga door met normale pipeline",
+                                (time.monotonic() - t_pair_start) * 1000,
+                            )
                     else:
                         _LOGGER.warning(
                             "BLE PAIR: Pair() on bonded device failed - trying disconnect+reconnect as fallback"
@@ -1554,79 +1809,10 @@ class MelittaDevice:
                     "  Also rotated RC4 key to: %s",
                     self._address, new_key_name or "(no more keys)",
                 )
-                self._status = "re_pairing"
-                self._last_error = "Auth mislukt met bestaand bond. Oud bond verwijderen en opnieuw koppelen..."
-                self._notify_callbacks()
-
-                await self._internal_disconnect()
-                await asyncio.sleep(0.5)
-
-                removed = await self._dbus_remove_device()
-                if removed:
-                    _LOGGER.warning("NUCLEAR: old bond removed. Waiting 2s then fresh pair+connect...")
-                    await asyncio.sleep(2.0)
-
-                    ble_device = await self._get_ble_device()
-                    if ble_device is None:
-                        _LOGGER.warning("NUCLEAR: device not found after RemoveDevice")
-                        self._status = "offline"
-                        self._last_error = "Apparaat niet gevonden na verwijderen bond"
-                        self._notify_callbacks()
-                        return False
-
-                    try:
-                        await self._establish_ble_connection(ble_device)
-                        self._is_connected = True
-                        _LOGGER.warning("NUCLEAR: reconnected after RemoveDevice")
-                    except Exception as err:
-                        _LOGGER.warning("NUCLEAR: reconnect failed: %s", err)
-                        self._status = "offline"
-                        self._last_error = f"Herverbinding mislukt: {err}"
-                        self._notify_callbacks()
-                        return False
-
-                    await asyncio.sleep(0.5)
-
-                    pair_ok = await self._dbus_pair_device()
-                    if pair_ok:
-                        _LOGGER.warning("NUCLEAR: fresh Pair() succeeded! Disconnect+reconnect for encrypted link...")
-                        self._suppress_disconnect_callback = True
-                        try:
-                            await self._internal_disconnect()
-                        except Exception:
-                            pass
-                        self._suppress_disconnect_callback = False
-                        await asyncio.sleep(1.0)
-
-                        reconnected = await self._internal_reconnect_ble()
-                        if not reconnected:
-                            await asyncio.sleep(2.0)
-                            reconnected = await self._internal_reconnect_ble()
-
-                        if reconnected:
-                            _LOGGER.warning("NUCLEAR: reconnected with fresh bond. Retrying auth...")
-                            self._status = "authenticating"
-                            self._notify_callbacks()
-
-                            pipeline_ok = await self._fast_pipeline_cccd_and_auth()
-                            if pipeline_ok and self._authenticated:
-                                self._status = "ready"
-                                self._start_keepalive()
-                                _LOGGER.warning(
-                                    "NUCLEAR: AUTH SUCCEEDED after fresh pair! session_key=%s",
-                                    self._session_key.hex() if self._session_key else "None",
-                                )
-                                await self._request_status()
-                                self._notify_callbacks()
-                                return True
-                            else:
-                                _LOGGER.warning("NUCLEAR: auth still failed after fresh pair")
-                        else:
-                            _LOGGER.warning("NUCLEAR: reconnect after fresh pair failed")
-                    else:
-                        _LOGGER.warning("NUCLEAR: fresh Pair() failed")
-                else:
-                    _LOGGER.warning("NUCLEAR: RemoveDevice failed - old bond could not be cleared")
+                nuclear_ok = await self._nuclear_remove_and_repair()
+                if nuclear_ok and self._authenticated:
+                    self._notify_callbacks()
+                    return True
 
                 self._auth_failure_count += 1
                 self._status = "connected_not_auth"
