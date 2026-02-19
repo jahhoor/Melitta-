@@ -43,6 +43,8 @@ class MelittaDevice:
         self._auth_got_frame = False
         self._auth_disconnect_reason: str | None = None
         self._pipeline_auth_write_time: float | None = None
+        self._cccd_test_notifications_active = False
+        self._cccd_test_char_path: str | None = None
         self._authenticated = False
         self._is_connected = False
         self._shutting_down = False
@@ -1427,24 +1429,26 @@ class MelittaDevice:
                         if val is True:
                             notifying = True
                             _LOGGER.warning(
-                                "CCCD TEST: Notifying=True na poll %d (%.1fms) - bond werkt!",
+                                "CCCD TEST: Notifying=True na poll %d (%.1fms) - bond werkt!\n"
+                                "  Notifications ACTIEF GEHOUDEN (geen StopNotify) voor directe auth.",
                                 poll_i + 1, (time.monotonic() - t_test) * 1000,
                             )
                             break
                     _LOGGER.debug("CCCD TEST: poll %d - Notifying nog niet True", poll_i + 1)
 
-                try:
-                    await bus.call(Message(
-                        destination="org.bluez", path=read_char_path,
-                        interface="org.bluez.GattCharacteristic1",
-                        member="StopNotify",
-                    ))
-                except Exception:
-                    pass
-
                 if notifying:
+                    self._cccd_test_notifications_active = True
+                    self._cccd_test_char_path = read_char_path
                     return True
                 else:
+                    try:
+                        await bus.call(Message(
+                            destination="org.bluez", path=read_char_path,
+                            interface="org.bluez.GattCharacteristic1",
+                            member="StopNotify",
+                        ))
+                    except Exception:
+                        pass
                     _LOGGER.warning(
                         "CCCD TEST: StartNotify OK maar Notifying bleef False na 5 polls (%.1fms) - STALE BOND!\n"
                         "  BlueZ accepteert het commando maar de machine reageert niet.\n"
@@ -1567,11 +1571,32 @@ class MelittaDevice:
             self._notify_callbacks()
             return False
 
+        t_reconn_done = time.monotonic()
         _LOGGER.warning(
-            "NUCLEAR: herverbonden met verse bond (%.1fms). Versleuteling activeren...",
-            (time.monotonic() - t_start) * 1000,
+            "NUCLEAR: herverbonden met verse bond (%.1fms). Versleuteling ONMIDDELLIJK activeren...",
+            (t_reconn_done - t_start) * 1000,
         )
         await self._dbus_force_encryption()
+
+        if not self._is_connected:
+            _LOGGER.warning(
+                "NUCLEAR: machine verbroken na reconnect (%.1fms) - opnieuw verbinden...",
+                (time.monotonic() - t_reconn_done) * 1000,
+            )
+            await asyncio.sleep(0.5)
+            reconnected = await self._internal_reconnect_ble()
+            if not reconnected:
+                await asyncio.sleep(1.0)
+                reconnected = await self._internal_reconnect_ble()
+            if reconnected:
+                _LOGGER.warning("NUCLEAR: 2e reconnect OK - versleuteling opnieuw activeren...")
+                await self._dbus_force_encryption()
+            else:
+                _LOGGER.warning("NUCLEAR: 2e reconnect MISLUKT")
+                self._status = "offline"
+                self._last_error = "Herverbinding mislukt na verse koppeling (2e poging)"
+                self._notify_callbacks()
+                return False
 
         _LOGGER.warning(
             "NUCLEAR: starten auth pipeline (%.1fms sinds start)...",
@@ -1662,10 +1687,13 @@ class MelittaDevice:
                             "BLE PAIR: encryption activated on existing bond (total=%.1fms) - testing CCCD write...",
                             (time.monotonic() - t_pair_start) * 1000,
                         )
+                        self._cccd_test_notifications_active = False
+                        self._cccd_test_char_path = None
                         cccd_test_result = await self._dbus_test_cccd_write()
                         if cccd_test_result is True:
                             _LOGGER.warning(
-                                "BLE PAIR: CCCD test PASSED - bestaande bond werkt! (total=%.1fms)",
+                                "BLE PAIR: CCCD test PASSED - bestaande bond werkt! (total=%.1fms)\n"
+                                "  Notifications zijn actief - ga DIRECT naar auth (skip pipeline CCCD setup).",
                                 (time.monotonic() - t_pair_start) * 1000,
                             )
                         elif cccd_test_result is False:
@@ -1747,11 +1775,34 @@ class MelittaDevice:
                         if not reconnected:
                             _LOGGER.warning("BLE PAIR: reconnect after pairing FAILED")
                             return False
+
+                        t_reconn_done = time.monotonic()
                         _LOGGER.warning(
-                            "BLE PAIR: reconnected after fresh pairing (total=%.1fms) - forcing encryption...",
-                            (time.monotonic() - t_pair_start) * 1000,
+                            "BLE PAIR: reconnected after fresh pairing (%.1fms) - forcing encryption IMMEDIATELY...",
+                            (t_reconn_done - t_pair_start) * 1000,
                         )
                         await self._dbus_force_encryption()
+
+                        if not self._is_connected:
+                            _LOGGER.warning(
+                                "BLE PAIR: machine disconnected after post-pair reconnect (%.1fms).\n"
+                                "  Dit is normaal - machine eist versleuteling. Opnieuw verbinden...",
+                                (time.monotonic() - t_reconn_done) * 1000,
+                            )
+                            await asyncio.sleep(0.5)
+                            reconnected = await self._internal_reconnect_ble()
+                            if not reconnected:
+                                await asyncio.sleep(1.0)
+                                reconnected = await self._internal_reconnect_ble()
+                            if reconnected:
+                                _LOGGER.warning(
+                                    "BLE PAIR: 2e reconnect OK (%.1fms) - forcing encryption again...",
+                                    (time.monotonic() - t_pair_start) * 1000,
+                                )
+                                await self._dbus_force_encryption()
+                            else:
+                                _LOGGER.warning("BLE PAIR: 2e reconnect na verse pairing MISLUKT")
+                                return False
                     else:
                         _LOGGER.warning(
                             "BLE PAIR: pairing FAILED (%.1fms total).\n"
@@ -2060,12 +2111,20 @@ class MelittaDevice:
         t_pipeline_start = time.monotonic()
         self._dbus_empty_count = 0
         self._empty_poll_count = 0
+
+        cccd_from_test = self._cccd_test_notifications_active
+        cccd_test_path = self._cccd_test_char_path
+        self._cccd_test_notifications_active = False
+        self._cccd_test_char_path = None
+
         _LOGGER.warning(
             "=== FAST PIPELINE: CCCD + AUTH in one atomic operation ===\n"
             "  Strategy: Register D-Bus handler FIRST, then write CCCD + auth\n"
             "  within the machine's ~370ms disconnect window.\n"
+            "  cccd_from_test=%s (notifications al actief van CCCD test)\n"
             "  3 pipeline attempts with different CCCD methods.\n"
-            "  TIMER START: t=0ms"
+            "  TIMER START: t=0ms",
+            cccd_from_test,
         )
 
         if not self._client or not self._is_connected:
@@ -2073,6 +2132,8 @@ class MelittaDevice:
             return False
 
         read_char_path = await self._get_char_dbus_path_async(BLE_READ_UUID)
+        if cccd_from_test and cccd_test_path:
+            read_char_path = cccd_test_path
         _LOGGER.warning(
             "FAST PIPELINE: char_path lookup took %.1fms, path=%s",
             (time.monotonic() - t_pipeline_start) * 1000, read_char_path,
@@ -2092,15 +2153,35 @@ class MelittaDevice:
                 self._notifications_active = True
                 self._notify_mode = "dbus_handler_only"
 
-                t_start_notify = time.monotonic()
-                sn_ok = await self._dbus_start_notify_on_char(read_char_path)
-                t_sn_done = time.monotonic()
+                if cccd_from_test:
+                    still_notifying = await self._dbus_check_notifying(read_char_path)
+                    if still_notifying:
+                        _LOGGER.warning(
+                            "FAST PIPELINE: CCCD al actief van CCCD test - SKIP StartNotify!\n"
+                            "  Notifying=True bevestigd. Direct door naar auth.",
+                        )
+                        cccd_confirmed = True
+                        sn_ok = True
+                        sn_ok_but_not_notifying = False
+                    else:
+                        _LOGGER.warning(
+                            "FAST PIPELINE: CCCD test had notifications actief maar Notifying=False nu!\n"
+                            "  Notifications verloren (disconnect?). Terugvallen op normale StartNotify.",
+                        )
+                        cccd_from_test = False
 
-                notifying = await self._dbus_check_notifying(read_char_path)
-                cccd_confirmed = notifying
-                sn_ok_but_not_notifying = sn_ok and not notifying
+                if not cccd_from_test:
+                    t_start_notify = time.monotonic()
+                    sn_ok = await self._dbus_start_notify_on_char(read_char_path)
+                    t_sn_done = time.monotonic()
 
-                if sn_ok and notifying:
+                    notifying = await self._dbus_check_notifying(read_char_path)
+                    cccd_confirmed = notifying
+                    sn_ok_but_not_notifying = sn_ok and not notifying
+
+                if cccd_from_test:
+                    pass
+                elif sn_ok and cccd_confirmed:
                     _LOGGER.warning(
                         "FAST PIPELINE: D-Bus StartNotify OK (%.1fms) - CCCD CONFIRMED! Notifying=True",
                         (t_sn_done - t_start_notify) * 1000,
@@ -2112,7 +2193,7 @@ class MelittaDevice:
                         "  Also attempting auth in case machine accepts anyway.",
                         (t_sn_done - t_start_notify) * 1000,
                     )
-                elif notifying:
+                elif cccd_confirmed:
                     _LOGGER.warning(
                         "FAST PIPELINE: D-Bus StartNotify failed (%.1fms) but Notifying=True - CCCD already active!",
                         (t_sn_done - t_start_notify) * 1000,
@@ -2124,7 +2205,7 @@ class MelittaDevice:
                         (t_sn_done - t_start_notify) * 1000,
                     )
 
-                if self._is_connected and self._client is not None:
+                if not cccd_from_test and self._is_connected and self._client is not None:
                     try:
                         t_bleak_sn = time.monotonic()
                         await asyncio.wait_for(
@@ -2141,14 +2222,24 @@ class MelittaDevice:
                             "FAST PIPELINE: bleak start_notify() failed (%.1fms): %s - continuing with D-Bus only",
                             (time.monotonic() - t_bleak_sn) * 1000, bleak_sn_err,
                         )
+                elif cccd_from_test:
+                    _LOGGER.warning(
+                        "FAST PIPELINE: bleak start_notify() OVERGESLAGEN (CCCD test notifications actief, voorkom 'Notify acquired' fout)",
+                    )
 
                 if (cccd_confirmed or sn_ok_but_not_notifying) and self._is_connected and self._client is not None:
+                    self._auth_event.clear()
+                    self._auth_got_frame = False
+                    self._auth_disconnect_reason = None
+                    self._authenticated = False
+
                     auth_payload = self._build_auth_payload()
                     auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
 
                     t_auth_w = time.monotonic()
                     _LOGGER.warning(
-                        "FAST PIPELINE: D-Bus path - writing auth immediately (t=%.1fms since pipeline start)...",
+                        "FAST PIPELINE: D-Bus path - writing auth immediately (t=%.1fms since pipeline start)...\n"
+                        "  auth_event CLEARED before write.",
                         (t_auth_w - t_pipeline_start) * 1000,
                     )
                     self._pipeline_auth_write_time = t_auth_w
@@ -2207,11 +2298,17 @@ class MelittaDevice:
                             except Exception as pt_err:
                                 _LOGGER.warning("FAST PIPELINE: D-Bus path plaintext auth error: %s", pt_err)
 
-                        new_key_name = rotate_rc4_key()
-                        if new_key_name:
+                        if self._auth_got_frame:
+                            new_key_name = rotate_rc4_key()
+                            if new_key_name:
+                                _LOGGER.warning(
+                                    "FAST PIPELINE: D-Bus path auth got frame but failed - ROTATING RC4 KEY to '%s'",
+                                    new_key_name,
+                                )
+                        else:
                             _LOGGER.warning(
-                                "FAST PIPELINE: D-Bus path auth failed - ROTATING RC4 KEY to '%s' for next attempt",
-                                new_key_name,
+                                "FAST PIPELINE: D-Bus path auth: geen frame ontvangen (event was pre-set of disconnect).\n"
+                                "  RC4 key NIET geroteerd (probleem is CCCD/timing, niet de sleutel).",
                             )
                         _LOGGER.warning(
                             "FAST PIPELINE: D-Bus path auth failed (got_frame=%s, connected=%s). Falling through to pipeline methods.",
