@@ -1103,6 +1103,55 @@ class MelittaDevice:
         except Exception:
             return False
 
+    async def _dbus_verify_link_status(self):
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType, Variant
+
+            mac_path = self._address.replace(":", "_").upper()
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                device_path = f"/org/bluez/hci0/dev_{mac_path}"
+                props_to_check = ["Paired", "Bonded", "Connected", "Trusted", "ServicesResolved"]
+                results = {}
+                for prop in props_to_check:
+                    try:
+                        reply = await asyncio.wait_for(
+                            bus.call(Message(
+                                destination="org.bluez", path=device_path,
+                                interface="org.freedesktop.DBus.Properties",
+                                member="Get", signature="ss",
+                                body=["org.bluez.Device1", prop],
+                            )),
+                            timeout=2.0,
+                        )
+                        if reply.message_type == MessageType.ERROR:
+                            results[prop] = f"ERROR:{reply.error_name}"
+                        else:
+                            val = reply.body[0] if reply.body else None
+                            if isinstance(val, Variant):
+                                val = val.value
+                            results[prop] = val
+                    except Exception as e:
+                        results[prop] = f"EXCEPTION:{e}"
+
+                _LOGGER.warning(
+                    "BLE LINK STATUS after reconnect:\n"
+                    "  device_path=%s\n"
+                    "  Paired=%s, Bonded=%s, Connected=%s\n"
+                    "  Trusted=%s, ServicesResolved=%s",
+                    device_path,
+                    results.get("Paired"), results.get("Bonded"), results.get("Connected"),
+                    results.get("Trusted"), results.get("ServicesResolved"),
+                )
+            finally:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+        except Exception as err:
+            _LOGGER.warning("BLE LINK STATUS check failed: %s", err)
+
     async def _test_ble_write(self) -> bool:
         if not self._client or not self._is_connected:
             return False
@@ -1187,11 +1236,11 @@ class MelittaDevice:
                     except Exception:
                         pass
                     self._suppress_disconnect_callback = False
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.3)
 
                     reconnected = await self._internal_reconnect_ble()
                     if not reconnected:
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(1.0)
                         reconnected = await self._internal_reconnect_ble()
                     if not reconnected:
                         _LOGGER.warning(
@@ -1222,11 +1271,16 @@ class MelittaDevice:
                         except Exception:
                             pass
                         self._suppress_disconnect_callback = False
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(0.3)
+                        t_reconn_start = time.monotonic()
 
                         reconnected = await self._internal_reconnect_ble()
                         if not reconnected:
-                            await asyncio.sleep(2.0)
+                            _LOGGER.warning(
+                                "BLE PAIR: first reconnect failed (%.1fms) - waiting 1s and retrying...",
+                                (time.monotonic() - t_reconn_start) * 1000,
+                            )
+                            await asyncio.sleep(1.0)
                             reconnected = await self._internal_reconnect_ble()
                         if not reconnected:
                             _LOGGER.warning("BLE PAIR: reconnect after pairing FAILED")
@@ -1235,6 +1289,51 @@ class MelittaDevice:
                             "BLE PAIR: reconnected with encrypted link (total=%.1fms)",
                             (time.monotonic() - t_pair_start) * 1000,
                         )
+                        await self._dbus_verify_link_status()
+                        if self._client and self._is_connected:
+                            try:
+                                test_data = await asyncio.wait_for(
+                                    self._client.read_gatt_char(BLE_READ_UUID),
+                                    timeout=3.0,
+                                )
+                                _LOGGER.warning(
+                                    "BLE PAIR: post-reconnect GATT read test: %d bytes, hex=%s\n"
+                                    "  %s",
+                                    len(test_data) if test_data else 0,
+                                    test_data.hex() if test_data else "None",
+                                    "DATA OK - encrypted link is working!" if test_data and len(test_data) > 0 else
+                                    "EMPTY DATA - encrypted link may NOT be active! Will attempt security upgrade...",
+                                )
+                                if not test_data or len(test_data) == 0:
+                                    _LOGGER.warning(
+                                        "BLE PAIR: Attempting response=True write to trigger security upgrade..."
+                                    )
+                                    try:
+                                        test_frame = build_frame(CMD_KEEPALIVE, None, b"", encrypt=False)
+                                        await asyncio.wait_for(
+                                            self._client.write_gatt_char(BLE_WRITE_UUID, test_frame, response=True),
+                                            timeout=3.0,
+                                        )
+                                        _LOGGER.warning("BLE PAIR: response=True write OK - retesting read...")
+                                        test_data2 = await asyncio.wait_for(
+                                            self._client.read_gatt_char(BLE_READ_UUID),
+                                            timeout=3.0,
+                                        )
+                                        _LOGGER.warning(
+                                            "BLE PAIR: post-security-upgrade read: %d bytes, hex=%s",
+                                            len(test_data2) if test_data2 else 0,
+                                            test_data2.hex() if test_data2 else "None",
+                                        )
+                                    except Exception as sec_err:
+                                        _LOGGER.warning(
+                                            "BLE PAIR: security upgrade attempt error: %s (%s)",
+                                            sec_err, type(sec_err).__name__,
+                                        )
+                            except Exception as read_err:
+                                _LOGGER.warning(
+                                    "BLE PAIR: post-reconnect GATT read error: %s (%s)",
+                                    read_err, type(read_err).__name__,
+                                )
                     else:
                         _LOGGER.warning(
                             "BLE PAIR: pairing FAILED (%.1fms total).\n"
@@ -1591,6 +1690,8 @@ class MelittaDevice:
 
     async def _fast_pipeline_cccd_and_auth(self) -> bool:
         t_pipeline_start = time.monotonic()
+        self._dbus_empty_count = 0
+        self._empty_poll_count = 0
         _LOGGER.warning(
             "=== FAST PIPELINE: CCCD + AUTH in one atomic operation ===\n"
             "  Strategy: Register D-Bus handler FIRST, then write CCCD + auth\n"
@@ -1654,6 +1755,24 @@ class MelittaDevice:
                         "  CCCD NOT confirmed. Skipping D-Bus auth path, will use pipeline methods.",
                         (t_sn_done - t_start_notify) * 1000,
                     )
+
+                if self._is_connected and self._client is not None:
+                    try:
+                        t_bleak_sn = time.monotonic()
+                        await asyncio.wait_for(
+                            self._client.start_notify(BLE_READ_UUID, self._on_notification),
+                            timeout=3.0,
+                        )
+                        _LOGGER.warning(
+                            "FAST PIPELINE: bleak start_notify() ALSO registered (%.1fms) - dual notification channel active",
+                            (time.monotonic() - t_bleak_sn) * 1000,
+                        )
+                        self._notify_mode = "dbus_handler+bleak_callback"
+                    except Exception as bleak_sn_err:
+                        _LOGGER.warning(
+                            "FAST PIPELINE: bleak start_notify() failed (%.1fms): %s - continuing with D-Bus only",
+                            (time.monotonic() - t_bleak_sn) * 1000, bleak_sn_err,
+                        )
 
                 if (cccd_confirmed or sn_ok_but_not_notifying) and self._is_connected and self._client is not None:
                     auth_payload = self._build_auth_payload()
@@ -2128,6 +2247,16 @@ class MelittaDevice:
                             attempt, i + 1, (time.monotonic() - t_wait_start) * 1000,
                         )
                         return True
+                elif data is not None and len(data) == 0:
+                    empty_poll_count = getattr(self, '_empty_poll_count', 0) + 1
+                    self._empty_poll_count = empty_poll_count
+                    if empty_poll_count <= 3 or empty_poll_count % 30 == 0:
+                        _LOGGER.warning(
+                            "FAST PIPELINE %d WAIT [#%d/%.0f]: bleak read returned EMPTY bytes (#%d) (%.1fms elapsed)\n"
+                            "  type=%s, repr=%s",
+                            attempt, i + 1, max_polls, empty_poll_count, wait_elapsed_ms,
+                            type(data).__name__, repr(data)[:100],
+                        )
                 elif i < 3 or i % 20 == 0:
                     _LOGGER.warning(
                         "FAST PIPELINE %d WAIT [#%d/%.0f]: still waiting... (%.1fms elapsed, connected=%s, same_data=%s)",
@@ -2760,12 +2889,53 @@ class MelittaDevice:
                     )
                     return
 
-                value = changed["Value"]
+                raw_value = changed["Value"]
+                value_type_name = type(raw_value).__name__
+                value_repr = repr(raw_value)[:200]
+
+                value = raw_value
+                if hasattr(value, 'type'):
+                    variant_sig = value.type
+                else:
+                    variant_sig = "no_type_attr"
                 if hasattr(value, 'value'):
                     value = value.value
-                data = bytes(value)
+                    inner_type = type(value).__name__
+                    inner_repr = repr(value)[:200]
+                else:
+                    inner_type = "no_unwrap"
+                    inner_repr = "N/A"
+
+                try:
+                    data = bytes(value)
+                except Exception as conv_err:
+                    _LOGGER.warning(
+                        "D-Bus PropertiesChanged: CANNOT convert Value to bytes!\n"
+                        "  type=%s, variant_sig=%s, inner_type=%s\n"
+                        "  value_repr=%s, inner_repr=%s\n"
+                        "  error=%s, path=%s",
+                        value_type_name, variant_sig, inner_type,
+                        value_repr, inner_repr, conv_err, msg_path,
+                    )
+                    return
+
                 if len(data) == 0:
-                    _LOGGER.warning("D-Bus PropertiesChanged: empty Value data, path=%s", msg_path)
+                    empty_count = getattr(self, '_dbus_empty_count', 0) + 1
+                    self._dbus_empty_count = empty_count
+                    if empty_count <= 3 or empty_count % 50 == 0:
+                        body_2_keys = list(msg.body[2]) if len(msg.body) > 2 and msg.body[2] else []
+                        _LOGGER.warning(
+                            "D-Bus PropertiesChanged: EMPTY Value data (#%d), path=%s\n"
+                            "  outer_type=%s, variant_sig=%s, inner_type=%s\n"
+                            "  outer_repr=%s\n"
+                            "  inner_repr=%s\n"
+                            "  invalidated_props=%s\n"
+                            "  full_body_types=[%s]",
+                            empty_count, msg_path,
+                            value_type_name, variant_sig, inner_type,
+                            value_repr, inner_repr, body_2_keys,
+                            ", ".join(type(b).__name__ for b in msg.body),
+                        )
                     return
 
                 latency_from_auth = ""
