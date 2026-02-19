@@ -1152,6 +1152,154 @@ class MelittaDevice:
         except Exception as err:
             _LOGGER.warning("BLE LINK STATUS check failed: %s", err)
 
+    async def _dbus_force_encryption(self) -> bool:
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import Message, MessageType, BusType, Variant
+
+            mac_path = self._address.replace(":", "_").upper()
+            device_path = f"/org/bluez/hci0/dev_{mac_path}"
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                paired_reply = await asyncio.wait_for(
+                    bus.call(Message(
+                        destination="org.bluez", path=device_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get", signature="ss",
+                        body=["org.bluez.Device1", "Paired"],
+                    )),
+                    timeout=2.0,
+                )
+                is_paired = False
+                if paired_reply.message_type != MessageType.ERROR:
+                    val = paired_reply.body[0] if paired_reply.body else None
+                    if isinstance(val, Variant):
+                        val = val.value
+                    is_paired = bool(val)
+
+                _LOGGER.warning(
+                    "BLE ENCRYPT: forcing encryption on %s (currently Paired=%s)",
+                    device_path, is_paired,
+                )
+
+                t_start = time.monotonic()
+                pair_reply = await asyncio.wait_for(
+                    bus.call(Message(
+                        destination="org.bluez", path=device_path,
+                        interface="org.bluez.Device1",
+                        member="Pair",
+                    )),
+                    timeout=10.0,
+                )
+                elapsed = (time.monotonic() - t_start) * 1000
+
+                if pair_reply.message_type == MessageType.ERROR:
+                    error_name = pair_reply.error_name or ""
+                    error_body = pair_reply.body
+                    if "AlreadyExists" in error_name:
+                        _LOGGER.warning(
+                            "BLE ENCRYPT: Pair() returned AlreadyExists (%.1fms) - bond exists, encryption should be active now",
+                            elapsed,
+                        )
+                        await self._dbus_wait_for_encryption(bus, device_path)
+                        return True
+                    else:
+                        _LOGGER.warning(
+                            "BLE ENCRYPT: Pair() FAILED (%.1fms): %s %s",
+                            elapsed, error_name, error_body,
+                        )
+                        return False
+                else:
+                    _LOGGER.warning(
+                        "BLE ENCRYPT: Pair() OK (%.1fms) - encryption activated!",
+                        elapsed,
+                    )
+                    await self._dbus_wait_for_encryption(bus, device_path)
+                    return True
+            finally:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+        except asyncio.TimeoutError:
+            _LOGGER.warning("BLE ENCRYPT: Pair() timed out (10s)")
+            return False
+        except Exception as err:
+            _LOGGER.warning("BLE ENCRYPT: error: %s (%s)", err, type(err).__name__)
+            return False
+
+    async def _dbus_wait_for_encryption(self, bus, device_path: str, timeout: float = 5.0):
+        from dbus_fast import Message, MessageType, Variant
+
+        t_start = time.monotonic()
+        for i in range(25):
+            elapsed = (time.monotonic() - t_start) * 1000
+            if elapsed > timeout * 1000:
+                _LOGGER.warning(
+                    "BLE ENCRYPT VERIFY: timeout after %.1fms waiting for ServicesResolved",
+                    elapsed,
+                )
+                break
+
+            results = {}
+            for prop in ["Paired", "Connected", "ServicesResolved"]:
+                try:
+                    reply = await asyncio.wait_for(
+                        bus.call(Message(
+                            destination="org.bluez", path=device_path,
+                            interface="org.freedesktop.DBus.Properties",
+                            member="Get", signature="ss",
+                            body=["org.bluez.Device1", prop],
+                        )),
+                        timeout=2.0,
+                    )
+                    if reply.message_type != MessageType.ERROR:
+                        val = reply.body[0] if reply.body else None
+                        if isinstance(val, Variant):
+                            val = val.value
+                        results[prop] = val
+                    else:
+                        results[prop] = f"ERR:{reply.error_name}"
+                except Exception as e:
+                    results[prop] = f"EXC:{e}"
+
+            paired = results.get("Paired")
+            connected = results.get("Connected")
+            resolved = results.get("ServicesResolved")
+
+            _LOGGER.warning(
+                "BLE ENCRYPT VERIFY [%d]: Paired=%s, Connected=%s, ServicesResolved=%s (%.1fms)",
+                i + 1, paired, connected, resolved, elapsed,
+            )
+
+            if paired is True and connected is True and resolved is True:
+                _LOGGER.warning(
+                    "BLE ENCRYPT VERIFY: encryption confirmed! (Paired+Connected+ServicesResolved all True after %.1fms)",
+                    elapsed,
+                )
+
+                if self._client and self._is_connected:
+                    try:
+                        test_data = await asyncio.wait_for(
+                            self._client.read_gatt_char(BLE_READ_UUID),
+                            timeout=3.0,
+                        )
+                        data_len = len(test_data) if test_data else 0
+                        _LOGGER.warning(
+                            "BLE ENCRYPT VERIFY: GATT read test: %d bytes, hex=%s -> %s",
+                            data_len,
+                            test_data.hex() if test_data else "None",
+                            "ENCRYPTED LINK WORKING!" if data_len > 0 else "still empty - encryption may not be sufficient",
+                        )
+                    except Exception as read_err:
+                        _LOGGER.warning(
+                            "BLE ENCRYPT VERIFY: GATT read test error: %s (%s)",
+                            read_err, type(read_err).__name__,
+                        )
+                return
+
+            await asyncio.sleep(0.2)
+
     async def _test_ble_write(self) -> bool:
         if not self._client or not self._is_connected:
             return False
@@ -1227,30 +1375,41 @@ class MelittaDevice:
                 is_already_paired = await self._dbus_check_paired()
                 if is_already_paired:
                     _LOGGER.warning(
-                        "BLE PAIR CHECK: device already paired (%.1fms) - doing disconnect+reconnect to activate encrypted BLE link",
+                        "BLE PAIR CHECK: device already paired (%.1fms) - forcing encryption via D-Bus Pair() on bonded device",
                         (time.monotonic() - t_pair_start) * 1000,
                     )
-                    self._suppress_disconnect_callback = True
-                    try:
-                        await self._internal_disconnect()
-                    except Exception:
-                        pass
-                    self._suppress_disconnect_callback = False
-                    await asyncio.sleep(0.3)
-
-                    reconnected = await self._internal_reconnect_ble()
-                    if not reconnected:
-                        await asyncio.sleep(1.0)
-                        reconnected = await self._internal_reconnect_ble()
-                    if not reconnected:
+                    enc_ok = await self._dbus_force_encryption()
+                    if enc_ok:
                         _LOGGER.warning(
-                            "BLE PAIR: reconnect after existing bond FAILED - trying without reconnect"
+                            "BLE PAIR: encryption activated on existing bond (total=%.1fms)",
+                            (time.monotonic() - t_pair_start) * 1000,
                         )
                     else:
                         _LOGGER.warning(
-                            "BLE PAIR: reconnected with encrypted link after existing bond (total=%.1fms)",
-                            (time.monotonic() - t_pair_start) * 1000,
+                            "BLE PAIR: Pair() on bonded device failed - trying disconnect+reconnect as fallback"
                         )
+                        self._suppress_disconnect_callback = True
+                        try:
+                            await self._internal_disconnect()
+                        except Exception:
+                            pass
+                        self._suppress_disconnect_callback = False
+                        await asyncio.sleep(0.3)
+
+                        reconnected = await self._internal_reconnect_ble()
+                        if not reconnected:
+                            await asyncio.sleep(1.0)
+                            reconnected = await self._internal_reconnect_ble()
+                        if not reconnected:
+                            _LOGGER.warning(
+                                "BLE PAIR: reconnect after existing bond FAILED - trying without reconnect"
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "BLE PAIR: reconnected after existing bond (total=%.1fms) - forcing encryption again...",
+                                (time.monotonic() - t_pair_start) * 1000,
+                            )
+                            await self._dbus_force_encryption()
                 else:
                     _LOGGER.warning(
                         "BLE PAIR CHECK: device NOT paired (%.1fms) - initiating pairing...\n"
@@ -1286,54 +1445,10 @@ class MelittaDevice:
                             _LOGGER.warning("BLE PAIR: reconnect after pairing FAILED")
                             return False
                         _LOGGER.warning(
-                            "BLE PAIR: reconnected with encrypted link (total=%.1fms)",
+                            "BLE PAIR: reconnected after fresh pairing (total=%.1fms) - forcing encryption...",
                             (time.monotonic() - t_pair_start) * 1000,
                         )
-                        await self._dbus_verify_link_status()
-                        if self._client and self._is_connected:
-                            try:
-                                test_data = await asyncio.wait_for(
-                                    self._client.read_gatt_char(BLE_READ_UUID),
-                                    timeout=3.0,
-                                )
-                                _LOGGER.warning(
-                                    "BLE PAIR: post-reconnect GATT read test: %d bytes, hex=%s\n"
-                                    "  %s",
-                                    len(test_data) if test_data else 0,
-                                    test_data.hex() if test_data else "None",
-                                    "DATA OK - encrypted link is working!" if test_data and len(test_data) > 0 else
-                                    "EMPTY DATA - encrypted link may NOT be active! Will attempt security upgrade...",
-                                )
-                                if not test_data or len(test_data) == 0:
-                                    _LOGGER.warning(
-                                        "BLE PAIR: Attempting response=True write to trigger security upgrade..."
-                                    )
-                                    try:
-                                        test_frame = build_frame(CMD_KEEPALIVE, None, b"", encrypt=False)
-                                        await asyncio.wait_for(
-                                            self._client.write_gatt_char(BLE_WRITE_UUID, test_frame, response=True),
-                                            timeout=3.0,
-                                        )
-                                        _LOGGER.warning("BLE PAIR: response=True write OK - retesting read...")
-                                        test_data2 = await asyncio.wait_for(
-                                            self._client.read_gatt_char(BLE_READ_UUID),
-                                            timeout=3.0,
-                                        )
-                                        _LOGGER.warning(
-                                            "BLE PAIR: post-security-upgrade read: %d bytes, hex=%s",
-                                            len(test_data2) if test_data2 else 0,
-                                            test_data2.hex() if test_data2 else "None",
-                                        )
-                                    except Exception as sec_err:
-                                        _LOGGER.warning(
-                                            "BLE PAIR: security upgrade attempt error: %s (%s)",
-                                            sec_err, type(sec_err).__name__,
-                                        )
-                            except Exception as read_err:
-                                _LOGGER.warning(
-                                    "BLE PAIR: post-reconnect GATT read error: %s (%s)",
-                                    read_err, type(read_err).__name__,
-                                )
+                        await self._dbus_force_encryption()
                     else:
                         _LOGGER.warning(
                             "BLE PAIR: pairing FAILED (%.1fms total).\n"
@@ -2019,12 +2134,62 @@ class MelittaDevice:
                             )
                     except (EOFError, OSError, BleakError) as cccd_err:
                         t_cccd_done = time.monotonic()
+                        err_str = str(cccd_err)
                         _LOGGER.warning(
-                            "FAST PIPELINE %d: CCCD write error after %.1fms: %s (%s). Trying auth anyway...",
+                            "FAST PIPELINE %d: CCCD write error after %.1fms: %s (%s)",
                             p_attempt, (t_cccd_done - t_cccd_start) * 1000,
                             cccd_err, type(cccd_err).__name__,
                         )
-                        cccd_ok = True
+                        if "NotPermitted" in err_str or "Write not permitted" in err_str:
+                            _LOGGER.warning(
+                                "FAST PIPELINE %d: 'Write not permitted' = LINK NOT ENCRYPTED! Forcing encryption via Pair()...",
+                                p_attempt,
+                            )
+                            enc_ok = await self._dbus_force_encryption()
+                            if enc_ok and self._is_connected:
+                                _LOGGER.warning(
+                                    "FAST PIPELINE %d: encryption forced OK - retrying CCCD descriptor write...",
+                                    p_attempt,
+                                )
+                                try:
+                                    if read_char and read_char.descriptors:
+                                        cccd_desc = None
+                                        for d in read_char.descriptors:
+                                            if str(d.uuid) == "00002902-0000-1000-8000-00805f9b34fb":
+                                                cccd_desc = d
+                                                break
+                                        if cccd_desc:
+                                            await asyncio.wait_for(
+                                                self._client.write_gatt_descriptor(cccd_desc.handle, b"\x01\x00"),
+                                                timeout=3.0,
+                                            )
+                                            _LOGGER.warning(
+                                                "FAST PIPELINE %d: CCCD retry after encryption: SUCCEEDED!",
+                                                p_attempt,
+                                            )
+                                            cccd_ok = True
+                                        else:
+                                            cccd_ok = True
+                                    else:
+                                        cccd_ok = True
+                                except Exception as retry_err:
+                                    _LOGGER.warning(
+                                        "FAST PIPELINE %d: CCCD retry after encryption failed: %s",
+                                        p_attempt, retry_err,
+                                    )
+                                    cccd_ok = True
+                            else:
+                                _LOGGER.warning(
+                                    "FAST PIPELINE %d: encryption force failed - trying auth anyway...",
+                                    p_attempt,
+                                )
+                                cccd_ok = True
+                        else:
+                            _LOGGER.warning(
+                                "FAST PIPELINE %d: non-permission CCCD error - trying auth anyway...",
+                                p_attempt,
+                            )
+                            cccd_ok = True
 
                 elif method == "auth_only_no_cccd":
                     _LOGGER.warning(
