@@ -27,7 +27,7 @@ DISCONNECT_TIMEOUT = 10.0
 BLE_SETTLE_DELAY = 0.3
 RECONNECT_BASE_DELAY = 10.0
 RECONNECT_MAX_DELAY = 300.0
-RECONNECT_MAX_ATTEMPTS = 0
+RECONNECT_MAX_ATTEMPTS = 3
 
 
 class MelittaDevice:
@@ -59,6 +59,8 @@ class MelittaDevice:
         self._last_error: str | None = None
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = RECONNECT_MAX_ATTEMPTS
+        self._auth_failure_count = 0
+        self._gave_up = False
         self._disconnect_in_progress = False
         self._suppress_disconnect_callback = False
         self._cccd_recovery_in_progress = False
@@ -220,7 +222,13 @@ class MelittaDevice:
             )
             self._notify_callbacks()
 
-            if not self._shutting_down:
+            if self._gave_up:
+                _LOGGER.warning(
+                    "NOT scheduling reconnect because gave_up=True for %s "
+                    "(auth failed %d times, reload integration to retry)",
+                    self._address, self._auth_failure_count,
+                )
+            elif not self._shutting_down:
                 self.schedule_reconnect(fast=use_fast_reconnect)
             else:
                 _LOGGER.warning(
@@ -239,6 +247,32 @@ class MelittaDevice:
         if self._shutting_down:
             return
         if self._is_connected and self._authenticated:
+            return
+        if self._gave_up:
+            _LOGGER.warning(
+                "Reconnect BLOCKED for %s - max pogingen bereikt (%d). "
+                "Herlaad de integratie om opnieuw te proberen.",
+                self._address, self._max_reconnect_attempts,
+            )
+            return
+        if self._max_reconnect_attempts > 0 and self._auth_failure_count >= self._max_reconnect_attempts:
+            self._gave_up = True
+            self._status = "offline"
+            self._last_error = (
+                f"Verbinding gestopt na {self._auth_failure_count} mislukte pogingen. "
+                "De koppelingsmodus (60 sec) is waarschijnlijk verlopen. "
+                "Druk opnieuw op 'Verbinden' op de machine en herlaad de integratie."
+            )
+            _LOGGER.warning(
+                "=== RECONNECT STOPPED for %s ===\n"
+                "  Auth failures: %d/%d - giving up.\n"
+                "  Machine koppelingsmodus is waarschijnlijk verlopen.\n"
+                "  Herlaad de integratie om opnieuw te proberen.",
+                self._address, self._auth_failure_count, self._max_reconnect_attempts,
+            )
+            self._cancel_reconnect()
+            self._stop_polling()
+            self._notify_callbacks()
             return
         if self._connect_pending or self._connect_lock.locked():
             _LOGGER.debug("Connect already in progress for %s, skipping schedule", self._address)
@@ -270,8 +304,10 @@ class MelittaDevice:
             )
         self._reconnect_attempts += 1
         _LOGGER.info(
-            "Scheduling reconnect to %s in %.0fs (attempt %d)",
+            "Scheduling reconnect to %s in %.0fs (attempt %d/%d, auth_failures=%d/%d)",
             self._address, delay, self._reconnect_attempts,
+            self._max_reconnect_attempts if self._max_reconnect_attempts > 0 else 999,
+            self._auth_failure_count, self._max_reconnect_attempts,
         )
         self._status = "waiting_reconnect"
         self._last_error = f"Opnieuw verbinden over {int(delay)} seconden... (poging {self._reconnect_attempts})"
@@ -288,21 +324,21 @@ class MelittaDevice:
     async def _reconnect_after_delay(self, delay: float):
         try:
             await asyncio.sleep(delay)
-            if self._shutting_down or (self._is_connected and self._authenticated):
+            if self._shutting_down or self._gave_up or (self._is_connected and self._authenticated):
                 return
             import time
             self._last_reconnect_time = time.monotonic()
             _LOGGER.info("Attempting reconnect to %s (attempt %d)...", self._address, self._reconnect_attempts)
             self._reconnect_task = None
             success = await self.connect()
-            if not success and not self._shutting_down:
+            if not success and not self._shutting_down and not self._gave_up:
                 self.schedule_reconnect()
         except asyncio.CancelledError:
             _LOGGER.debug("Reconnect task cancelled for %s", self._address)
         except Exception as err:
             _LOGGER.error("Reconnect error for %s: %s", self._address, err)
             self._reconnect_task = None
-            if not self._shutting_down:
+            if not self._shutting_down and not self._gave_up:
                 self.schedule_reconnect()
 
     def _on_notification(self, sender, data: bytes):
@@ -489,9 +525,13 @@ class MelittaDevice:
 
         self._session_key = session
         self._authenticated = True
+        self._auth_failure_count = 0
+        self._gave_up = False
+        self._reconnect_attempts = 0
         _LOGGER.warning(
             "=== AUTH SUCCESS ===\n"
-            "  session_key=%s, echo_match=True, hash_match=%s, encrypted=%s",
+            "  session_key=%s, echo_match=True, hash_match=%s, encrypted=%s\n"
+            "  Auth failure counter reset to 0.",
             session.hex(), hash_match, frame.encrypted,
         )
         self._auth_event.set()
@@ -540,6 +580,14 @@ class MelittaDevice:
         if self._is_connected and self._authenticated:
             _LOGGER.debug("Already connected and authenticated to %s", self._address)
             return True
+
+        if self._gave_up:
+            _LOGGER.warning(
+                "Connect BLOCKED for %s - gave up after %d auth failures. "
+                "Herlaad de integratie om opnieuw te proberen.",
+                self._address, self._auth_failure_count,
+            )
+            return False
 
         self._connect_pending = True
 
@@ -1580,16 +1628,35 @@ class MelittaDevice:
                 else:
                     _LOGGER.warning("NUCLEAR: RemoveDevice failed - old bond could not be cleared")
 
+                self._auth_failure_count += 1
                 self._status = "connected_not_auth"
                 _LOGGER.warning(
                     "Connected but NOT authenticated to %s - "
-                    "machine may need pairing button press (Verbinden modus)",
-                    self._address,
+                    "auth failure %d/%d. Machine may need pairing button press (Verbinden modus)",
+                    self._address, self._auth_failure_count, self._max_reconnect_attempts,
                 )
-                self._last_error = (
-                    "Authenticatie mislukt. Zorg dat de machine in 'Verbinden' modus staat "
-                    "(blauw knipperend display) en herlaad de integratie."
-                )
+                if self._max_reconnect_attempts > 0 and self._auth_failure_count >= self._max_reconnect_attempts:
+                    self._gave_up = True
+                    self._status = "offline"
+                    self._last_error = (
+                        f"Authenticatie mislukt na {self._auth_failure_count} pogingen. "
+                        "De koppelingsmodus (60 sec) is waarschijnlijk verlopen. "
+                        "Druk opnieuw op 'Verbinden' op de machine en herlaad de integratie."
+                    )
+                    _LOGGER.warning(
+                        "=== AUTH GAVE UP for %s after %d failures ===\n"
+                        "  Stopping all reconnect attempts. Reload integration to retry.",
+                        self._address, self._auth_failure_count,
+                    )
+                    self._cancel_reconnect()
+                    self._stop_polling()
+                    self._notify_callbacks()
+                    return self._authenticated
+                else:
+                    self._last_error = (
+                        f"Authenticatie mislukt (poging {self._auth_failure_count}/{self._max_reconnect_attempts}). "
+                        "Zorg dat de machine in 'Verbinden' modus staat (blauw knipperend display)."
+                    )
                 if not self._notifications_active:
                     self._notify_mode = "polling"
                     self._polling_task = asyncio.ensure_future(self._start_polling())
