@@ -198,9 +198,27 @@ class EfComParser:
         cmd_hex = data[1:3].hex() if self._pos >= 3 else data[1:2].hex()
         if cmd_hex not in self._unknown_cmds_logged:
             self._unknown_cmds_logged.add(cmd_hex)
-            _LOGGER.debug(
-                "Unknown command in %d-byte frame (cmd_bytes=%s), dropping (APK behavior)",
-                self._pos, cmd_hex,
+            from .crypto import get_all_rc4_keys, rc4_crypt as _rc4_crypt
+            cmd_len = 2 if self._pos >= 3 else 1
+            enc_offset = 1 + cmd_len + 1
+            decrypt_info = []
+            for key_name, key_bytes in get_all_rc4_keys():
+                try:
+                    if self._pos > enc_offset:
+                        plaintext_byte = data[1 + cmd_len:enc_offset].hex() if enc_offset > 1 + cmd_len else "none"
+                        encrypted_part = data[enc_offset:self._pos]
+                        decrypted = _rc4_crypt(key_bytes, bytes(encrypted_part))
+                        decrypt_info.append(
+                            f"    {key_name}: plain_after_cmd={plaintext_byte} decrypted={decrypted.hex()}"
+                        )
+                except Exception:
+                    pass
+            decrypt_lines = "\n".join(decrypt_info) if decrypt_info else "    (no keys available)"
+            _LOGGER.warning(
+                "Unknown command in %d-byte frame (cmd_bytes=%s), raw_hex=%s\n"
+                "  APK encryption offset: byte %d+ encrypted (byte %d stays plaintext)\n"
+                "  RC4 decrypt attempts:\n%s",
+                self._pos, cmd_hex, data.hex(), enc_offset, enc_offset - 1, decrypt_lines,
             )
         return None
 

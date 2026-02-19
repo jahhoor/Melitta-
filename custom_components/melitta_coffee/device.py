@@ -16,12 +16,12 @@ from .const import (
     MACHINE_STATE_NAMES,
     BEVERAGE_NAMES,
 )
-from .crypto import sbox_hash
+from .crypto import sbox_hash, rotate_rc4_key, get_all_rc4_keys
 from .protocol import build_frame, EfComParser, EfComFrame
 
 _LOGGER = logging.getLogger(__name__)
 
-AUTH_TIMEOUT = 30.0
+AUTH_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 15.0
 DISCONNECT_TIMEOUT = 10.0
 BLE_SETTLE_DELAY = 0.3
@@ -1286,9 +1286,11 @@ class MelittaDevice:
                 )
                 await self._request_status()
             else:
+                new_key_name = rotate_rc4_key()
                 _LOGGER.warning(
-                    "Auth failed for %s - trying NUCLEAR option: remove old bond and fresh pair...",
-                    self._address,
+                    "Auth failed for %s - trying NUCLEAR option: remove old bond and fresh pair...\n"
+                    "  Also rotated RC4 key to: %s",
+                    self._address, new_key_name or "(no more keys)",
                 )
                 self._status = "re_pairing"
                 self._last_error = "Auth mislukt met bestaand bond. Oud bond verwijderen en opnieuw koppelen..."
@@ -1626,12 +1628,20 @@ class MelittaDevice:
                 t_sn_done = time.monotonic()
 
                 notifying = await self._dbus_check_notifying(read_char_path)
-                cccd_confirmed = sn_ok or notifying
+                cccd_confirmed = notifying
+                sn_ok_but_not_notifying = sn_ok and not notifying
 
-                if sn_ok:
+                if sn_ok and notifying:
                     _LOGGER.warning(
-                        "FAST PIPELINE: D-Bus StartNotify OK (%.1fms) - CCCD written! Notifying=%s",
-                        (t_sn_done - t_start_notify) * 1000, notifying,
+                        "FAST PIPELINE: D-Bus StartNotify OK (%.1fms) - CCCD CONFIRMED! Notifying=True",
+                        (t_sn_done - t_start_notify) * 1000,
+                    )
+                elif sn_ok_but_not_notifying:
+                    _LOGGER.warning(
+                        "FAST PIPELINE: D-Bus StartNotify returned OK (%.1fms) BUT Notifying=False!\n"
+                        "  CCCD NOT truly written to machine. Will try direct descriptor write.\n"
+                        "  Also attempting auth in case machine accepts anyway.",
+                        (t_sn_done - t_start_notify) * 1000,
                     )
                 elif notifying:
                     _LOGGER.warning(
@@ -1645,7 +1655,7 @@ class MelittaDevice:
                         (t_sn_done - t_start_notify) * 1000,
                     )
 
-                if cccd_confirmed and self._is_connected and self._client is not None:
+                if (cccd_confirmed or sn_ok_but_not_notifying) and self._is_connected and self._client is not None:
                     auth_payload = self._build_auth_payload()
                     auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
 
@@ -1710,6 +1720,12 @@ class MelittaDevice:
                             except Exception as pt_err:
                                 _LOGGER.warning("FAST PIPELINE: D-Bus path plaintext auth error: %s", pt_err)
 
+                        new_key_name = rotate_rc4_key()
+                        if new_key_name:
+                            _LOGGER.warning(
+                                "FAST PIPELINE: D-Bus path auth failed - ROTATING RC4 KEY to '%s' for next attempt",
+                                new_key_name,
+                            )
                         _LOGGER.warning(
                             "FAST PIPELINE: D-Bus path auth failed (got_frame=%s, connected=%s). Falling through to pipeline methods.",
                             self._auth_got_frame, self._is_connected,
@@ -1727,8 +1743,17 @@ class MelittaDevice:
                 "auth_only_no_cccd",
             ]
             _LOGGER.warning(
-                "FAST PIPELINE: D-Bus CCCD confirmed (Notifying=True), skipping CCCD methods.\n"
+                "FAST PIPELINE: D-Bus CCCD TRULY confirmed (Notifying=True), skipping CCCD methods.\n"
                 "  Only trying auth_only_no_cccd as fallback.",
+            )
+        elif dbus_ok and sn_ok_but_not_notifying:
+            pipeline_methods = [
+                "direct_cccd_descriptor",
+                "auth_only_no_cccd",
+            ]
+            _LOGGER.warning(
+                "FAST PIPELINE: D-Bus StartNotify OK but Notifying=False - CCCD NOT confirmed.\n"
+                "  Adding direct_cccd_descriptor to pipeline methods.",
             )
         else:
             pipeline_methods = [
@@ -2011,10 +2036,17 @@ class MelittaDevice:
                     p_attempt, method, self._auth_disconnect_reason,
                 )
             else:
-                _LOGGER.warning(
-                    "FAST PIPELINE %d: no auth response (method=%s). Will try next method.",
-                    p_attempt, method,
-                )
+                if method != "auth_only_no_cccd":
+                    rotated = rotate_rc4_key()
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d: no auth response with encrypted auth (method=%s). Rotated RC4 key to: %s.",
+                        p_attempt, method, rotated or "(no more keys)",
+                    )
+                else:
+                    _LOGGER.warning(
+                        "FAST PIPELINE %d: no auth response (method=%s, no CCCD). Not rotating RC4 key (issue likely CCCD/timing).",
+                        p_attempt, method,
+                    )
 
             await asyncio.sleep(1.0)
 

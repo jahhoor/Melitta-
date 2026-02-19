@@ -10,6 +10,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 _RC4_KEY_CACHE = None
+_ALL_RC4_KEYS = None
+_ACTIVE_KEY_INDEX = 0
 
 
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
@@ -31,40 +33,75 @@ def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
         return decrypted
 
 
+def _derive_all_rc4_keys() -> list[tuple[str, bytes]]:
+    global _ALL_RC4_KEYS
+    if _ALL_RC4_KEYS is not None:
+        return _ALL_RC4_KEYS
+
+    key_sources = [
+        ("compound_B+A", RC4_KEY_PART_B + RC4_KEY_PART_A),
+        ("compound_A+B", RC4_KEY_PART_A + RC4_KEY_PART_B),
+        ("AES_KEY", AES_KEY),
+    ]
+
+    results = []
+    for name, aes_key in key_sources:
+        if len(aes_key) != 32:
+            _LOGGER.warning("RC4 KEY: skipping %s (len=%d, need 32)", name, len(aes_key))
+            continue
+        try:
+            rc4_key = _aes_cbc_decrypt(aes_key, IV_INIT, AES_ENCRYPTED_DATA)
+            results.append((name, rc4_key))
+            _LOGGER.warning(
+                "RC4 KEY [%s]: derived %d bytes, first4=%s",
+                name, len(rc4_key), rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
+            )
+        except Exception as e:
+            _LOGGER.warning("RC4 KEY [%s]: derivation FAILED: %s", name, e)
+
+    _ALL_RC4_KEYS = results
+    return results
+
+
 def get_rc4_key() -> bytes:
-    global _RC4_KEY_CACHE
+    global _RC4_KEY_CACHE, _ACTIVE_KEY_INDEX
     if _RC4_KEY_CACHE is not None:
         return _RC4_KEY_CACHE
 
-    compound_key = RC4_KEY_PART_B + RC4_KEY_PART_A
-    compound_matches_aes = (compound_key == AES_KEY)
-    _LOGGER.warning(
-        "=== RC4 KEY DERIVATION ===\n"
-        "  AES key source: compound(R3.g.f2460b+f2459a) = %d bytes, first4=%s\n"
-        "  AES_KEY constant (defined but unused): %d bytes, first4=%s\n"
-        "  compound == AES_KEY: %s\n"
-        "  IV: %d bytes, Encrypted data: %d bytes\n"
-        "  NOTE: If auth fails, try swapping to AES_KEY for decryption.",
-        len(compound_key), compound_key[:4].hex(),
-        len(AES_KEY), AES_KEY[:4].hex(),
-        compound_matches_aes,
-        len(IV_INIT), len(AES_ENCRYPTED_DATA),
-    )
-    _LOGGER.debug(
-        "RC4 KEY DERIVATION (full keys): compound=%s, AES_KEY=%s, IV=%s, data=%s",
-        compound_key.hex(), AES_KEY.hex(), IV_INIT.hex(), AES_ENCRYPTED_DATA.hex(),
-    )
+    all_keys = _derive_all_rc4_keys()
+    if not all_keys:
+        raise RuntimeError("No RC4 keys could be derived")
 
-    rc4_key = _aes_cbc_decrypt(compound_key, IV_INIT, AES_ENCRYPTED_DATA)
-
+    idx = _ACTIVE_KEY_INDEX % len(all_keys)
+    name, rc4_key = all_keys[idx]
     _RC4_KEY_CACHE = rc4_key
     _LOGGER.warning(
-        "=== RC4 KEY DERIVED ===\n"
+        "=== RC4 KEY ACTIVE [%d/%d]: %s ===\n"
         "  RC4 key length: %d bytes, first4=%s",
+        idx + 1, len(all_keys), name,
         len(rc4_key), rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
     )
-    _LOGGER.debug("RC4 key hex [SENSITIVE]: %s", rc4_key.hex())
     return rc4_key
+
+
+def rotate_rc4_key() -> str | None:
+    global _RC4_KEY_CACHE, _ACTIVE_KEY_INDEX
+    all_keys = _derive_all_rc4_keys()
+    if len(all_keys) <= 1:
+        return None
+
+    _ACTIVE_KEY_INDEX = (_ACTIVE_KEY_INDEX + 1) % len(all_keys)
+    _RC4_KEY_CACHE = None
+    name, _ = all_keys[_ACTIVE_KEY_INDEX]
+    _LOGGER.warning(
+        "=== RC4 KEY ROTATED to [%d/%d]: %s ===",
+        _ACTIVE_KEY_INDEX + 1, len(all_keys), name,
+    )
+    return name
+
+
+def get_all_rc4_keys() -> list[tuple[str, bytes]]:
+    return _derive_all_rc4_keys()
 
 
 class RC4:
