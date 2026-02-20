@@ -64,6 +64,7 @@ class MelittaDevice:
         self._dbus_notify_bus = None
         self._dbus_notify_handler = None
         self._dbus_match_rule: str | None = None
+        self._dbus_cleanup_task: asyncio.Task | None = None
         self._strength: int = 2
         self._cups: int = 1
         self._water_level: int | None = None
@@ -170,6 +171,8 @@ class MelittaDevice:
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
             self._keepalive_task = None
+
+        self._dbus_cleanup_task = asyncio.ensure_future(self._stop_dbus_notifications())
 
         if was_auth:
             self._status = "auth_dropped"
@@ -362,7 +365,17 @@ class MelittaDevice:
             await self._internal_disconnect()
             await asyncio.sleep(0.5)
 
+        if self._dbus_cleanup_task and not self._dbus_cleanup_task.done():
+            try:
+                await asyncio.wait_for(self._dbus_cleanup_task, timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+        self._dbus_cleanup_task = None
+        await self._stop_dbus_notifications()
+
         if self._hass is not None:
+            from .dbus_utils import dbus_cancel_pairing
+            await dbus_cancel_pairing(self._address)
             await self._force_bluez_disconnect()
 
         _LOGGER.info("Connecting to %s (attempt %d)", self._address, self._reconnect_attempts + 1)
@@ -444,15 +457,33 @@ class MelittaDevice:
                 return True
             else:
                 self._auth_failure_count += 1
-                self._status = "connected_not_auth"
-                self._last_error = (
-                    f"Authenticatie mislukt (poging {self._auth_failure_count}/{self._max_reconnect_attempts}). "
-                    "Zorg dat de machine in 'Verbinden' modus staat."
-                )
                 _LOGGER.warning(
                     "Auth failed for %s (failure %d/%d)",
                     self._address, self._auth_failure_count, self._max_reconnect_attempts,
                 )
+
+                if self._auth_failure_count == 1 and self._hass is not None:
+                    _LOGGER.info("First auth failure - removing bond for fresh pair on next attempt")
+                    self._status = "removing_stale_bond"
+                    self._last_error = "Authenticatie mislukt. Oude koppeling verwijderen voor nieuwe poging..."
+                    self._notify_callbacks()
+                    self._suppress_disconnect_callback = True
+                    try:
+                        await self._internal_disconnect()
+                    except Exception:
+                        pass
+                    self._suppress_disconnect_callback = False
+                    await asyncio.sleep(0.3)
+                    from .dbus_utils import dbus_remove_device
+                    await dbus_remove_device(self._address)
+                    await asyncio.sleep(1.0)
+                else:
+                    self._status = "connected_not_auth"
+                    self._last_error = (
+                        f"Authenticatie mislukt (poging {self._auth_failure_count}/{self._max_reconnect_attempts}). "
+                        "Zorg dat de machine in 'Verbinden' modus staat."
+                    )
+
                 self._notify_callbacks()
                 return False
 
@@ -464,13 +495,56 @@ class MelittaDevice:
             return False
 
     async def _handle_pairing(self) -> bool:
-        from .dbus_utils import dbus_check_paired, dbus_pair_device, dbus_force_encryption
+        from .dbus_utils import (
+            dbus_check_paired, dbus_pair_device, dbus_force_encryption,
+            dbus_remove_device, dbus_check_bond_valid,
+        )
 
         is_paired = await dbus_check_paired(self._address)
         if is_paired:
-            _LOGGER.info("Device already paired, activating encryption")
-            await dbus_force_encryption(self._address)
-            return False
+            bond_valid = await dbus_check_bond_valid(self._address)
+            if bond_valid:
+                _LOGGER.info("Device already paired with valid bond, activating encryption")
+                await dbus_force_encryption(self._address)
+                return False
+            else:
+                _LOGGER.warning("Stale bond detected (paired but encryption failed) - removing old pairing")
+                self._status = "removing_stale_bond"
+                self._last_error = "Oude koppeling verwijderen (rode Bluetooth)..."
+                self._notify_callbacks()
+
+                self._suppress_disconnect_callback = True
+                try:
+                    await self._internal_disconnect()
+                except Exception:
+                    pass
+                self._suppress_disconnect_callback = False
+                await asyncio.sleep(0.3)
+
+                removed = await dbus_remove_device(self._address)
+                if removed:
+                    _LOGGER.info("Stale bond removed, verifying...")
+                else:
+                    _LOGGER.warning("Failed to remove stale bond")
+
+                await asyncio.sleep(2.0)
+
+                still_paired = await dbus_check_paired(self._address)
+                if still_paired:
+                    _LOGGER.warning("Bond still exists after removal, retrying...")
+                    await dbus_remove_device(self._address)
+                    await asyncio.sleep(2.0)
+
+                reconnected = await self._internal_reconnect_ble()
+                if not reconnected:
+                    await asyncio.sleep(2.0)
+                    reconnected = await self._internal_reconnect_ble()
+                if not reconnected:
+                    _LOGGER.warning("Reconnect after bond removal failed")
+                    self._status = "offline"
+                    self._last_error = "Herverbinding na verwijderen oude koppeling mislukt"
+                    self._notify_callbacks()
+                    return False
 
         _LOGGER.info("Device not paired, initiating pairing (machine must be in Verbinden mode)")
 

@@ -221,6 +221,36 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
         return False
 
 
+async def dbus_check_bond_valid(address: str) -> bool:
+    try:
+        from dbus_fast import Message, MessageType
+        bus = await _get_bus()
+        try:
+            for adapter in await _get_adapters(bus):
+                dp = _device_path(adapter, address)
+                paired = await _get_device_property(bus, dp, "Paired")
+                if not paired:
+                    continue
+                connected = await _get_device_property(bus, dp, "Connected")
+                if not connected:
+                    _LOGGER.debug("Bond check: device not connected, assuming valid (will verify on connect)")
+                    return True
+                for wait in range(6):
+                    services_resolved = await _get_device_property(bus, dp, "ServicesResolved")
+                    if services_resolved:
+                        _LOGGER.debug("Bond check: ServicesResolved=True after %ds, bond is valid", wait)
+                        return True
+                    await asyncio.sleep(0.5)
+                _LOGGER.info("Bond check: ServicesResolved still False after 3s - stale bond detected")
+                return False
+            return True
+        finally:
+            bus.disconnect()
+    except Exception as err:
+        _LOGGER.debug("Bond check error: %s", err)
+        return True
+
+
 async def dbus_force_encryption(address: str) -> bool:
     try:
         from dbus_fast import Message, MessageType
@@ -249,6 +279,25 @@ async def dbus_force_encryption(address: str) -> bool:
     except Exception as err:
         _LOGGER.debug("Force encryption error: %s", err)
         return False
+
+
+async def dbus_cancel_pairing(address: str):
+    try:
+        from dbus_fast import Message, MessageType
+        bus = await _get_bus()
+        try:
+            for adapter in await _get_adapters(bus):
+                dp = _device_path(adapter, address)
+                await bus.call(Message(
+                    destination="org.bluez", path=dp,
+                    interface="org.bluez.Device1",
+                    member="CancelPairing",
+                ))
+                _LOGGER.debug("CancelPairing sent for %s", address)
+        finally:
+            bus.disconnect()
+    except Exception as err:
+        _LOGGER.debug("CancelPairing error (expected if not pairing): %s", err)
 
 
 async def dbus_force_disconnect(address: str):
