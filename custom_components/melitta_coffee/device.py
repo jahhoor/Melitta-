@@ -162,7 +162,7 @@ class MelittaDevice:
         if client is not self._client:
             return
 
-        was_auth = self._status in ("authenticating", "waiting_for_machine_button")
+        was_auth = self._status == "authenticating"
         self._is_connected = False
         self._authenticated = False
         self._session_key = None
@@ -493,10 +493,34 @@ class MelittaDevice:
 
         char_path = await self._get_char_path()
         dbus_handler_active = False
+        notifications_confirmed = False
 
         if char_path and self._hass is not None:
+            from .dbus_utils import (
+                dbus_write_cccd, dbus_start_notify, dbus_check_notifying,
+                dbus_register_notification_handler,
+            )
+
+            cccd_ok = await dbus_write_cccd(char_path)
+            if cccd_ok:
+                _LOGGER.debug("CCCD descriptor written via D-Bus")
+            else:
+                _LOGGER.debug("CCCD descriptor write skipped (not found or failed)")
+
+            start_ok = await dbus_start_notify(char_path)
+            if start_ok:
+                _LOGGER.debug("D-Bus StartNotify succeeded")
+
+            await asyncio.sleep(0.3)
+
+            notifying = await dbus_check_notifying(char_path)
+            if notifying:
+                _LOGGER.debug("Notifying confirmed active via D-Bus")
+                notifications_confirmed = True
+            else:
+                _LOGGER.debug("Notifying not yet active, proceeding anyway")
+
             try:
-                from .dbus_utils import dbus_register_notification_handler
                 bus, handler, match_rule = await dbus_register_notification_handler(
                     char_path, self._process_incoming_data,
                 )
@@ -515,11 +539,15 @@ class MelittaDevice:
                 timeout=3.0,
             )
             self._notifications_active = True
+            notifications_confirmed = True
             _LOGGER.debug("Bleak start_notify succeeded")
         except Exception as err:
             _LOGGER.debug("Bleak start_notify failed: %s - using D-Bus/polling", err)
             if not dbus_handler_active:
                 _LOGGER.info("No notification channel available, will use polling")
+
+        if notifications_confirmed:
+            await asyncio.sleep(0.2)
 
         auth_ok = await self._do_authenticate()
         return auth_ok
@@ -538,8 +566,8 @@ class MelittaDevice:
         auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
         _LOGGER.info("Sending encrypted auth frame (%d bytes)", len(auth_encrypted))
 
-        self._status = "waiting_for_machine_button"
-        self._last_error = "Auth-frame verstuurd. Druk op 'Verbinden' op het koffieapparaat als dat nog niet gedaan is."
+        self._status = "authenticating"
+        self._last_error = "Bezig met authenticeren..."
         self._notify_callbacks()
 
         try:

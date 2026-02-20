@@ -300,6 +300,87 @@ async def dbus_remove_device(address: str) -> bool:
         return False
 
 
+async def dbus_write_cccd(char_path: str) -> bool:
+    try:
+        from dbus_fast import Message, MessageType, Variant
+        bus = await _get_bus()
+        try:
+            introspect = await bus.call(Message(
+                destination="org.bluez", path=char_path,
+                interface="org.freedesktop.DBus.Introspectable",
+                member="Introspect",
+            ))
+            if introspect.message_type == MessageType.ERROR:
+                _LOGGER.debug("CCCD introspect failed for %s", char_path)
+                return False
+
+            descriptors = re.findall(r'<node name="(desc\w+)"', introspect.body[0]) if introspect.body else []
+
+            for desc_name in descriptors:
+                desc_path = f"{char_path}/{desc_name}"
+                uuid_reply = await bus.call(Message(
+                    destination="org.bluez", path=desc_path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get", signature="ss",
+                    body=["org.bluez.GattDescriptor1", "UUID"],
+                ))
+                if uuid_reply.message_type == MessageType.ERROR:
+                    continue
+                desc_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
+                if desc_uuid.lower() == "00002902-0000-1000-8000-00805f9b34fb":
+                    cccd_value = bytes([0x01, 0x00])
+                    write_reply = await asyncio.wait_for(
+                        bus.call(Message(
+                            destination="org.bluez", path=desc_path,
+                            interface="org.bluez.GattDescriptor1",
+                            member="WriteValue",
+                            signature="aya{sv}",
+                            body=[list(cccd_value), {}],
+                        )),
+                        timeout=3.0,
+                    )
+                    if write_reply.message_type == MessageType.ERROR:
+                        _LOGGER.debug("CCCD write error: %s", write_reply.error_name)
+                        return False
+                    _LOGGER.debug("CCCD descriptor written (0x0100) on %s", desc_path)
+                    return True
+
+            _LOGGER.debug("No CCCD descriptor (0x2902) found on %s", char_path)
+            return False
+        finally:
+            bus.disconnect()
+    except Exception as err:
+        _LOGGER.debug("CCCD write error: %s", err)
+        return False
+
+
+async def dbus_check_notifying(char_path: str) -> bool:
+    try:
+        from dbus_fast import Message, MessageType
+        bus = await _get_bus()
+        try:
+            reply = await asyncio.wait_for(
+                bus.call(Message(
+                    destination="org.bluez", path=char_path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get", signature="ss",
+                    body=["org.bluez.GattCharacteristic1", "Notifying"],
+                )),
+                timeout=2.0,
+            )
+            if reply.message_type == MessageType.ERROR:
+                return False
+            val = reply.body[0] if reply.body else None
+            if hasattr(val, 'value'):
+                val = val.value
+            return bool(val)
+        finally:
+            bus.disconnect()
+    except Exception as err:
+        _LOGGER.debug("Check notifying error: %s", err)
+        return False
+
+
 async def dbus_start_notify(char_path: str) -> bool:
     try:
         from dbus_fast import Message, MessageType
