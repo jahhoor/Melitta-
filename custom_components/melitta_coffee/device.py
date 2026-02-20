@@ -264,7 +264,7 @@ class MelittaDevice:
             self._handle_frame(frame)
 
     def _on_notification(self, sender, data: bytes):
-        _LOGGER.debug("BLE notification: %d bytes from %s", len(data), sender)
+        _LOGGER.debug("BLE notification: %d bytes from %s, hex=%s", len(data), sender, bytes(data).hex())
         self._process_incoming_data(bytes(data))
 
     def _handle_frame(self, frame: EfComFrame):
@@ -283,8 +283,16 @@ class MelittaDevice:
         payload = frame.payload
         self._auth_got_frame = True
 
+        _LOGGER.debug(
+            "AUTH RESPONSE: encrypted=%s, payload_len=%d, payload_hex=%s",
+            frame.encrypted, len(payload), payload.hex(),
+        )
+
         if len(payload) != 8:
-            _LOGGER.warning("Auth response: unexpected payload length %d (expected 8)", len(payload))
+            _LOGGER.warning(
+                "AUTH RESPONSE: unexpected payload length %d (expected 8), raw=%s",
+                len(payload), payload.hex(),
+            )
             self._auth_event.set()
             return
 
@@ -292,27 +300,45 @@ class MelittaDevice:
         session = payload[4:6]
         hash_received = payload[6:8]
 
+        _LOGGER.debug(
+            "AUTH RESPONSE parsed: echo=%s, session=%s, hash=%s",
+            echo.hex(), session.hex(), hash_received.hex(),
+        )
+
         if self._auth_challenge is None:
-            _LOGGER.warning("Auth response: no pending challenge")
+            _LOGGER.warning("AUTH RESPONSE: no pending challenge")
             self._auth_event.set()
             return
 
         if echo != self._auth_challenge:
-            _LOGGER.warning("Auth response: echo mismatch (sent=%s, got=%s)", self._auth_challenge.hex(), echo.hex())
+            _LOGGER.warning(
+                "AUTH RESPONSE: echo MISMATCH (sent_challenge=%s, received_echo=%s)",
+                self._auth_challenge.hex(), echo.hex(),
+            )
             self._auth_event.set()
             return
+
+        _LOGGER.debug("AUTH RESPONSE: echo matches challenge OK")
 
         verify_data = payload[0:6]
         expected_hash = sbox_hash(verify_data, len(verify_data))
         if hash_received != expected_hash:
-            _LOGGER.info("Auth: hash mismatch but echo matched, accepting session anyway")
+            _LOGGER.info(
+                "AUTH RESPONSE: hash mismatch (received=%s, expected=%s) but echo matched, accepting",
+                hash_received.hex(), expected_hash.hex(),
+            )
+        else:
+            _LOGGER.debug("AUTH RESPONSE: hash verification OK")
 
         self._session_key = session
         self._authenticated = True
         self._auth_failure_count = 0
         self._gave_up = False
         self._reconnect_attempts = 0
-        _LOGGER.info("Auth succeeded: session_key=%s, encrypted=%s", session.hex(), frame.encrypted)
+        _LOGGER.info(
+            "AUTH SUCCESS: session_key=%s, encrypted=%s, challenge=%s",
+            session.hex(), frame.encrypted, self._auth_challenge.hex(),
+        )
         self._auth_event.set()
 
     def _handle_status_response(self, frame: EfComFrame):
@@ -569,6 +595,8 @@ class MelittaDevice:
         dbus_handler_active = False
         notifications_confirmed = False
 
+        _LOGGER.debug("NOTIFY SETUP: char_path=%s, has_hass=%s", char_path, self._hass is not None)
+
         if char_path and self._hass is not None:
             from .dbus_utils import (
                 dbus_write_cccd, dbus_start_notify, dbus_check_notifying,
@@ -576,23 +604,17 @@ class MelittaDevice:
             )
 
             cccd_ok = await dbus_write_cccd(char_path)
-            if cccd_ok:
-                _LOGGER.debug("CCCD descriptor written via D-Bus")
-            else:
-                _LOGGER.debug("CCCD descriptor write skipped (not found or failed)")
+            _LOGGER.debug("NOTIFY SETUP: CCCD write result=%s (path=%s)", cccd_ok, char_path)
 
             start_ok = await dbus_start_notify(char_path)
-            if start_ok:
-                _LOGGER.debug("D-Bus StartNotify succeeded")
+            _LOGGER.debug("NOTIFY SETUP: D-Bus StartNotify result=%s", start_ok)
 
             await asyncio.sleep(0.3)
 
             notifying = await dbus_check_notifying(char_path)
+            _LOGGER.debug("NOTIFY SETUP: Notifying property=%s", notifying)
             if notifying:
-                _LOGGER.debug("Notifying confirmed active via D-Bus")
                 notifications_confirmed = True
-            else:
-                _LOGGER.debug("Notifying not yet active, proceeding anyway")
 
             try:
                 bus, handler, match_rule = await dbus_register_notification_handler(
@@ -603,9 +625,9 @@ class MelittaDevice:
                 self._dbus_match_rule = match_rule
                 self._notifications_active = True
                 dbus_handler_active = True
-                _LOGGER.debug("D-Bus notification handler registered")
+                _LOGGER.debug("NOTIFY SETUP: D-Bus handler registered, match_rule=%s", match_rule)
             except Exception as err:
-                _LOGGER.debug("D-Bus notification handler failed: %s", err)
+                _LOGGER.debug("NOTIFY SETUP: D-Bus handler FAILED: %s (%s)", err, type(err).__name__)
 
         try:
             await asyncio.wait_for(
@@ -614,11 +636,16 @@ class MelittaDevice:
             )
             self._notifications_active = True
             notifications_confirmed = True
-            _LOGGER.debug("Bleak start_notify succeeded")
+            _LOGGER.debug("NOTIFY SETUP: Bleak start_notify OK")
         except Exception as err:
-            _LOGGER.debug("Bleak start_notify failed: %s - using D-Bus/polling", err)
+            _LOGGER.debug("NOTIFY SETUP: Bleak start_notify FAILED: %s (%s)", err, type(err).__name__)
             if not dbus_handler_active:
-                _LOGGER.info("No notification channel available, will use polling")
+                _LOGGER.info("NOTIFY SETUP: No notification channel available, will use polling")
+
+        _LOGGER.debug(
+            "NOTIFY SETUP COMPLETE: notifications_confirmed=%s, dbus_handler=%s, bleak_notify=%s",
+            notifications_confirmed, dbus_handler_active, notifications_confirmed,
+        )
 
         if notifications_confirmed:
             await asyncio.sleep(0.2)
@@ -637,8 +664,27 @@ class MelittaDevice:
         challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
         auth_payload = self._auth_challenge + challenge_hash
 
+        from .crypto import get_rc4_key, get_all_rc4_keys, _ACTIVE_KEY_INDEX
+        try:
+            active_key = get_rc4_key()
+            all_keys = get_all_rc4_keys()
+            active_idx = _ACTIVE_KEY_INDEX
+            active_name = all_keys[active_idx % len(all_keys)][0] if all_keys else "none"
+            _LOGGER.debug(
+                "AUTH PREP: challenge=%s, sbox_hash=%s, payload=%s, "
+                "rc4_key_path=%s (idx=%d/%d), rc4_key_first4=%s",
+                self._auth_challenge.hex(), challenge_hash.hex(), auth_payload.hex(),
+                active_name, active_idx + 1, len(all_keys),
+                active_key[:4].hex() if len(active_key) >= 4 else "N/A",
+            )
+        except Exception as e:
+            _LOGGER.debug("AUTH PREP: challenge=%s, rc4 key info error: %s", self._auth_challenge.hex(), e)
+
         auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
-        _LOGGER.info("Sending encrypted auth frame (%d bytes)", len(auth_encrypted))
+        _LOGGER.info(
+            "Sending encrypted auth frame (%d bytes), frame_hex=%s",
+            len(auth_encrypted), auth_encrypted.hex(),
+        )
 
         self._status = "authenticating"
         self._last_error = "Bezig met authenticeren..."
@@ -675,7 +721,10 @@ class MelittaDevice:
         auth_payload = self._auth_challenge + challenge_hash
         auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
 
-        _LOGGER.info("Sending plaintext auth frame (%d bytes)", len(auth_plaintext))
+        _LOGGER.info(
+            "Sending plaintext auth frame (%d bytes), challenge=%s, frame_hex=%s",
+            len(auth_plaintext), self._auth_challenge.hex(), auth_plaintext.hex(),
+        )
         try:
             await asyncio.wait_for(
                 self._client.write_gatt_char(BLE_WRITE_UUID, auth_plaintext, response=False),
@@ -704,36 +753,49 @@ class MelittaDevice:
         poll_interval = 0.15
         max_polls = int(AUTH_TIMEOUT / poll_interval)
         last_data = None
+        poll_count = 0
+        data_received_count = 0
+
+        _LOGGER.debug("AUTH WAIT: starting, max_polls=%d, interval=%.2fs, timeout=%.1fs", max_polls, poll_interval, AUTH_TIMEOUT)
 
         for i in range(max_polls):
             if self._authenticated or self._auth_got_frame:
+                _LOGGER.debug("AUTH WAIT: completed at poll %d (authenticated=%s, got_frame=%s)", i, self._authenticated, self._auth_got_frame)
                 return True
             if self._auth_event.is_set():
+                _LOGGER.debug("AUTH WAIT: event set at poll %d", i)
                 return True
             if not self._is_connected or self._client is None:
+                _LOGGER.debug("AUTH WAIT: disconnected at poll %d", i)
                 return False
 
+            poll_count += 1
             try:
                 data = await asyncio.wait_for(
                     client.read_gatt_char(BLE_READ_UUID),
                     timeout=2.0,
                 )
                 if data and len(data) > 0 and data != last_data:
-                    _LOGGER.debug("Auth poll: new data %d bytes", len(data))
+                    data_received_count += 1
+                    _LOGGER.debug("AUTH WAIT poll %d: new data %d bytes, hex=%s", i, len(data), data.hex())
                     last_data = data
                     self._process_incoming_data(data)
                     if self._authenticated or self._auth_event.is_set():
                         return True
             except asyncio.TimeoutError:
-                pass
+                if i % 10 == 0:
+                    _LOGGER.debug("AUTH WAIT poll %d: read timeout (no data)", i)
             except (BleakError, EOFError) as err:
-                _LOGGER.debug("Auth poll read error: %s", err)
+                _LOGGER.debug("AUTH WAIT poll %d: BLE error: %s (%s)", i, err, type(err).__name__)
             except Exception as err:
-                _LOGGER.debug("Auth poll error: %s", err)
+                _LOGGER.debug("AUTH WAIT poll %d: error: %s (%s)", i, err, type(err).__name__)
 
             await asyncio.sleep(poll_interval)
 
-        _LOGGER.info("Auth wait timeout after %.1fs", AUTH_TIMEOUT)
+        _LOGGER.info(
+            "AUTH WAIT: timeout after %.1fs (%d polls, %d data received, authenticated=%s, got_frame=%s)",
+            AUTH_TIMEOUT, poll_count, data_received_count, self._authenticated, self._auth_got_frame,
+        )
         return False
 
     async def _get_ble_device(self):

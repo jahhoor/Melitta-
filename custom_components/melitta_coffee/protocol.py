@@ -214,6 +214,10 @@ class EfComParser:
             return None
 
         encrypted_portion = bytes(work[decrypt_start:decrypt_start + decrypt_count])
+        _LOGGER.debug(
+            "DECRYPT cmd=%r: raw_hex=%s, decrypt_range=[%d:%d] (%d bytes), encrypted_hex=%s",
+            cmd_str, data.hex(), decrypt_start, decrypt_start + decrypt_count, decrypt_count, encrypted_portion.hex(),
+        )
         decrypted = rc4_crypt(rc4_key, encrypted_portion)
         for i in range(decrypt_count):
             work[decrypt_start + i] = decrypted[i]
@@ -223,8 +227,8 @@ class EfComParser:
         actual_chk = work[chk_pos]
 
         _LOGGER.debug(
-            "Decrypt cmd=%r: checksum computed=0x%02x, in_frame=0x%02x, match=%s",
-            cmd_str, expected_chk, actual_chk, expected_chk == actual_chk,
+            "DECRYPT cmd=%r: decrypted_frame_hex=%s, checksum computed=0x%02x, in_frame=0x%02x, match=%s",
+            cmd_str, bytes(work).hex(), expected_chk, actual_chk, expected_chk == actual_chk,
         )
 
         if expected_chk == actual_chk:
@@ -236,6 +240,10 @@ class EfComParser:
             )
             return EfComFrame(cmd_str, payload, True)
 
+        _LOGGER.debug(
+            "DECRYPT cmd=%r: checksum MISMATCH, encrypted decode failed (will try plaintext)",
+            cmd_str,
+        )
         return None
 
     def _try_plaintext(self, data: bytes, cmd_str: str, cmd_len: int, payload_len: int) -> EfComFrame | None:
