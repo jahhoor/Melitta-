@@ -47,12 +47,12 @@ def _derive_all_rc4_keys() -> list[tuple[str, bytes]]:
     results = []
     for name, aes_key in key_sources:
         if len(aes_key) != 32:
-            _LOGGER.warning("RC4 KEY: skipping %s (len=%d, need 32)", name, len(aes_key))
+            _LOGGER.debug("RC4 KEY: skipping %s (len=%d, need 32)", name, len(aes_key))
             continue
         try:
             rc4_key = _aes_cbc_decrypt(aes_key, IV_INIT, AES_ENCRYPTED_DATA)
             results.append((name, rc4_key))
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "RC4 KEY [%s]: derived %d bytes, first4=%s",
                 name, len(rc4_key), rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
             )
@@ -75,11 +75,10 @@ def get_rc4_key() -> bytes:
     idx = _ACTIVE_KEY_INDEX % len(all_keys)
     name, rc4_key = all_keys[idx]
     _RC4_KEY_CACHE = rc4_key
-    _LOGGER.warning(
-        "=== RC4 KEY ACTIVE [%d/%d]: %s ===\n"
-        "  RC4 key length: %d bytes, first4=%s",
+    _LOGGER.debug(
+        "RC4 key active [%d/%d]: %s (first4=%s)",
         idx + 1, len(all_keys), name,
-        len(rc4_key), rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
+        rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
     )
     return rc4_key
 
@@ -93,8 +92,8 @@ def rotate_rc4_key() -> str | None:
     _ACTIVE_KEY_INDEX = (_ACTIVE_KEY_INDEX + 1) % len(all_keys)
     _RC4_KEY_CACHE = None
     name, _ = all_keys[_ACTIVE_KEY_INDEX]
-    _LOGGER.warning(
-        "=== RC4 KEY ROTATED to [%d/%d]: %s ===",
+    _LOGGER.info(
+        "RC4 key rotated to [%d/%d]: %s",
         _ACTIVE_KEY_INDEX + 1, len(all_keys), name,
     )
     return name

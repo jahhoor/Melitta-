@@ -42,13 +42,12 @@ def build_frame(command: str, session_key: bytes | None, payload: bytes | None, 
     frame[pos] = chk
     frame[pos + 1] = FRAME_END
 
-    _LOGGER.warning(
-        "build_frame: cmd=%r, session=%s, payload=%s, encrypt=%s, checksum=0x%02x, plaintext_hex=%s",
+    _LOGGER.debug(
+        "build_frame: cmd=%r, session=%s, payload=%s, encrypt=%s, plaintext_hex=%s",
         command,
         session_key.hex() if session_key else "None",
         payload.hex() if payload else "None",
         encrypt,
-        chk,
         bytes(frame).hex(),
     )
 
@@ -62,9 +61,9 @@ def build_frame(command: str, session_key: bytes | None, payload: bytes | None, 
         encrypted = rc4_crypt(rc4_key, plaintext)
         for i in range(actual_count):
             frame[actual_start + i] = encrypted[i]
-        _LOGGER.warning(
-            "build_frame encrypted_hex=%s (encrypt_start=%d, encrypt_count=%d, plaintext_byte[%d]=0x%02x)",
-            bytes(frame).hex(), actual_start, actual_count, apk_offset, frame[apk_offset],
+        _LOGGER.debug(
+            "build_frame encrypted_hex=%s (encrypt_start=%d, encrypt_count=%d)",
+            bytes(frame).hex(), actual_start, actual_count,
         )
 
     return bytes(frame)
@@ -198,27 +197,9 @@ class EfComParser:
         cmd_hex = data[1:3].hex() if self._pos >= 3 else data[1:2].hex()
         if cmd_hex not in self._unknown_cmds_logged:
             self._unknown_cmds_logged.add(cmd_hex)
-            from .crypto import get_all_rc4_keys, rc4_crypt as _rc4_crypt
-            cmd_len = 2 if self._pos >= 3 else 1
-            enc_offset = 1 + cmd_len + 1
-            decrypt_info = []
-            for key_name, key_bytes in get_all_rc4_keys():
-                try:
-                    if self._pos > enc_offset:
-                        plaintext_byte = data[1 + cmd_len:enc_offset].hex() if enc_offset > 1 + cmd_len else "none"
-                        encrypted_part = data[enc_offset:self._pos]
-                        decrypted = _rc4_crypt(key_bytes, bytes(encrypted_part))
-                        decrypt_info.append(
-                            f"    {key_name}: plain_after_cmd={plaintext_byte} decrypted={decrypted.hex()}"
-                        )
-                except Exception:
-                    pass
-            decrypt_lines = "\n".join(decrypt_info) if decrypt_info else "    (no keys available)"
-            _LOGGER.warning(
-                "Unknown command in %d-byte frame (cmd_bytes=%s), raw_hex=%s\n"
-                "  APK encryption offset: byte %d+ encrypted (byte %d stays plaintext)\n"
-                "  RC4 decrypt attempts:\n%s",
-                self._pos, cmd_hex, data.hex(), enc_offset, enc_offset - 1, decrypt_lines,
+            _LOGGER.debug(
+                "Unknown command in %d-byte frame (cmd_bytes=%s), raw_hex=%s",
+                self._pos, cmd_hex, data.hex(),
             )
         return None
 
@@ -249,8 +230,8 @@ class EfComParser:
         if expected_chk == actual_chk:
             payload_start = cmd_len + 1
             payload = bytes(work[payload_start:payload_start + payload_len])
-            _LOGGER.info(
-                "FRAME DECODED (encrypted): cmd=%r, payload=%s (%d bytes)",
+            _LOGGER.debug(
+                "Frame decoded (encrypted): cmd=%r, payload=%s (%d bytes)",
                 cmd_str, payload.hex(), len(payload),
             )
             return EfComFrame(cmd_str, payload, True)
@@ -265,8 +246,8 @@ class EfComParser:
         if expected_chk == work[chk_pos]:
             payload_start = cmd_len + 1
             payload = bytes(work[payload_start:payload_start + payload_len])
-            _LOGGER.info(
-                "FRAME DECODED (plaintext): cmd=%r, payload=%s (%d bytes)",
+            _LOGGER.debug(
+                "Frame decoded (plaintext): cmd=%r, payload=%s (%d bytes)",
                 cmd_str, payload.hex(), len(payload),
             )
             return EfComFrame(cmd_str, payload, False)
