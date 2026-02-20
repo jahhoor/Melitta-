@@ -158,12 +158,15 @@ class MelittaDevice:
     def _on_disconnect(self, client: BleakClient):
         if self._suppress_disconnect_callback:
             self._is_connected = False
-            _LOGGER.debug("Disconnect callback suppressed for %s", self._address)
+            _LOGGER.debug("DISCONNECT: callback suppressed for %s (internal disconnect in progress)", self._address)
             return
         if client is not self._client:
+            _LOGGER.debug("DISCONNECT: ignoring callback for old client (not current client)")
             return
 
         was_auth = self._status == "authenticating"
+        was_connected = self._is_connected
+        was_authenticated = self._authenticated
         self._is_connected = False
         self._authenticated = False
         self._session_key = None
@@ -182,12 +185,18 @@ class MelittaDevice:
             self._status = "offline"
             self._last_error = "Verbinding verbroken"
 
-        _LOGGER.info("Disconnected from %s (was_auth=%s)", self._address, was_auth)
+        _LOGGER.info(
+            "DISCONNECT: %s (was_connected=%s, was_authenticated=%s, was_auth_in_progress=%s, "
+            "auth_failures=%d, shutting_down=%s, gave_up=%s)",
+            self._address, was_connected, was_authenticated, was_auth,
+            self._auth_failure_count, self._shutting_down, self._gave_up,
+        )
         self._notify_callbacks()
 
         if self._gave_up:
-            _LOGGER.info("Not reconnecting: gave up after %d failures", self._auth_failure_count)
+            _LOGGER.info("DISCONNECT: not reconnecting - gave up after %d auth failures", self._auth_failure_count)
         elif not self._shutting_down:
+            _LOGGER.debug("DISCONNECT: scheduling reconnect...")
             self.schedule_reconnect()
 
     def _cancel_reconnect(self):
@@ -197,8 +206,10 @@ class MelittaDevice:
 
     def schedule_reconnect(self):
         if self._shutting_down or self._gave_up:
+            _LOGGER.debug("RECONNECT: skipping - shutting_down=%s, gave_up=%s", self._shutting_down, self._gave_up)
             return
         if self._is_connected and self._authenticated:
+            _LOGGER.debug("RECONNECT: skipping - already connected and authenticated")
             return
         if self._max_reconnect_attempts > 0 and self._auth_failure_count >= self._max_reconnect_attempts:
             self._gave_up = True
@@ -207,14 +218,19 @@ class MelittaDevice:
                 f"Verbinding gestopt na {self._auth_failure_count} mislukte pogingen. "
                 "Druk opnieuw op 'Verbinden' op de machine en herlaad de integratie."
             )
-            _LOGGER.warning("Reconnect stopped for %s after %d failures", self._address, self._auth_failure_count)
+            _LOGGER.warning(
+                "RECONNECT: giving up for %s after %d auth failures (max=%d)",
+                self._address, self._auth_failure_count, self._max_reconnect_attempts,
+            )
             self._cancel_reconnect()
             self._stop_polling()
             self._notify_callbacks()
             return
         if self._connect_pending or self._connect_lock.locked():
+            _LOGGER.debug("RECONNECT: skipping - connect already pending or locked")
             return
         if self._reconnect_task and not self._reconnect_task.done():
+            _LOGGER.debug("RECONNECT: skipping - reconnect task already running")
             return
 
         now = time.monotonic()
@@ -225,7 +241,10 @@ class MelittaDevice:
             delay = max(delay, 8.0 - since_last)
 
         self._reconnect_attempts += 1
-        _LOGGER.info("Reconnect to %s in %.0fs (attempt %d)", self._address, delay, self._reconnect_attempts)
+        _LOGGER.info(
+            "RECONNECT: scheduling for %s in %.0fs (attempt %d, backoff_exp=%d, since_last=%.1fs)",
+            self._address, delay, self._reconnect_attempts, capped, since_last,
+        )
         self._status = "waiting_reconnect"
         self._last_error = f"Opnieuw verbinden over {int(delay)} seconden... (poging {self._reconnect_attempts})"
         self._notify_callbacks()
@@ -240,18 +259,25 @@ class MelittaDevice:
 
     async def _reconnect_after_delay(self, delay: float):
         try:
+            _LOGGER.debug("RECONNECT: waiting %.0fs before reconnect attempt...", delay)
             await asyncio.sleep(delay)
             if self._shutting_down or self._gave_up or (self._is_connected and self._authenticated):
+                _LOGGER.debug(
+                    "RECONNECT: cancelled after delay (shutting_down=%s, gave_up=%s, connected=%s, auth=%s)",
+                    self._shutting_down, self._gave_up, self._is_connected, self._authenticated,
+                )
                 return
             self._last_reconnect_time = time.monotonic()
             self._reconnect_task = None
+            _LOGGER.info("RECONNECT: starting reconnect attempt now for %s", self._address)
             success = await self.connect()
+            _LOGGER.info("RECONNECT: attempt result=%s for %s", success, self._address)
             if not success and not self._shutting_down and not self._gave_up:
                 self.schedule_reconnect()
         except asyncio.CancelledError:
-            pass
+            _LOGGER.debug("RECONNECT: reconnect task cancelled for %s", self._address)
         except Exception as err:
-            _LOGGER.error("Reconnect error for %s: %s", self._address, err)
+            _LOGGER.error("RECONNECT: error for %s: %s (%s)", self._address, err, type(err).__name__)
             self._reconnect_task = None
             if not self._shutting_down and not self._gave_up:
                 self.schedule_reconnect()
@@ -369,15 +395,21 @@ class MelittaDevice:
 
     async def connect(self) -> bool:
         if self._is_connected and self._authenticated:
+            _LOGGER.debug("CONNECT: already connected and authenticated, skipping")
             return True
         if self._gave_up:
-            _LOGGER.info("Connect blocked: gave up after %d failures", self._auth_failure_count)
+            _LOGGER.info("CONNECT: blocked - gave up after %d auth failures", self._auth_failure_count)
             return False
 
+        _LOGGER.info(
+            "CONNECT: starting for %s (connected=%s, authenticated=%s, auth_failures=%d)",
+            self._address, self._is_connected, self._authenticated, self._auth_failure_count,
+        )
         self._connect_pending = True
         try:
             async with self._connect_lock:
                 if self._is_connected and self._authenticated:
+                    _LOGGER.debug("CONNECT: became connected while waiting for lock")
                     return True
                 self._cancel_reconnect()
                 return await self._do_connect()
@@ -388,46 +420,84 @@ class MelittaDevice:
         self._cancel_reconnect()
 
         if self._client is not None:
+            _LOGGER.debug("CONNECT FLOW: disconnecting existing client before new connect")
             await self._internal_disconnect()
             await asyncio.sleep(0.5)
 
         if self._dbus_cleanup_task and not self._dbus_cleanup_task.done():
+            _LOGGER.debug("CONNECT FLOW: waiting for pending D-Bus cleanup...")
             try:
                 await asyncio.wait_for(self._dbus_cleanup_task, timeout=2.0)
             except (asyncio.TimeoutError, Exception):
-                pass
+                _LOGGER.debug("CONNECT FLOW: D-Bus cleanup wait timed out, continuing")
         self._dbus_cleanup_task = None
         await self._stop_dbus_notifications()
 
         if self._hass is not None:
-            from .dbus_utils import dbus_cancel_pairing
+            from .dbus_utils import (
+                dbus_cancel_pairing, dbus_check_paired, dbus_remove_device,
+            )
+            _LOGGER.debug("CONNECT FLOW: cancelling any pending pairing operations")
             await dbus_cancel_pairing(self._address)
+            _LOGGER.debug("CONNECT FLOW: forcing BlueZ disconnect if still connected")
             await self._force_bluez_disconnect()
 
-        _LOGGER.info("Connecting to %s (attempt %d)", self._address, self._reconnect_attempts + 1)
+            _LOGGER.debug("CONNECT FLOW: checking existing bond status in BlueZ")
+            pre_paired = await dbus_check_paired(self._address)
+            _LOGGER.info("CONNECT FLOW: pre-connect bond check: paired=%s, auth_failures=%d", pre_paired, self._auth_failure_count)
+            if pre_paired:
+                if self._auth_failure_count > 0:
+                    _LOGGER.warning(
+                        "CONNECT FLOW: device paired in BlueZ but had %d auth failures - removing stale bond",
+                        self._auth_failure_count,
+                    )
+                    self._status = "removing_stale_bond"
+                    self._last_error = "Oude Bluetooth-koppeling verwijderen..."
+                    self._notify_callbacks()
+                    removed = await dbus_remove_device(self._address)
+                    _LOGGER.info("CONNECT FLOW: bond removal result=%s", removed)
+                    await asyncio.sleep(2.0)
+                    still_paired = await dbus_check_paired(self._address)
+                    if still_paired:
+                        _LOGGER.warning("CONNECT FLOW: bond still exists after removal, retrying...")
+                        await dbus_remove_device(self._address)
+                        await asyncio.sleep(2.0)
+                    _LOGGER.info("CONNECT FLOW: stale bond removed, proceeding to connect fresh")
+                else:
+                    _LOGGER.info("CONNECT FLOW: device already paired in BlueZ (no failures), will use existing bond")
+
+        _LOGGER.info("CONNECT FLOW: establishing BLE connection to %s (attempt %d)", self._address, self._reconnect_attempts + 1)
 
         try:
             self._status = "connecting"
             self._stop_polling()
             self._notify_callbacks()
 
+            _LOGGER.debug("CONNECT FLOW: looking up BLE device for %s", self._address)
             ble_device = await self._get_ble_device()
             if ble_device is None:
+                _LOGGER.warning("CONNECT FLOW: BLE device not found for %s", self._address)
                 return False
 
+            _LOGGER.debug("CONNECT FLOW: BLE device found, establishing connection...")
             await self._establish_ble_connection(ble_device)
             self._is_connected = True
             self._reconnect_attempts = 0
             self._last_error = None
-            _LOGGER.info("BLE connected to %s", self._address)
+            _LOGGER.info("CONNECT FLOW: BLE connected to %s (MTU=%s)", self._address,
+                         self._client.mtu_size if self._client and hasattr(self._client, 'mtu_size') else "unknown")
 
             await asyncio.sleep(0.1)
             if not self._is_connected or self._shutting_down:
+                _LOGGER.debug("CONNECT FLOW: lost connection immediately after connect or shutting down")
                 return False
 
             if self._hass is not None:
+                _LOGGER.debug("CONNECT FLOW: handling BLE pairing...")
                 freshly_paired = await self._handle_pairing()
+                _LOGGER.info("CONNECT FLOW: pairing result: freshly_paired=%s", freshly_paired)
                 if freshly_paired:
+                    _LOGGER.info("CONNECT FLOW: fresh pairing done, disconnect/reconnect cycle for encryption activation")
                     self._suppress_disconnect_callback = True
                     try:
                         await self._internal_disconnect()
@@ -436,42 +506,49 @@ class MelittaDevice:
                     self._suppress_disconnect_callback = False
                     await asyncio.sleep(0.5)
 
+                    _LOGGER.debug("CONNECT FLOW: reconnecting after fresh pairing (attempt 1)...")
                     reconnected = await self._internal_reconnect_ble()
                     if not reconnected:
+                        _LOGGER.debug("CONNECT FLOW: reconnect attempt 1 failed, retrying after 1s...")
                         await asyncio.sleep(1.0)
                         reconnected = await self._internal_reconnect_ble()
                     if not reconnected:
-                        _LOGGER.warning("Reconnect after pairing failed")
+                        _LOGGER.warning("CONNECT FLOW: reconnect after pairing failed (both attempts)")
                         self._status = "offline"
                         self._last_error = "Herverbinding na koppeling mislukt"
                         self._notify_callbacks()
                         return False
 
-                    _LOGGER.info("Reconnected after fresh pairing, activating encryption...")
+                    _LOGGER.info("CONNECT FLOW: reconnected after fresh pairing, activating encryption via Pair()...")
                     from .dbus_utils import dbus_force_encryption
-                    await dbus_force_encryption(self._address)
+                    enc_result = await dbus_force_encryption(self._address)
+                    _LOGGER.debug("CONNECT FLOW: force encryption result=%s", enc_result)
 
                     if not self._is_connected:
+                        _LOGGER.debug("CONNECT FLOW: lost connection after encryption, reconnecting...")
                         await asyncio.sleep(0.5)
                         reconnected = await self._internal_reconnect_ble()
                         if not reconnected:
                             await asyncio.sleep(1.0)
                             reconnected = await self._internal_reconnect_ble()
                         if reconnected:
-                            await dbus_force_encryption(self._address)
+                            enc_result2 = await dbus_force_encryption(self._address)
+                            _LOGGER.debug("CONNECT FLOW: second force encryption result=%s", enc_result2)
                         else:
                             self._status = "offline"
                             self._last_error = "Herverbinding mislukt na koppeling"
                             self._notify_callbacks()
                             return False
 
+            _LOGGER.info("CONNECT FLOW: moving to authentication phase for %s", self._address)
             self._status = "authenticating"
             self._notify_callbacks()
 
             auth_ok = await self._setup_notifications_and_auth()
+            _LOGGER.info("CONNECT FLOW: auth result=%s, authenticated=%s, connected=%s", auth_ok, self._authenticated, self._is_connected)
 
             if not self._is_connected:
-                _LOGGER.info("Connection lost during auth for %s", self._address)
+                _LOGGER.info("CONNECT FLOW: connection lost during auth for %s", self._address)
                 return False
 
             if self._authenticated:
@@ -514,9 +591,79 @@ class MelittaDevice:
                 return False
 
         except (BleakError, asyncio.TimeoutError, OSError, EOFError) as err:
+            err_str = str(err)
+            _LOGGER.error("Connect failed to %s: %s", self._address, err)
+
+            if self._hass is not None and "failed to discover services" in err_str.lower():
+                _LOGGER.warning("Service discovery failed - likely stale bond, attempting bond removal and retry")
+                from .dbus_utils import dbus_check_paired, dbus_remove_device
+                is_paired = await dbus_check_paired(self._address)
+                if is_paired:
+                    self._status = "removing_stale_bond"
+                    self._last_error = "Service-ontdekking mislukt. Oude koppeling verwijderen..."
+                    self._notify_callbacks()
+                    await dbus_remove_device(self._address)
+                    await asyncio.sleep(2.0)
+                    still_paired = await dbus_check_paired(self._address)
+                    if still_paired:
+                        await dbus_remove_device(self._address)
+                        await asyncio.sleep(2.0)
+                    _LOGGER.info("Bond removed after service discovery failure, retrying connect...")
+
+                    self._status = "connecting"
+                    self._last_error = "Opnieuw verbinden na verwijderen oude koppeling..."
+                    self._notify_callbacks()
+                    try:
+                        ble_device = await self._get_ble_device()
+                        if ble_device is not None:
+                            await self._establish_ble_connection(ble_device)
+                            self._is_connected = True
+                            self._reconnect_attempts = 0
+                            _LOGGER.info("Retry connect succeeded after bond removal")
+
+                            if self._hass is not None:
+                                freshly_paired = await self._handle_pairing()
+                                if freshly_paired:
+                                    self._suppress_disconnect_callback = True
+                                    try:
+                                        await self._internal_disconnect()
+                                    except Exception:
+                                        pass
+                                    self._suppress_disconnect_callback = False
+                                    await asyncio.sleep(0.5)
+                                    reconnected = await self._internal_reconnect_ble()
+                                    if not reconnected:
+                                        await asyncio.sleep(1.0)
+                                        reconnected = await self._internal_reconnect_ble()
+                                    if reconnected:
+                                        from .dbus_utils import dbus_force_encryption
+                                        await dbus_force_encryption(self._address)
+                                    else:
+                                        self._status = "offline"
+                                        self._last_error = "Herverbinding na koppeling mislukt"
+                                        self._notify_callbacks()
+                                        return False
+
+                            self._status = "authenticating"
+                            self._notify_callbacks()
+                            auth_ok = await self._setup_notifications_and_auth()
+                            if self._authenticated:
+                                self._status = "ready"
+                                self._start_keepalive()
+                                _LOGGER.info("Connected and authenticated after bond removal retry")
+                                await self._request_status()
+                                self._notify_callbacks()
+                                return True
+                            else:
+                                self._status = "connected_not_auth"
+                                self._last_error = "Authenticatie mislukt na herverbinding"
+                                self._notify_callbacks()
+                                return False
+                    except (BleakError, asyncio.TimeoutError, OSError, EOFError) as retry_err:
+                        _LOGGER.error("Retry connect also failed after bond removal: %s", retry_err)
+
             self._status = "offline"
             self._last_error = f"Verbinding mislukt: {err}"
-            _LOGGER.error("Connect failed to %s: %s", self._address, err)
             self._notify_callbacks()
             return False
 
@@ -526,15 +673,20 @@ class MelittaDevice:
             dbus_remove_device, dbus_check_bond_valid,
         )
 
+        _LOGGER.debug("PAIRING: checking existing pairing status for %s", self._address)
         is_paired = await dbus_check_paired(self._address)
+        _LOGGER.info("PAIRING: is_paired=%s for %s", is_paired, self._address)
         if is_paired:
+            _LOGGER.debug("PAIRING: checking bond validity (ServicesResolved)...")
             bond_valid = await dbus_check_bond_valid(self._address)
+            _LOGGER.info("PAIRING: bond_valid=%s for %s", bond_valid, self._address)
             if bond_valid:
-                _LOGGER.info("Device already paired with valid bond, activating encryption")
-                await dbus_force_encryption(self._address)
+                _LOGGER.info("PAIRING: valid bond exists, activating encryption via Pair()")
+                enc_ok = await dbus_force_encryption(self._address)
+                _LOGGER.debug("PAIRING: force encryption result=%s", enc_ok)
                 return False
             else:
-                _LOGGER.warning("Stale bond detected (paired but encryption failed) - removing old pairing")
+                _LOGGER.warning("PAIRING: stale bond detected (paired but ServicesResolved=False) - removing old pairing")
                 self._status = "removing_stale_bond"
                 self._last_error = "Oude koppeling verwijderen (rode Bluetooth)..."
                 self._notify_callbacks()
@@ -572,19 +724,21 @@ class MelittaDevice:
                     self._notify_callbacks()
                     return False
 
-        _LOGGER.info("Device not paired, initiating pairing (machine must be in Verbinden mode)")
+        _LOGGER.info("PAIRING: device not paired, initiating BLE pairing (machine MUST be in Verbinden mode with blue blinking)")
 
         def status_cb(status, msg):
+            _LOGGER.debug("PAIRING: status callback: status=%s, msg=%s", status, msg)
             self._status = status
             self._last_error = msg
             self._notify_callbacks()
 
         pair_ok = await dbus_pair_device(self._address, status_callback=status_cb)
+        _LOGGER.info("PAIRING: result=%s for %s", pair_ok, self._address)
         if pair_ok:
-            _LOGGER.info("Pairing succeeded")
+            _LOGGER.info("PAIRING: succeeded - machine is now paired")
             return True
         else:
-            _LOGGER.warning("Pairing failed - continuing without pairing")
+            _LOGGER.warning("PAIRING: failed - is the machine in Verbinden mode? (blue blinking display, 60s window)")
             return False
 
     async def _setup_notifications_and_auth(self) -> bool:
@@ -802,29 +956,36 @@ class MelittaDevice:
         if self._hass is not None:
             try:
                 from homeassistant.components.bluetooth import async_ble_device_from_address
+                _LOGGER.debug("BLE DEVICE: looking up %s via HA Bluetooth", self._address)
                 ble_device = async_ble_device_from_address(self._hass, self._address, connectable=True)
                 if ble_device:
+                    _LOGGER.debug("BLE DEVICE: found %s (name=%s)", self._address,
+                                  ble_device.name if hasattr(ble_device, 'name') else "unknown")
                     return ble_device
-                _LOGGER.info("Device %s not found via HA Bluetooth", self._address)
+                _LOGGER.info("BLE DEVICE: %s not found via HA Bluetooth - is the machine powered on?", self._address)
                 self._status = "offline"
                 self._last_error = "Machine niet gevonden via Bluetooth. Staat de machine aan?"
                 self._notify_callbacks()
                 return None
             except ImportError:
+                _LOGGER.warning("BLE DEVICE: HA Bluetooth integration not available")
                 self._status = "offline"
                 self._last_error = "Bluetooth-integratie niet beschikbaar"
                 self._notify_callbacks()
                 return None
             except Exception as err:
+                _LOGGER.warning("BLE DEVICE: error looking up %s: %s (%s)", self._address, err, type(err).__name__)
                 self._status = "offline"
                 self._last_error = f"Bluetooth-fout: {err}"
                 self._notify_callbacks()
                 return None
         else:
+            _LOGGER.debug("BLE DEVICE: no hass, using raw address %s", self._address)
             return self._address
 
     async def _establish_ble_connection(self, ble_device):
         if self._hass is not None and not isinstance(ble_device, str):
+            _LOGGER.debug("BLE CONNECT: using establish_connection (HA mode, max_attempts=3)")
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
                 ble_device,
@@ -832,18 +993,23 @@ class MelittaDevice:
                 disconnected_callback=self._on_disconnect,
                 max_attempts=3,
             )
+            _LOGGER.debug("BLE CONNECT: establish_connection succeeded, client=%s", type(self._client).__name__)
         else:
+            _LOGGER.debug("BLE CONNECT: using BleakClient direct (timeout=%ds)", CONNECT_TIMEOUT)
             self._client = BleakClient(
                 ble_device,
                 timeout=CONNECT_TIMEOUT,
                 disconnected_callback=self._on_disconnect,
             )
             await self._client.connect()
+            _LOGGER.debug("BLE CONNECT: BleakClient.connect() succeeded")
 
     async def _internal_disconnect(self):
+        _LOGGER.debug("INTERNAL DISCONNECT: starting (has_client=%s, connected=%s)", self._client is not None, self._is_connected)
         await self._stop_dbus_notifications()
 
         if self._client is None:
+            _LOGGER.debug("INTERNAL DISCONNECT: no client, nothing to disconnect")
             return
         old_client = self._client
         self._client = None
@@ -854,38 +1020,48 @@ class MelittaDevice:
         try:
             try:
                 await old_client.stop_notify(BLE_READ_UUID)
-            except Exception:
-                pass
+                _LOGGER.debug("INTERNAL DISCONNECT: stop_notify succeeded")
+            except Exception as err:
+                _LOGGER.debug("INTERNAL DISCONNECT: stop_notify error (expected): %s", err)
             try:
                 await old_client.disconnect()
-            except Exception:
-                pass
+                _LOGGER.debug("INTERNAL DISCONNECT: BLE disconnect succeeded")
+            except Exception as err:
+                _LOGGER.debug("INTERNAL DISCONNECT: BLE disconnect error (expected): %s", err)
         finally:
             self._suppress_disconnect_callback = False
+        _LOGGER.debug("INTERNAL DISCONNECT: complete")
 
     async def _internal_reconnect_ble(self) -> bool:
+        _LOGGER.debug("INTERNAL RECONNECT: attempting BLE reconnect for %s", self._address)
         ble_device = await self._get_ble_device()
         if ble_device is None:
+            _LOGGER.debug("INTERNAL RECONNECT: BLE device not found")
             return False
 
         try:
             await self._establish_ble_connection(ble_device)
             self._is_connected = True
-            _LOGGER.debug("BLE reconnect succeeded for %s", self._address)
+            _LOGGER.info("INTERNAL RECONNECT: BLE reconnect succeeded for %s", self._address)
             await asyncio.sleep(0.3)
             return True
         except Exception as err:
-            _LOGGER.debug("BLE reconnect failed for %s: %s", self._address, err)
+            _LOGGER.warning("INTERNAL RECONNECT: BLE reconnect failed for %s: %s (%s)", self._address, err, type(err).__name__)
             self._client = None
             self._is_connected = False
             return False
 
     async def _get_char_path(self) -> str | None:
         from .dbus_utils import get_char_path_from_services, get_char_path_via_dbus
+        _LOGGER.debug("CHAR PATH: looking up D-Bus path for characteristic %s", BLE_READ_UUID)
         path = get_char_path_from_services(self._client, BLE_READ_UUID)
         if path:
+            _LOGGER.debug("CHAR PATH: found via Bleak services: %s", path)
             return path
-        return await get_char_path_via_dbus(self._address, BLE_READ_UUID)
+        _LOGGER.debug("CHAR PATH: not found via Bleak services, trying D-Bus introspection...")
+        path = await get_char_path_via_dbus(self._address, BLE_READ_UUID)
+        _LOGGER.debug("CHAR PATH: D-Bus introspection result: %s", path)
+        return path
 
     async def _force_bluez_disconnect(self):
         from .dbus_utils import dbus_force_disconnect
@@ -907,30 +1083,38 @@ class MelittaDevice:
         self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
 
     async def _keepalive_loop(self):
+        _LOGGER.debug("KEEPALIVE: loop started (interval=%ds, session_key=%s)",
+                       KEEPALIVE_INTERVAL, self._session_key.hex() if self._session_key else "None")
+        keepalive_count = 0
         try:
             while self._is_connected and self._authenticated:
                 await asyncio.sleep(KEEPALIVE_INTERVAL)
                 if not self._is_connected or not self._authenticated:
+                    _LOGGER.debug("KEEPALIVE: loop ending (connected=%s, authenticated=%s)", self._is_connected, self._authenticated)
                     break
                 try:
                     frame = build_frame(CMD_KEEPALIVE, self._session_key, None, encrypt=True)
                     await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
-                    _LOGGER.debug("Keepalive sent")
+                    keepalive_count += 1
+                    _LOGGER.debug("KEEPALIVE: sent #%d (%d bytes)", keepalive_count, len(frame))
                 except Exception as err:
-                    _LOGGER.warning("Keepalive failed: %s", err)
+                    _LOGGER.warning("KEEPALIVE: send failed after %d successful sends: %s (%s)",
+                                    keepalive_count, err, type(err).__name__)
                     break
         except asyncio.CancelledError:
-            pass
+            _LOGGER.debug("KEEPALIVE: loop cancelled after %d sends", keepalive_count)
 
     async def _request_status(self):
         if not self._is_connected or not self._authenticated:
+            _LOGGER.debug("STATUS REQUEST: skipping (connected=%s, authenticated=%s)", self._is_connected, self._authenticated)
             return
         try:
             frame = build_frame(CMD_STATUS, self._session_key, None, encrypt=True)
             await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
-            _LOGGER.debug("Status request sent")
+            _LOGGER.debug("STATUS REQUEST: sent (%d bytes, session=%s)", len(frame),
+                          self._session_key.hex() if self._session_key else "None")
         except Exception as err:
-            _LOGGER.debug("Status request failed: %s", err)
+            _LOGGER.debug("STATUS REQUEST: failed: %s (%s)", err, type(err).__name__)
 
     async def _start_polling(self):
         last_data = None
@@ -979,7 +1163,7 @@ class MelittaDevice:
 
     async def brew(self, beverage_type: int, strength: int | None = None, cups: int | None = None) -> bool:
         if not self._authenticated or not self._session_key:
-            _LOGGER.warning("Cannot brew: not authenticated")
+            _LOGGER.warning("BREW: cannot brew - not authenticated (auth=%s, session=%s)", self._authenticated, self._session_key is not None)
             return False
 
         s = strength if strength is not None else self._strength
@@ -987,20 +1171,23 @@ class MelittaDevice:
         payload = bytes([beverage_type & 0xFF, s & 0xFF, c & 0xFF])
 
         bev_name = BEVERAGE_NAMES.get(beverage_type, f"type_{beverage_type}")
-        _LOGGER.info("Brewing: %s (type=%d), strength=%d, cups=%d", bev_name, beverage_type, s, c)
+        _LOGGER.info(
+            "BREW: starting %s (type=%d, strength=%d, cups=%d, payload=%s, session=%s)",
+            bev_name, beverage_type, s, c, payload.hex(), self._session_key.hex(),
+        )
 
         try:
             frame = build_frame(CMD_BREW, self._session_key, payload, encrypt=True)
             await self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False)
-            _LOGGER.info("Brew command sent for %s", bev_name)
+            _LOGGER.info("BREW: command sent for %s (%d bytes)", bev_name, len(frame))
             return True
         except Exception as err:
-            _LOGGER.error("Brew command failed: %s", err)
+            _LOGGER.error("BREW: command failed for %s: %s (%s)", bev_name, err, type(err).__name__)
             return False
 
     async def send_write(self, param_id: int, value: int) -> bool:
         if not self._authenticated or not self._session_key:
-            _LOGGER.warning("Cannot write: not authenticated")
+            _LOGGER.warning("WRITE CMD: cannot write - not authenticated (auth=%s, session=%s)", self._authenticated, self._session_key is not None)
             return False
 
         payload = bytes([
@@ -1019,7 +1206,7 @@ class MelittaDevice:
             return False
 
     async def disconnect(self):
-        _LOGGER.info("Disconnect requested for %s", self._address)
+        _LOGGER.info("SHUTDOWN: disconnect requested for %s (connected=%s, authenticated=%s)", self._address, self._is_connected, self._authenticated)
         self._shutting_down = True
         self._auth_event.set()
         self._cancel_reconnect()
@@ -1049,4 +1236,4 @@ class MelittaDevice:
         self._status = "offline"
         self._shutting_down = False
         self._notify_callbacks()
-        _LOGGER.info("Disconnect complete for %s", self._address)
+        _LOGGER.info("SHUTDOWN: disconnect complete for %s", self._address)
