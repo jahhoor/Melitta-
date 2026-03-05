@@ -15,7 +15,7 @@ _ACTIVE_KEY_INDEX = 0
 
 
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
-    _LOGGER.debug(
+    _LOGGER.info(
         "AES-CBC decrypt: key=%d bytes, iv=%d bytes, data=%d bytes, data_hex=%s",
         len(key), len(iv), len(data), data.hex(),
     )
@@ -26,10 +26,10 @@ def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     try:
         unpadder = sym_padding.PKCS7(128).unpadder()
         unpadded = unpadder.update(decrypted) + unpadder.finalize()
-        _LOGGER.debug("PKCS7 unpad OK: %d -> %d bytes, result_hex=%s", len(decrypted), len(unpadded), unpadded.hex())
+        _LOGGER.info("PKCS7 unpad OK: %d -> %d bytes, result_hex=%s", len(decrypted), len(unpadded), unpadded.hex())
         return unpadded
     except ValueError:
-        _LOGGER.debug("PKCS7 unpad failed, returning raw %d bytes, result_hex=%s", len(decrypted), decrypted.hex())
+        _LOGGER.info("PKCS7 unpad failed, returning raw %d bytes, result_hex=%s", len(decrypted), decrypted.hex())
         return decrypted
 
 
@@ -47,12 +47,12 @@ def _derive_all_rc4_keys() -> list[tuple[str, bytes]]:
     results = []
     for name, aes_key in key_sources:
         if len(aes_key) != 32:
-            _LOGGER.debug("RC4 KEY: skipping %s (len=%d, need 32)", name, len(aes_key))
+            _LOGGER.info("RC4 KEY: skipping %s (len=%d, need 32)", name, len(aes_key))
             continue
         try:
             rc4_key = _aes_cbc_decrypt(aes_key, IV_INIT, AES_ENCRYPTED_DATA)
             results.append((name, rc4_key))
-            _LOGGER.debug(
+            _LOGGER.info(
                 "RC4 KEY [%s]: derived %d bytes, first4=%s",
                 name, len(rc4_key), rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
             )
@@ -75,7 +75,7 @@ def get_rc4_key() -> bytes:
     idx = _ACTIVE_KEY_INDEX % len(all_keys)
     name, rc4_key = all_keys[idx]
     _RC4_KEY_CACHE = rc4_key
-    _LOGGER.debug(
+    _LOGGER.info(
         "RC4 key active [%d/%d]: %s (first4=%s)",
         idx + 1, len(all_keys), name,
         rc4_key[:4].hex() if len(rc4_key) >= 4 else "N/A",
@@ -129,15 +129,15 @@ class RC4:
 
 
 def rc4_crypt(key: bytes, data: bytes) -> bytes:
-    _LOGGER.debug("RC4 crypt: key=%d bytes, data=%d bytes, in_hex=%s", len(key), len(data), data.hex())
+    _LOGGER.info("RC4 crypt: key=%d bytes, data=%d bytes, in_hex=%s", len(key), len(data), data.hex())
     rc4 = RC4(key)
     result = rc4.crypt(data)
-    _LOGGER.debug("RC4 crypt result: out_hex=%s", result.hex())
+    _LOGGER.info("RC4 crypt result: out_hex=%s", result.hex())
     return result
 
 
 def sbox_hash(data: bytes, length: int) -> bytes:
-    _LOGGER.debug("SBOX hash input: data=%s, length=%d", data[:length].hex(), length)
+    _LOGGER.info("SBOX hash input: data=%s, length=%d", data[:length].hex(), length)
     b1 = SBOX[data[0] & 0xFF]
     for i in range(1, length):
         b1 = SBOX[(b1 ^ data[i]) & 0xFF]
@@ -149,5 +149,5 @@ def sbox_hash(data: bytes, length: int) -> bytes:
     result2 = (b2 + 167) & 0xFF
 
     result = bytes([result1, result2])
-    _LOGGER.debug("SBOX hash output: %s (b1_final=%d, b2_final=%d)", result.hex(), result1, result2)
+    _LOGGER.info("SBOX hash output: %s (b1_final=%d, b2_final=%d)", result.hex(), result1, result2)
     return result

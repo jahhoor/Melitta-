@@ -55,24 +55,24 @@ async def dbus_check_paired(address: str) -> bool:
         bus = await _get_bus()
         try:
             adapters = await _get_adapters(bus)
-            _LOGGER.debug("DBUS CHECK PAIRED: checking %s on adapters %s", address, adapters)
+            _LOGGER.info("DBUS CHECK PAIRED: checking %s on adapters %s", address, adapters)
             for adapter in adapters:
                 dp = _device_path(adapter, address)
                 val = await _get_device_property(bus, dp, "Paired")
                 connected = await _get_device_property(bus, dp, "Connected")
                 trusted = await _get_device_property(bus, dp, "Trusted")
-                _LOGGER.debug(
+                _LOGGER.info(
                     "DBUS CHECK PAIRED: %s on %s: Paired=%s, Connected=%s, Trusted=%s",
                     address, adapter, val, connected, trusted,
                 )
                 if val is not None and bool(val):
                     return True
-            _LOGGER.debug("DBUS CHECK PAIRED: %s not paired on any adapter", address)
+            _LOGGER.info("DBUS CHECK PAIRED: %s not paired on any adapter", address)
             return False
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS CHECK PAIRED: error for %s: %s (%s)", address, err, type(err).__name__)
+        _LOGGER.info("DBUS CHECK PAIRED: error for %s: %s (%s)", address, err, type(err).__name__)
         return False
 
 
@@ -88,7 +88,7 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
 
             @dbus_method()
             def Release(self) -> "":
-                _LOGGER.debug("DBUS AGENT: Release called")
+                _LOGGER.info("DBUS AGENT: Release called")
 
             @dbus_method()
             def RequestPinCode(self, device: "o") -> "s":
@@ -97,7 +97,7 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
 
             @dbus_method()
             def DisplayPinCode(self, device: "o", pincode: "s") -> "":
-                _LOGGER.debug("DBUS AGENT: DisplayPinCode for %s: %s", device, pincode)
+                _LOGGER.info("DBUS AGENT: DisplayPinCode for %s: %s", device, pincode)
 
             @dbus_method()
             def RequestPasskey(self, device: "o") -> "u":
@@ -106,7 +106,7 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
 
             @dbus_method()
             def DisplayPasskey(self, device: "o", passkey: "u", entered: "q") -> "":
-                _LOGGER.debug("DBUS AGENT: DisplayPasskey for %s: passkey=%d, entered=%d", device, passkey, entered)
+                _LOGGER.info("DBUS AGENT: DisplayPasskey for %s: passkey=%d, entered=%d", device, passkey, entered)
 
             @dbus_method()
             def RequestConfirmation(self, device: "o", passkey: "u") -> "":
@@ -118,7 +118,7 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
 
             @dbus_method()
             def AuthorizeService(self, device: "o", uuid: "s") -> "":
-                _LOGGER.debug("DBUS AGENT: AuthorizeService for %s, uuid=%s", device, uuid)
+                _LOGGER.info("DBUS AGENT: AuthorizeService for %s, uuid=%s", device, uuid)
 
             @dbus_method()
             def Cancel(self) -> "":
@@ -130,12 +130,12 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
         try:
             try:
                 await bus.request_name("org.melitta.agent")
-                _LOGGER.debug("DBUS PAIR: claimed bus name org.melitta.agent")
+                _LOGGER.info("DBUS PAIR: claimed bus name org.melitta.agent")
             except Exception as err:
-                _LOGGER.debug("DBUS PAIR: bus name claim failed (expected if already held): %s", err)
+                _LOGGER.info("DBUS PAIR: bus name claim failed (expected if already held): %s", err)
 
             bus.export(AGENT_PATH, agent)
-            _LOGGER.debug("DBUS PAIR: agent exported on %s", AGENT_PATH)
+            _LOGGER.info("DBUS PAIR: agent exported on %s", AGENT_PATH)
 
             reg_reply = await bus.call(Message(
                 destination="org.bluez", path="/org/bluez",
@@ -148,9 +148,9 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
                 if "AlreadyExists" not in (reg_reply.error_name or ""):
                     _LOGGER.warning("DBUS PAIR: agent registration failed: %s", reg_reply.error_name)
                     return False
-                _LOGGER.debug("DBUS PAIR: agent already registered (AlreadyExists)")
+                _LOGGER.info("DBUS PAIR: agent already registered (AlreadyExists)")
             else:
-                _LOGGER.debug("DBUS PAIR: agent registered successfully")
+                _LOGGER.info("DBUS PAIR: agent registered successfully")
             agent_registered = True
 
             await bus.call(Message(
@@ -160,16 +160,16 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
                 signature="o",
                 body=[AGENT_PATH],
             ))
-            _LOGGER.debug("DBUS PAIR: set as default agent")
+            _LOGGER.info("DBUS PAIR: set as default agent")
 
             adapters = await _get_adapters(bus)
-            _LOGGER.debug("DBUS PAIR: scanning adapters %s for device %s", adapters, address)
+            _LOGGER.info("DBUS PAIR: scanning adapters %s for device %s", adapters, address)
             for adapter in adapters:
                 dp = _device_path(adapter, address)
                 paired = await _get_device_property(bus, dp, "Paired")
-                _LOGGER.debug("DBUS PAIR: %s on %s: Paired=%s", address, adapter, paired)
+                _LOGGER.info("DBUS PAIR: %s on %s: Paired=%s", address, adapter, paired)
                 if paired is None:
-                    _LOGGER.debug("DBUS PAIR: device not found on adapter %s, skipping", adapter)
+                    _LOGGER.info("DBUS PAIR: device not found on adapter %s, skipping", adapter)
                     continue
                 if bool(paired):
                     _LOGGER.info("DBUS PAIR: device %s already paired on %s", address, adapter)
@@ -210,7 +210,7 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
                     member="Set", signature="ssv",
                     body=["org.bluez.Device1", "Trusted", Variant("b", True)],
                 ))
-                _LOGGER.debug("DBUS PAIR: Trusted set for %s (result=%s)", address,
+                _LOGGER.info("DBUS PAIR: Trusted set for %s (result=%s)", address,
                               "OK" if trust_reply.message_type != MessageType.ERROR else trust_reply.error_name)
                 return True
 
@@ -239,6 +239,9 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
     except asyncio.TimeoutError:
         _LOGGER.warning("DBUS PAIR: Pair() timed out (30s) for %s - is the machine in Verbinden mode?", address)
         return False
+    except EOFError as err:
+        _LOGGER.warning("DBUS PAIR: D-Bus connection closed unexpectedly (EOFError) for %s: %s - bus cleaned up", address, err)
+        return False
     except ImportError:
         _LOGGER.warning("DBUS PAIR: dbus_fast not available for pairing")
         return False
@@ -248,7 +251,7 @@ async def dbus_pair_device(address: str, status_callback=None) -> bool:
 
 
 async def dbus_check_bond_valid(address: str) -> bool:
-    _LOGGER.debug("DBUS BOND CHECK: validating bond for %s", address)
+    _LOGGER.info("DBUS BOND CHECK: validating bond for %s", address)
     try:
         from dbus_fast import Message, MessageType
         bus = await _get_bus()
@@ -257,40 +260,40 @@ async def dbus_check_bond_valid(address: str) -> bool:
                 dp = _device_path(adapter, address)
                 paired = await _get_device_property(bus, dp, "Paired")
                 if not paired:
-                    _LOGGER.debug("DBUS BOND CHECK: not paired on %s, skipping", adapter)
+                    _LOGGER.info("DBUS BOND CHECK: not paired on %s, skipping", adapter)
                     continue
                 connected = await _get_device_property(bus, dp, "Connected")
-                _LOGGER.debug("DBUS BOND CHECK: %s on %s: Paired=%s, Connected=%s", address, adapter, paired, connected)
+                _LOGGER.info("DBUS BOND CHECK: %s on %s: Paired=%s, Connected=%s", address, adapter, paired, connected)
                 if not connected:
-                    _LOGGER.debug("DBUS BOND CHECK: device not connected, assuming valid bond (will verify on connect)")
+                    _LOGGER.info("DBUS BOND CHECK: device not connected, assuming valid bond (will verify on connect)")
                     return True
                 for wait in range(6):
                     services_resolved = await _get_device_property(bus, dp, "ServicesResolved")
-                    _LOGGER.debug("DBUS BOND CHECK: ServicesResolved=%s (poll %d/6)", services_resolved, wait + 1)
+                    _LOGGER.info("DBUS BOND CHECK: ServicesResolved=%s (poll %d/6)", services_resolved, wait + 1)
                     if services_resolved:
                         _LOGGER.info("DBUS BOND CHECK: ServicesResolved=True after %d polls, bond is valid", wait + 1)
                         return True
                     await asyncio.sleep(0.5)
                 _LOGGER.warning("DBUS BOND CHECK: ServicesResolved still False after 3s - STALE BOND detected for %s", address)
                 return False
-            _LOGGER.debug("DBUS BOND CHECK: no paired adapter found, returning True")
+            _LOGGER.info("DBUS BOND CHECK: no paired adapter found, returning True")
             return True
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS BOND CHECK: error for %s: %s (%s)", address, err, type(err).__name__)
+        _LOGGER.info("DBUS BOND CHECK: error for %s: %s (%s)", address, err, type(err).__name__)
         return True
 
 
 async def dbus_force_encryption(address: str) -> bool:
-    _LOGGER.debug("DBUS ENCRYPT: forcing encryption for %s via Pair()", address)
+    _LOGGER.info("DBUS ENCRYPT: forcing encryption for %s via Pair()", address)
     try:
         from dbus_fast import Message, MessageType
         bus = await _get_bus()
         try:
             for adapter in await _get_adapters(bus):
                 dp = _device_path(adapter, address)
-                _LOGGER.debug("DBUS ENCRYPT: calling Pair() on %s (timeout=5s)", dp)
+                _LOGGER.info("DBUS ENCRYPT: calling Pair() on %s (timeout=5s)", dp)
                 reply = await asyncio.wait_for(
                     bus.call(Message(
                         destination="org.bluez", path=dp,
@@ -301,23 +304,23 @@ async def dbus_force_encryption(address: str) -> bool:
                 )
                 if reply.message_type == MessageType.ERROR:
                     if "AlreadyExists" in (reply.error_name or ""):
-                        _LOGGER.debug("DBUS ENCRYPT: encryption already active (AlreadyExists) for %s", address)
+                        _LOGGER.info("DBUS ENCRYPT: encryption already active (AlreadyExists) for %s", address)
                         return True
-                    _LOGGER.debug("DBUS ENCRYPT: Pair() error: %s for %s", reply.error_name, address)
+                    _LOGGER.info("DBUS ENCRYPT: Pair() error: %s for %s", reply.error_name, address)
                     return False
                 _LOGGER.info("DBUS ENCRYPT: encryption activated for %s", address)
                 return True
-            _LOGGER.debug("DBUS ENCRYPT: no adapter found for %s", address)
+            _LOGGER.info("DBUS ENCRYPT: no adapter found for %s", address)
             return False
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS ENCRYPT: error for %s: %s (%s)", address, err, type(err).__name__)
+        _LOGGER.info("DBUS ENCRYPT: error for %s: %s (%s)", address, err, type(err).__name__)
         return False
 
 
 async def dbus_cancel_pairing(address: str):
-    _LOGGER.debug("DBUS CANCEL PAIR: cancelling any active pairing for %s", address)
+    _LOGGER.info("DBUS CANCEL PAIR: cancelling any active pairing for %s", address)
     try:
         from dbus_fast import Message, MessageType
         bus = await _get_bus()
@@ -330,17 +333,17 @@ async def dbus_cancel_pairing(address: str):
                     member="CancelPairing",
                 ))
                 if hasattr(reply, 'message_type') and reply.message_type == MessageType.ERROR:
-                    _LOGGER.debug("DBUS CANCEL PAIR: %s (expected if not pairing)", reply.error_name)
+                    _LOGGER.info("DBUS CANCEL PAIR: %s (expected if not pairing)", reply.error_name)
                 else:
-                    _LOGGER.debug("DBUS CANCEL PAIR: succeeded for %s on %s", address, adapter)
+                    _LOGGER.info("DBUS CANCEL PAIR: succeeded for %s on %s", address, adapter)
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS CANCEL PAIR: error (expected if not pairing): %s", err)
+        _LOGGER.info("DBUS CANCEL PAIR: error (expected if not pairing): %s", err)
 
 
 async def dbus_force_disconnect(address: str):
-    _LOGGER.debug("DBUS FORCE DISCONNECT: checking and disconnecting %s", address)
+    _LOGGER.info("DBUS FORCE DISCONNECT: checking and disconnecting %s", address)
     try:
         from dbus_fast import Message, MessageType
         bus = await _get_bus()
@@ -348,7 +351,7 @@ async def dbus_force_disconnect(address: str):
             for adapter in await _get_adapters(bus):
                 dp = _device_path(adapter, address)
                 connected = await _get_device_property(bus, dp, "Connected")
-                _LOGGER.debug("DBUS FORCE DISCONNECT: %s on %s: Connected=%s", address, adapter, connected)
+                _LOGGER.info("DBUS FORCE DISCONNECT: %s on %s: Connected=%s", address, adapter, connected)
                 if connected:
                     await bus.call(Message(
                         destination="org.bluez", path=dp,
@@ -360,7 +363,7 @@ async def dbus_force_disconnect(address: str):
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS FORCE DISCONNECT: error for %s: %s (%s)", address, err, type(err).__name__)
+        _LOGGER.info("DBUS FORCE DISCONNECT: error for %s: %s (%s)", address, err, type(err).__name__)
 
 
 async def dbus_remove_device(address: str) -> bool:
@@ -372,7 +375,7 @@ async def dbus_remove_device(address: str) -> bool:
             mac_path = address.replace(":", "_").upper()
             for adapter in await _get_adapters(bus):
                 dp = f"/org/bluez/{adapter}/dev_{mac_path}"
-                _LOGGER.debug("DBUS REMOVE: calling RemoveDevice on %s for %s", adapter, dp)
+                _LOGGER.info("DBUS REMOVE: calling RemoveDevice on %s for %s", adapter, dp)
                 reply = await bus.call(Message(
                     destination="org.bluez",
                     path=f"/org/bluez/{adapter}",
@@ -385,18 +388,18 @@ async def dbus_remove_device(address: str) -> bool:
                     _LOGGER.info("DBUS REMOVE: RemoveDevice succeeded for %s on %s", address, adapter)
                     return True
                 else:
-                    _LOGGER.debug("DBUS REMOVE: RemoveDevice error on %s: %s", adapter, reply.error_name)
-            _LOGGER.debug("DBUS REMOVE: device not found on any adapter")
+                    _LOGGER.info("DBUS REMOVE: RemoveDevice error on %s: %s", adapter, reply.error_name)
+            _LOGGER.info("DBUS REMOVE: device not found on any adapter")
             return False
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS REMOVE: error for %s: %s (%s)", address, err, type(err).__name__)
+        _LOGGER.info("DBUS REMOVE: error for %s: %s (%s)", address, err, type(err).__name__)
         return False
 
 
 async def dbus_write_cccd(char_path: str) -> bool:
-    _LOGGER.debug("DBUS CCCD: writing CCCD on %s", char_path)
+    _LOGGER.info("DBUS CCCD: writing CCCD on %s", char_path)
     try:
         from dbus_fast import Message, MessageType, Variant
         bus = await _get_bus()
@@ -407,11 +410,11 @@ async def dbus_write_cccd(char_path: str) -> bool:
                 member="Introspect",
             ))
             if introspect.message_type == MessageType.ERROR:
-                _LOGGER.debug("DBUS CCCD: introspect failed for %s: %s", char_path, introspect.error_name)
+                _LOGGER.info("DBUS CCCD: introspect failed for %s: %s", char_path, introspect.error_name)
                 return False
 
             descriptors = re.findall(r'<node name="(desc\w+)"', introspect.body[0]) if introspect.body else []
-            _LOGGER.debug("DBUS CCCD: found %d descriptors on %s: %s", len(descriptors), char_path, descriptors)
+            _LOGGER.info("DBUS CCCD: found %d descriptors on %s: %s", len(descriptors), char_path, descriptors)
 
             for desc_name in descriptors:
                 desc_path = f"{char_path}/{desc_name}"
@@ -422,13 +425,13 @@ async def dbus_write_cccd(char_path: str) -> bool:
                     body=["org.bluez.GattDescriptor1", "UUID"],
                 ))
                 if uuid_reply.message_type == MessageType.ERROR:
-                    _LOGGER.debug("DBUS CCCD: UUID read failed for %s", desc_path)
+                    _LOGGER.info("DBUS CCCD: UUID read failed for %s", desc_path)
                     continue
                 desc_uuid = str(uuid_reply.body[0].value if uuid_reply.body else "")
-                _LOGGER.debug("DBUS CCCD: descriptor %s UUID=%s", desc_name, desc_uuid)
+                _LOGGER.info("DBUS CCCD: descriptor %s UUID=%s", desc_name, desc_uuid)
                 if desc_uuid.lower() == "00002902-0000-1000-8000-00805f9b34fb":
                     cccd_value = bytes([0x01, 0x00])
-                    _LOGGER.debug("DBUS CCCD: found CCCD descriptor, writing 0x0100 to %s", desc_path)
+                    _LOGGER.info("DBUS CCCD: found CCCD descriptor, writing 0x0100 to %s", desc_path)
                     write_reply = await asyncio.wait_for(
                         bus.call(Message(
                             destination="org.bluez", path=desc_path,
@@ -440,22 +443,22 @@ async def dbus_write_cccd(char_path: str) -> bool:
                         timeout=3.0,
                     )
                     if write_reply.message_type == MessageType.ERROR:
-                        _LOGGER.debug("DBUS CCCD: write error: %s", write_reply.error_name)
+                        _LOGGER.info("DBUS CCCD: write error: %s", write_reply.error_name)
                         return False
                     _LOGGER.info("DBUS CCCD: descriptor written (0x0100) on %s", desc_path)
                     return True
 
-            _LOGGER.debug("DBUS CCCD: no CCCD descriptor (0x2902) found on %s", char_path)
+            _LOGGER.info("DBUS CCCD: no CCCD descriptor (0x2902) found on %s", char_path)
             return False
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS CCCD: error: %s (%s)", err, type(err).__name__)
+        _LOGGER.info("DBUS CCCD: error: %s (%s)", err, type(err).__name__)
         return False
 
 
 async def dbus_check_notifying(char_path: str) -> bool:
-    _LOGGER.debug("DBUS NOTIFY CHECK: checking Notifying property on %s", char_path)
+    _LOGGER.info("DBUS NOTIFY CHECK: checking Notifying property on %s", char_path)
     try:
         from dbus_fast import Message, MessageType
         bus = await _get_bus()
@@ -470,23 +473,23 @@ async def dbus_check_notifying(char_path: str) -> bool:
                 timeout=2.0,
             )
             if reply.message_type == MessageType.ERROR:
-                _LOGGER.debug("DBUS NOTIFY CHECK: error reading Notifying: %s", reply.error_name)
+                _LOGGER.info("DBUS NOTIFY CHECK: error reading Notifying: %s", reply.error_name)
                 return False
             val = reply.body[0] if reply.body else None
             if hasattr(val, 'value'):
                 val = val.value
             result = bool(val)
-            _LOGGER.debug("DBUS NOTIFY CHECK: Notifying=%s on %s", result, char_path)
+            _LOGGER.info("DBUS NOTIFY CHECK: Notifying=%s on %s", result, char_path)
             return result
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS NOTIFY CHECK: error: %s (%s)", err, type(err).__name__)
+        _LOGGER.info("DBUS NOTIFY CHECK: error: %s (%s)", err, type(err).__name__)
         return False
 
 
 async def dbus_start_notify(char_path: str) -> bool:
-    _LOGGER.debug("DBUS START NOTIFY: calling StartNotify on %s", char_path)
+    _LOGGER.info("DBUS START NOTIFY: calling StartNotify on %s", char_path)
     try:
         from dbus_fast import Message, MessageType
         bus = await _get_bus()
@@ -500,19 +503,19 @@ async def dbus_start_notify(char_path: str) -> bool:
                 timeout=3.0,
             )
             if reply.message_type == MessageType.ERROR:
-                _LOGGER.debug("DBUS START NOTIFY: error: %s on %s", reply.error_name, char_path)
+                _LOGGER.info("DBUS START NOTIFY: error: %s on %s", reply.error_name, char_path)
                 return False
             _LOGGER.info("DBUS START NOTIFY: succeeded on %s", char_path)
             return True
         finally:
             bus.disconnect()
     except Exception as err:
-        _LOGGER.debug("DBUS START NOTIFY: error: %s (%s)", err, type(err).__name__)
+        _LOGGER.info("DBUS START NOTIFY: error: %s (%s)", err, type(err).__name__)
         return False
 
 
 async def dbus_register_notification_handler(char_path: str, data_callback):
-    _LOGGER.debug("DBUS HANDLER: registering notification handler on %s", char_path)
+    _LOGGER.info("DBUS HANDLER: registering notification handler on %s", char_path)
     from dbus_fast import Message, BusType
     from dbus_fast.aio import MessageBus
 
@@ -565,7 +568,7 @@ async def dbus_register_notification_handler(char_path: str, data_callback):
 async def dbus_cleanup_notification_handler(bus, handler, match_rule):
     if bus is None:
         return
-    _LOGGER.debug("DBUS CLEANUP: removing notification handler (match_rule=%s)", match_rule)
+    _LOGGER.info("DBUS CLEANUP: removing notification handler (match_rule=%s)", match_rule)
     try:
         if handler:
             bus.remove_message_handler(handler)
@@ -589,7 +592,7 @@ async def dbus_cleanup_notification_handler(bus, handler, match_rule):
 
 def get_char_path_from_services(client, uuid: str) -> str | None:
     if not client:
-        _LOGGER.debug("CHAR PATH FROM SERVICES: no client")
+        _LOGGER.info("CHAR PATH FROM SERVICES: no client")
         return None
     try:
         service_count = 0
@@ -600,21 +603,21 @@ def get_char_path_from_services(client, uuid: str) -> str | None:
                 char_count += 1
                 if char.uuid.lower() == uuid.lower():
                     if hasattr(char, 'path'):
-                        _LOGGER.debug("CHAR PATH FROM SERVICES: found %s via char.path=%s (services=%d, chars=%d)",
+                        _LOGGER.info("CHAR PATH FROM SERVICES: found %s via char.path=%s (services=%d, chars=%d)",
                                       uuid, char.path, service_count, char_count)
                         return char.path
                     if hasattr(char, 'obj') and hasattr(char.obj, 'get_object_path'):
                         path = char.obj.get_object_path()
-                        _LOGGER.debug("CHAR PATH FROM SERVICES: found %s via obj.get_object_path()=%s", uuid, path)
+                        _LOGGER.info("CHAR PATH FROM SERVICES: found %s via obj.get_object_path()=%s", uuid, path)
                         return path
-        _LOGGER.debug("CHAR PATH FROM SERVICES: UUID %s not found (searched %d services, %d chars)", uuid, service_count, char_count)
+        _LOGGER.info("CHAR PATH FROM SERVICES: UUID %s not found (searched %d services, %d chars)", uuid, service_count, char_count)
     except Exception as err:
-        _LOGGER.debug("CHAR PATH FROM SERVICES: error: %s (%s)", err, type(err).__name__)
+        _LOGGER.info("CHAR PATH FROM SERVICES: error: %s (%s)", err, type(err).__name__)
     return None
 
 
 async def get_char_path_via_dbus(address: str, uuid: str) -> str | None:
-    _LOGGER.debug("DBUS CHAR PATH: searching for UUID %s on device %s", uuid, address)
+    _LOGGER.info("DBUS CHAR PATH: searching for UUID %s on device %s", uuid, address)
     try:
         from dbus_fast import Message, MessageType
         uuid_short = uuid.replace("-", "").lower()

@@ -42,7 +42,7 @@ def build_frame(command: str, session_key: bytes | None, payload: bytes | None, 
     frame[pos] = chk
     frame[pos + 1] = FRAME_END
 
-    _LOGGER.debug(
+    _LOGGER.info(
         "build_frame: cmd=%r, session=%s, payload=%s, encrypt=%s, plaintext_hex=%s",
         command,
         session_key.hex() if session_key else "None",
@@ -61,7 +61,7 @@ def build_frame(command: str, session_key: bytes | None, payload: bytes | None, 
         encrypted = rc4_crypt(rc4_key, plaintext)
         for i in range(actual_count):
             frame[actual_start + i] = encrypted[i]
-        _LOGGER.debug(
+        _LOGGER.info(
             "build_frame encrypted_hex=%s (encrypt_start=%d, encrypt_count=%d)",
             bytes(frame).hex(), actual_start, actual_count,
         )
@@ -107,7 +107,7 @@ class EfComParser:
             return None
 
         if b == FRAME_START and self._pos > 0:
-            _LOGGER.debug(
+            _LOGGER.info(
                 "FRAME_START mid-parse at pos=%d, resyncing",
                 self._pos,
             )
@@ -156,14 +156,14 @@ class EfComParser:
 
             if data[1:1 + cmd_len] == cmd_bytes:
                 expected = 1 + cmd_len + payload_len + 2
-                _LOGGER.debug("Detected frame cmd=%r, expected_len=%d", cmd_str, expected)
+                _LOGGER.info("Detected frame cmd=%r, expected_len=%d", cmd_str, expected)
                 return expected
 
         return 0
 
     def _try_parse_frame(self) -> EfComFrame | None:
         data = bytes(self._buffer[:self._pos])
-        _LOGGER.debug("Parsing frame: %d bytes, raw_hex=%s", self._pos, data.hex())
+        _LOGGER.info("Parsing frame: %d bytes, raw_hex=%s", self._pos, data.hex())
 
         for cmd_str, (payload_len, is_encrypted) in COMMAND_REGISTRY.items():
             cmd_bytes = cmd_str.encode("latin-1")
@@ -176,7 +176,7 @@ class EfComParser:
             if data[1:1 + cmd_len] != cmd_bytes:
                 continue
 
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Command match: cmd=%r, payload_len=%d, encrypted=%s",
                 cmd_str, payload_len, is_encrypted,
             )
@@ -187,7 +187,7 @@ class EfComParser:
                     return frame
                 frame = self._try_plaintext(data, cmd_str, cmd_len, payload_len)
                 if frame is not None:
-                    _LOGGER.debug("Encrypted decode failed, plaintext fallback succeeded for cmd=%r", cmd_str)
+                    _LOGGER.info("Encrypted decode failed, plaintext fallback succeeded for cmd=%r", cmd_str)
                     return frame
             else:
                 frame = self._try_plaintext(data, cmd_str, cmd_len, payload_len)
@@ -197,7 +197,7 @@ class EfComParser:
         cmd_hex = data[1:3].hex() if self._pos >= 3 else data[1:2].hex()
         if cmd_hex not in self._unknown_cmds_logged:
             self._unknown_cmds_logged.add(cmd_hex)
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Unknown command in %d-byte frame (cmd_bytes=%s), raw_hex=%s",
                 self._pos, cmd_hex, data.hex(),
             )
@@ -210,11 +210,11 @@ class EfComParser:
         decrypt_start = cmd_len + 2
         decrypt_count = payload_len + 1
         if decrypt_start + decrypt_count > len(work):
-            _LOGGER.debug("Decrypt range exceeds frame length, skipping")
+            _LOGGER.info("Decrypt range exceeds frame length, skipping")
             return None
 
         encrypted_portion = bytes(work[decrypt_start:decrypt_start + decrypt_count])
-        _LOGGER.debug(
+        _LOGGER.info(
             "DECRYPT cmd=%r: raw_hex=%s, decrypt_range=[%d:%d] (%d bytes), encrypted_hex=%s",
             cmd_str, data.hex(), decrypt_start, decrypt_start + decrypt_count, decrypt_count, encrypted_portion.hex(),
         )
@@ -226,7 +226,7 @@ class EfComParser:
         expected_chk = compute_checksum(chk_pos, work)
         actual_chk = work[chk_pos]
 
-        _LOGGER.debug(
+        _LOGGER.info(
             "DECRYPT cmd=%r: decrypted_frame_hex=%s, checksum computed=0x%02x, in_frame=0x%02x, match=%s",
             cmd_str, bytes(work).hex(), expected_chk, actual_chk, expected_chk == actual_chk,
         )
@@ -234,13 +234,13 @@ class EfComParser:
         if expected_chk == actual_chk:
             payload_start = cmd_len + 1
             payload = bytes(work[payload_start:payload_start + payload_len])
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Frame decoded (encrypted): cmd=%r, payload=%s (%d bytes)",
                 cmd_str, payload.hex(), len(payload),
             )
             return EfComFrame(cmd_str, payload, True)
 
-        _LOGGER.debug(
+        _LOGGER.info(
             "DECRYPT cmd=%r: checksum MISMATCH, encrypted decode failed (will try plaintext)",
             cmd_str,
         )
@@ -254,7 +254,7 @@ class EfComParser:
         if expected_chk == work[chk_pos]:
             payload_start = cmd_len + 1
             payload = bytes(work[payload_start:payload_start + payload_len])
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Frame decoded (plaintext): cmd=%r, payload=%s (%d bytes)",
                 cmd_str, payload.hex(), len(payload),
             )

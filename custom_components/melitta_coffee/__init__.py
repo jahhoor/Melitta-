@@ -12,12 +12,16 @@ PLATFORMS = ["sensor", "binary_sensor", "button", "select"]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
+    melitta_logger = logging.getLogger("custom_components.melitta_coffee")
+    melitta_logger.setLevel(logging.DEBUG)
+    _LOGGER.info("SETUP: debug logging ENABLED for custom_components.melitta_coffee (all submodules)")
+
     address = entry.data[CONF_MAC_ADDRESS]
     _LOGGER.info("SETUP: setting up Melitta integration for %s (title=%s, entry_id=%s)", address, entry.title, entry.entry_id)
     device = MelittaDevice(address, entry.title, hass=hass)
     hass.data[DOMAIN][entry.entry_id] = device
 
-    _LOGGER.debug("SETUP: forwarding platform setups: %s", PLATFORMS)
+    _LOGGER.info("SETUP: forwarding platform setups: %s", PLATFORMS)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def _initial_connect():
@@ -30,7 +34,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device.schedule_reconnect()
 
     entry.async_create_background_task(hass, _initial_connect(), f"melitta_connect_{address}")
-    _LOGGER.debug("SETUP: background connect task created for %s", address)
+    _LOGGER.info("SETUP: background connect task created for %s", address)
 
     return True
 
