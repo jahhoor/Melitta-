@@ -1,0 +1,42 @@
+{
+  "domain": "melitta_coffee",
+  "name": "Melitta Coffee Machine",
+  "codeowners": [
+    "@jahhoor"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "bluetooth"
+  ],
+  "documentation": "https://github.com/jahhoor/Melitta-",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": [
+    "bleak>=0.21.0",
+    "bleak-retry-connector>=3.4.0",
+    "cryptography>=41.0.0",
+    "dbus-fast>=2.21.1"
+  ],
+  "bluetooth": [
+    {
+      "local_name": "8301*"
+    },
+    {
+      "local_name": "8311*"
+    },
+    {
+      "local_name": "8401*"
+    },
+    {
+      "local_name": "8501*"
+    },
+    {
+      "local_name": "8601*"
+    },
+    {
+      "local_name": "8604*"
+    }
+  ],
+  "version": "2.0.1",
+  "issue_tracker": "https://github.com/jahhoor/Melitta-/issues"
+}
