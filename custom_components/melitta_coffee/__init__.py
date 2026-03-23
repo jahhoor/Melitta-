@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -9,6 +10,7 @@ from .device import MelittaDevice
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["sensor", "binary_sensor", "button", "select"]
+INITIAL_CONNECT_DELAY = 12.0
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -27,6 +29,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def _initial_connect() -> None:
+        _LOGGER.info("SETUP: waiting %.0fs before first BLE connect to %s", INITIAL_CONNECT_DELAY, address)
+        await asyncio.sleep(INITIAL_CONNECT_DELAY)
         _LOGGER.info("SETUP: starting initial connection to %s", address)
         success = await device.connect()
         if success:

@@ -21,11 +21,14 @@ from .protocol import build_frame, EfComParser, EfComFrame
 _LOGGER = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 10.0
-CONNECT_TIMEOUT = 15.0
+CONNECT_TIMEOUT = 20.0
 DISCONNECT_TIMEOUT = 10.0
-RECONNECT_BASE_DELAY = 10.0
+RECONNECT_BASE_DELAY = 15.0
 RECONNECT_MAX_DELAY = 300.0
 RECONNECT_MAX_ATTEMPTS = 3
+CONNECT_COOLDOWN_SECONDS = 12.0
+CONNECT_COOLDOWN_BUSY_SECONDS = 20.0
+POST_CONNECT_SETTLE_DELAY = 1.2
 
 
 class MelittaDevice:
@@ -48,6 +51,7 @@ class MelittaDevice:
         self._connect_lock = asyncio.Lock()
         self._connect_pending = False
         self._last_reconnect_time: float = 0.0
+        self._connect_cooldown_until: float = 0.0
         self._callbacks: list[Callable] = []
         self._status = "offline"
         self._machine_state: int | None = None
@@ -155,6 +159,35 @@ class MelittaDevice:
                 cb()
             except Exception:
                 _LOGGER.exception("Error in callback")
+
+    def _classify_connect_error(self, err: Exception) -> str:
+        message = f"{type(err).__name__}: {err}".lower()
+        if "in progress" in message or "br-connection-canceled" in message or "failed to cancel connection" in message:
+            return "bluez_busy"
+        if "failed to discover services" in message or "device disconnected" in message:
+            return "service_discovery"
+        if "timeout" in message:
+            return "timeout"
+        return "other"
+
+    async def _wait_for_connect_cooldown(self) -> None:
+        remaining = self._connect_cooldown_until - time.monotonic()
+        if remaining > 0:
+            _LOGGER.info("CONNECT: cooling down for %.1fs before next BLE attempt", remaining)
+            await asyncio.sleep(remaining)
+
+    def _apply_connect_cooldown(self, err: Exception) -> None:
+        kind = self._classify_connect_error(err)
+        cooldown = CONNECT_COOLDOWN_BUSY_SECONDS if kind == "bluez_busy" else CONNECT_COOLDOWN_SECONDS
+        until = time.monotonic() + cooldown
+        if until > self._connect_cooldown_until:
+            self._connect_cooldown_until = until
+        _LOGGER.info(
+            "CONNECT: applied cooldown of %.0fs for %s after %s",
+            cooldown,
+            self._address,
+            kind,
+        )
 
     def _on_disconnect(self, client: BleakClient):
         if self._suppress_disconnect_callback:
@@ -463,7 +496,7 @@ class MelittaDevice:
             )
 
             # Match the Android app more closely: connect, let GATT settle, then notify/auth.
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(POST_CONNECT_SETTLE_DELAY)
             if not self._is_connected or self._shutting_down:
                 _LOGGER.info("CONNECT FLOW: lost connection immediately after connect or shutting down")
                 return False
@@ -509,6 +542,7 @@ class MelittaDevice:
             return False
 
         except (BleakError, asyncio.TimeoutError, OSError, EOFError) as err:
+            self._apply_connect_cooldown(err)
             _LOGGER.error("Connect failed to %s: %s", self._address, err)
             self._status = "offline"
             self._last_error = f"Verbinding mislukt: {err}"
@@ -748,71 +782,51 @@ class MelittaDevice:
             return self._address
 
     async def _establish_ble_connection(self, ble_device):
-        last_error = None
+        await self._wait_for_connect_cooldown()
+        await self._close_client_quietly()
 
-        # The APK path is a plain GATT connect/discover/notify sequence. Try the least opinionated
-        # connection strategy first before falling back to Home Assistant's retry wrapper.
-        strategies: list[tuple[str, str]] = []
-        if self._hass is not None and not isinstance(ble_device, str):
-            strategies.append(("direct_ble_device", "direct"))
-            strategies.append(("ha_establish_connection", "ha"))
-            strategies.append(("direct_address", "direct_address"))
-        else:
-            strategies.append(("direct", "direct"))
+        target = ble_device
+        strategy_name = "ha_establish_connection"
+        max_attempts = 3
 
-        for strategy_name, strategy_kind in strategies:
+        _LOGGER.info(
+            "BLE CONNECT: strategy=%s via establish_connection(timeout=%ss, max_attempts=%s)",
+            strategy_name,
+            CONNECT_TIMEOUT,
+            max_attempts,
+        )
+        try:
+            self._client = await establish_connection(
+                BleakClientWithServiceCache,
+                target,
+                self._name,
+                disconnected_callback=self._on_disconnect,
+                max_attempts=max_attempts,
+            )
+            await asyncio.sleep(0.5)
+            services = getattr(self._client, "services", None)
             try:
-                await self._close_client_quietly()
-                if strategy_kind == "ha":
-                    _LOGGER.info("BLE CONNECT: strategy=%s via establish_connection (max_attempts=1)", strategy_name)
-                    self._client = await establish_connection(
-                        BleakClientWithServiceCache,
-                        ble_device,
-                        self._name,
-                        disconnected_callback=self._on_disconnect,
-                        max_attempts=1,
-                    )
-                else:
-                    target = self._address if strategy_kind == "direct_address" else ble_device
-                    _LOGGER.info(
-                        "BLE CONNECT: strategy=%s via BleakClient.connect(timeout=%ss)",
-                        strategy_name,
-                        CONNECT_TIMEOUT,
-                    )
-                    self._client = BleakClient(
-                        target,
-                        timeout=CONNECT_TIMEOUT,
-                        disconnected_callback=self._on_disconnect,
-                    )
-                    await self._client.connect()
-
-                await asyncio.sleep(0.4)
-                services = getattr(self._client, "services", None)
-                try:
-                    service_count = len(list(services)) if services is not None else 0
-                except Exception:
-                    service_count = 0
-                _LOGGER.info(
-                    "BLE CONNECT: strategy=%s succeeded (services=%s, mtu=%s)",
-                    strategy_name,
-                    service_count if service_count else "unknown",
-                    self._client.mtu_size if self._client and hasattr(self._client, "mtu_size") else "unknown",
-                )
-                return
-            except Exception as err:
-                last_error = err
-                _LOGGER.warning(
-                    "BLE CONNECT: strategy=%s failed for %s: %s (%s)",
-                    strategy_name,
-                    self._address,
-                    err,
-                    type(err).__name__,
-                )
-                await self._close_client_quietly()
-                await asyncio.sleep(0.8)
-
-        if last_error is not None:
-            raise last_error
+                service_count = len(list(services)) if services is not None else 0
+            except Exception:
+                service_count = 0
+            _LOGGER.info(
+                "BLE CONNECT: strategy=%s succeeded (services=%s, mtu=%s)",
+                strategy_name,
+                service_count if service_count else "unknown",
+                self._client.mtu_size if self._client and hasattr(self._client, "mtu_size") else "unknown",
+            )
+            return
+        except Exception as err:
+            self._apply_connect_cooldown(err)
+            _LOGGER.warning(
+                "BLE CONNECT: strategy=%s failed for %s: %s (%s)",
+                strategy_name,
+                self._address,
+                err,
+                type(err).__name__,
+            )
+            await self._close_client_quietly()
+            raise
 
     async def _close_client_quietly(self):
         client = self._client
