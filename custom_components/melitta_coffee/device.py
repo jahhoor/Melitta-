@@ -435,39 +435,19 @@ class MelittaDevice:
         await self._stop_dbus_notifications()
 
         if self._hass is not None:
-            from .dbus_utils import (
-                dbus_cancel_pairing, dbus_check_paired, dbus_remove_device,
-            )
+            from .dbus_utils import dbus_cancel_pairing, dbus_check_paired
+
             _LOGGER.info("CONNECT FLOW: cancelling any pending pairing operations")
             await dbus_cancel_pairing(self._address)
             _LOGGER.info("CONNECT FLOW: forcing BlueZ disconnect if still connected")
             await self._force_bluez_disconnect()
 
-            _LOGGER.info("CONNECT FLOW: checking existing bond status in BlueZ")
             pre_paired = await dbus_check_paired(self._address)
-            _LOGGER.info("CONNECT FLOW: pre-connect bond check: paired=%s, auth_failures=%d", pre_paired, self._auth_failure_count)
-            if pre_paired:
-                if self._auth_failure_count > 0:
-                    _LOGGER.warning(
-                        "CONNECT FLOW: device paired in BlueZ but had %d auth failures - removing stale bond",
-                        self._auth_failure_count,
-                    )
-                    self._status = "removing_stale_bond"
-                    self._last_error = "Oude Bluetooth-koppeling verwijderen..."
-                    self._notify_callbacks()
-                    removed = await dbus_remove_device(self._address)
-                    _LOGGER.info("CONNECT FLOW: bond removal result=%s", removed)
-                    self._skip_bond_check = True
-                    _LOGGER.info("CONNECT FLOW: _skip_bond_check=True set (will skip bond check in _handle_pairing)")
-                    await asyncio.sleep(2.0)
-                    still_paired = await dbus_check_paired(self._address)
-                    if still_paired:
-                        _LOGGER.warning("CONNECT FLOW: bond still exists after removal, retrying...")
-                        await dbus_remove_device(self._address)
-                        await asyncio.sleep(2.0)
-                    _LOGGER.info("CONNECT FLOW: stale bond removed, proceeding to connect fresh")
-                else:
-                    _LOGGER.info("CONNECT FLOW: device already paired in BlueZ (no failures), will use existing bond")
+            _LOGGER.info(
+                "CONNECT FLOW: pre-connect bond check: paired=%s, auth_failures=%d (no automatic bond removal)",
+                pre_paired,
+                self._auth_failure_count,
+            )
 
         _LOGGER.info("CONNECT FLOW: establishing BLE connection to %s (attempt %d)", self._address, self._reconnect_attempts + 1)
 
@@ -500,7 +480,7 @@ class MelittaDevice:
                 freshly_paired = await self._handle_pairing()
                 _LOGGER.info("CONNECT FLOW: pairing result: freshly_paired=%s", freshly_paired)
                 if freshly_paired:
-                    _LOGGER.info("CONNECT FLOW: fresh pairing done, disconnect/reconnect cycle for encryption activation")
+                    _LOGGER.info("CONNECT FLOW: fresh pairing done, reconnecting once before app-layer auth")
                     self._suppress_disconnect_callback = True
                     try:
                         await self._internal_disconnect()
@@ -522,27 +502,6 @@ class MelittaDevice:
                         self._notify_callbacks()
                         return False
 
-                    _LOGGER.info("CONNECT FLOW: reconnected after fresh pairing, activating encryption via Pair()...")
-                    from .dbus_utils import dbus_force_encryption
-                    enc_result = await dbus_force_encryption(self._address)
-                    _LOGGER.info("CONNECT FLOW: force encryption result=%s", enc_result)
-
-                    if not self._is_connected:
-                        _LOGGER.info("CONNECT FLOW: lost connection after encryption, reconnecting...")
-                        await asyncio.sleep(0.5)
-                        reconnected = await self._internal_reconnect_ble()
-                        if not reconnected:
-                            await asyncio.sleep(1.0)
-                            reconnected = await self._internal_reconnect_ble()
-                        if reconnected:
-                            enc_result2 = await dbus_force_encryption(self._address)
-                            _LOGGER.info("CONNECT FLOW: second force encryption result=%s", enc_result2)
-                        else:
-                            self._status = "offline"
-                            self._last_error = "Herverbinding mislukt na koppeling"
-                            self._notify_callbacks()
-                            return False
-
             _LOGGER.info("CONNECT FLOW: moving to authentication phase for %s", self._address)
             self._status = "authenticating"
             self._notify_callbacks()
@@ -561,186 +520,42 @@ class MelittaDevice:
                 await self._request_status()
                 self._notify_callbacks()
                 return True
-            else:
-                self._auth_failure_count += 1
-                _LOGGER.warning(
-                    "Auth failed for %s (failure %d/%d)",
-                    self._address, self._auth_failure_count, self._max_reconnect_attempts,
-                )
 
-                if self._auth_failure_count == 1 and self._hass is not None:
-                    _LOGGER.info("First auth failure - removing bond for fresh pair on next attempt")
-                    self._status = "removing_stale_bond"
-                    self._last_error = "Authenticatie mislukt. Oude koppeling verwijderen voor nieuwe poging..."
-                    self._notify_callbacks()
-                    self._suppress_disconnect_callback = True
-                    try:
-                        await self._internal_disconnect()
-                    except Exception:
-                        pass
-                    self._suppress_disconnect_callback = False
-                    await asyncio.sleep(0.3)
-                    from .dbus_utils import dbus_remove_device
-                    await dbus_remove_device(self._address)
-                    self._skip_bond_check = True
-                    _LOGGER.info("AUTH FAIL: _skip_bond_check=True set for next connect attempt")
-                    await asyncio.sleep(1.0)
-                else:
-                    self._status = "connected_not_auth"
-                    self._last_error = (
-                        f"Authenticatie mislukt (poging {self._auth_failure_count}/{self._max_reconnect_attempts}). "
-                        "Zorg dat de machine in 'Verbinden' modus staat."
-                    )
-
-                self._notify_callbacks()
-                return False
+            self._auth_failure_count += 1
+            _LOGGER.warning(
+                "Auth failed for %s (failure %d/%d)",
+                self._address,
+                self._auth_failure_count,
+                self._max_reconnect_attempts,
+            )
+            self._status = "connected_not_auth"
+            self._last_error = (
+                f"Authenticatie mislukt (poging {self._auth_failure_count}/{self._max_reconnect_attempts}). "
+                "Probeer eerst opnieuw verbinden op de machine. Oude Bluetooth-koppelingen worden niet automatisch verwijderd."
+            )
+            self._notify_callbacks()
+            return False
 
         except (BleakError, asyncio.TimeoutError, OSError, EOFError) as err:
-            err_str = str(err)
             _LOGGER.error("Connect failed to %s: %s", self._address, err)
-
-            if self._hass is not None and "failed to discover services" in err_str.lower():
-                _LOGGER.warning("Service discovery failed - likely stale bond, attempting bond removal and retry")
-                from .dbus_utils import dbus_check_paired, dbus_remove_device
-                is_paired = await dbus_check_paired(self._address)
-                if is_paired:
-                    self._status = "removing_stale_bond"
-                    self._last_error = "Service-ontdekking mislukt. Oude koppeling verwijderen..."
-                    self._notify_callbacks()
-                    await dbus_remove_device(self._address)
-                    self._skip_bond_check = True
-                    _LOGGER.info("SERVICE DISCOVERY FAIL: _skip_bond_check=True set for retry")
-                    await asyncio.sleep(2.0)
-                    still_paired = await dbus_check_paired(self._address)
-                    if still_paired:
-                        await dbus_remove_device(self._address)
-                        await asyncio.sleep(2.0)
-                    _LOGGER.info("Bond removed after service discovery failure, retrying connect...")
-
-                    self._status = "connecting"
-                    self._last_error = "Opnieuw verbinden na verwijderen oude koppeling..."
-                    self._notify_callbacks()
-                    try:
-                        ble_device = await self._get_ble_device()
-                        if ble_device is not None:
-                            await self._establish_ble_connection(ble_device)
-                            self._is_connected = True
-                            self._reconnect_attempts = 0
-                            _LOGGER.info("Retry connect succeeded after bond removal")
-
-                            if self._hass is not None:
-                                freshly_paired = await self._handle_pairing()
-                                if freshly_paired:
-                                    self._suppress_disconnect_callback = True
-                                    try:
-                                        await self._internal_disconnect()
-                                    except Exception:
-                                        pass
-                                    self._suppress_disconnect_callback = False
-                                    await asyncio.sleep(0.5)
-                                    reconnected = await self._internal_reconnect_ble()
-                                    if not reconnected:
-                                        await asyncio.sleep(1.0)
-                                        reconnected = await self._internal_reconnect_ble()
-                                    if reconnected:
-                                        from .dbus_utils import dbus_force_encryption
-                                        await dbus_force_encryption(self._address)
-                                    else:
-                                        self._status = "offline"
-                                        self._last_error = "Herverbinding na koppeling mislukt"
-                                        self._notify_callbacks()
-                                        return False
-
-                            self._status = "authenticating"
-                            self._notify_callbacks()
-                            auth_ok = await self._setup_notifications_and_auth()
-                            if self._authenticated:
-                                self._status = "ready"
-                                self._start_keepalive()
-                                _LOGGER.info("Connected and authenticated after bond removal retry")
-                                await self._request_status()
-                                self._notify_callbacks()
-                                return True
-                            else:
-                                self._status = "connected_not_auth"
-                                self._last_error = "Authenticatie mislukt na herverbinding"
-                                self._notify_callbacks()
-                                return False
-                    except (BleakError, asyncio.TimeoutError, OSError, EOFError) as retry_err:
-                        _LOGGER.error("Retry connect also failed after bond removal: %s", retry_err)
-
             self._status = "offline"
             self._last_error = f"Verbinding mislukt: {err}"
             self._notify_callbacks()
             return False
 
     async def _handle_pairing(self) -> bool:
-        from .dbus_utils import (
-            dbus_check_paired, dbus_pair_device, dbus_force_encryption,
-            dbus_remove_device, dbus_check_bond_valid,
+        from .dbus_utils import dbus_check_paired, dbus_pair_device
+
+        _LOGGER.info("PAIRING: checking existing pairing status for %s", self._address)
+        is_paired = await dbus_check_paired(self._address)
+        _LOGGER.info("PAIRING: is_paired=%s for %s", is_paired, self._address)
+        if is_paired:
+            _LOGGER.info("PAIRING: existing bond detected, skipping extra Pair()/bond validation")
+            return False
+
+        _LOGGER.info(
+            "PAIRING: device not paired, initiating BLE pairing (machine MUST be in Verbinden mode with blue blinking)"
         )
-
-        if self._skip_bond_check:
-            _LOGGER.info("PAIRING: _skip_bond_check=True - skipping ALL bond checks, going DIRECT to fresh Pair() for %s", self._address)
-            self._skip_bond_check = False
-        else:
-            _LOGGER.info("PAIRING: checking existing pairing status for %s", self._address)
-            is_paired = await dbus_check_paired(self._address)
-            _LOGGER.info("PAIRING: is_paired=%s for %s", is_paired, self._address)
-            if is_paired:
-                _LOGGER.info("PAIRING: checking bond validity (ServicesResolved)...")
-                bond_valid = await dbus_check_bond_valid(self._address)
-                _LOGGER.info("PAIRING: bond_valid=%s for %s", bond_valid, self._address)
-                if bond_valid:
-                    _LOGGER.info("PAIRING: valid bond exists, activating encryption via Pair()")
-                    enc_ok = await dbus_force_encryption(self._address)
-                    _LOGGER.info("PAIRING: force encryption result=%s", enc_ok)
-                    return False
-                else:
-                    _LOGGER.warning("PAIRING: stale bond detected (paired but ServicesResolved=False) - removing old pairing")
-                    self._status = "removing_stale_bond"
-                    self._last_error = "Oude koppeling verwijderen (rode Bluetooth)..."
-                    self._notify_callbacks()
-
-                    self._suppress_disconnect_callback = True
-                    try:
-                        await self._internal_disconnect()
-                    except Exception:
-                        pass
-                    self._suppress_disconnect_callback = False
-                    await asyncio.sleep(0.3)
-
-                    removed = await dbus_remove_device(self._address)
-                    self._skip_bond_check = True
-                    _LOGGER.info("PAIRING: _skip_bond_check=True set after RemoveDevice (stale bond removal)")
-                    if removed:
-                        _LOGGER.info("Stale bond removed, verifying...")
-                    else:
-                        _LOGGER.warning("Failed to remove stale bond")
-
-                    await asyncio.sleep(2.0)
-
-                    still_paired = await dbus_check_paired(self._address)
-                    if still_paired:
-                        _LOGGER.warning("Bond still exists after removal, retrying...")
-                        await dbus_remove_device(self._address)
-                        await asyncio.sleep(2.0)
-
-                    reconnected = await self._internal_reconnect_ble()
-                    if not reconnected:
-                        await asyncio.sleep(2.0)
-                        reconnected = await self._internal_reconnect_ble()
-                    if not reconnected:
-                        _LOGGER.warning("Reconnect after bond removal failed")
-                        self._status = "offline"
-                        self._last_error = "Herverbinding na verwijderen oude koppeling mislukt"
-                        self._notify_callbacks()
-                        return False
-
-                    _LOGGER.info("PAIRING: stale bond removed + reconnected - _skip_bond_check consumed, going DIRECT to fresh Pair()")
-                    self._skip_bond_check = False
-
-        _LOGGER.info("PAIRING: device not paired, initiating BLE pairing (machine MUST be in Verbinden mode with blue blinking)")
 
         def status_cb(status, msg):
             _LOGGER.info("PAIRING: status callback: status=%s, msg=%s", status, msg)
@@ -753,51 +568,16 @@ class MelittaDevice:
         if pair_ok:
             _LOGGER.info("PAIRING: succeeded - machine is now paired")
             return True
-        else:
-            _LOGGER.warning("PAIRING: failed - is the machine in Verbinden mode? (blue blinking display, 60s window)")
-            return False
+
+        _LOGGER.warning("PAIRING: failed - is the machine in Verbinden mode? (blue blinking display, 60s window)")
+        return False
 
     async def _setup_notifications_and_auth(self) -> bool:
         if not self._client or not self._is_connected:
             return False
 
-        char_path = await self._get_char_path()
-        dbus_handler_active = False
         notifications_confirmed = False
-
-        _LOGGER.info("NOTIFY SETUP: char_path=%s, has_hass=%s", char_path, self._hass is not None)
-
-        if char_path and self._hass is not None:
-            from .dbus_utils import (
-                dbus_write_cccd, dbus_start_notify, dbus_check_notifying,
-                dbus_register_notification_handler,
-            )
-
-            cccd_ok = await dbus_write_cccd(char_path)
-            _LOGGER.info("NOTIFY SETUP: CCCD write result=%s (path=%s)", cccd_ok, char_path)
-
-            start_ok = await dbus_start_notify(char_path)
-            _LOGGER.info("NOTIFY SETUP: D-Bus StartNotify result=%s", start_ok)
-
-            await asyncio.sleep(0.3)
-
-            notifying = await dbus_check_notifying(char_path)
-            _LOGGER.info("NOTIFY SETUP: Notifying property=%s", notifying)
-            if notifying:
-                notifications_confirmed = True
-
-            try:
-                bus, handler, match_rule = await dbus_register_notification_handler(
-                    char_path, self._process_incoming_data,
-                )
-                self._dbus_notify_bus = bus
-                self._dbus_notify_handler = handler
-                self._dbus_match_rule = match_rule
-                self._notifications_active = True
-                dbus_handler_active = True
-                _LOGGER.info("NOTIFY SETUP: D-Bus handler registered, match_rule=%s", match_rule)
-            except Exception as err:
-                _LOGGER.info("NOTIFY SETUP: D-Bus handler FAILED: %s (%s)", err, type(err).__name__)
+        _LOGGER.info("NOTIFY SETUP: using Bleak notifications first for %s", self._address)
 
         try:
             await asyncio.wait_for(
@@ -809,13 +589,8 @@ class MelittaDevice:
             _LOGGER.info("NOTIFY SETUP: Bleak start_notify OK")
         except Exception as err:
             _LOGGER.info("NOTIFY SETUP: Bleak start_notify FAILED: %s (%s)", err, type(err).__name__)
-            if not dbus_handler_active:
-                _LOGGER.info("NOTIFY SETUP: No notification channel available, will use polling")
-
-        _LOGGER.info(
-            "NOTIFY SETUP COMPLETE: notifications_confirmed=%s, dbus_handler=%s, bleak_notify=%s",
-            notifications_confirmed, dbus_handler_active, notifications_confirmed,
-        )
+            self._notifications_active = False
+            _LOGGER.info("NOTIFY SETUP: falling back to read polling during auth")
 
         if notifications_confirmed:
             await asyncio.sleep(0.2)
@@ -920,13 +695,27 @@ class MelittaDevice:
         if client is None:
             return False
 
+        if self._notifications_active:
+            _LOGGER.info("AUTH WAIT: waiting for notification-driven auth response (timeout=%.1fs)", AUTH_TIMEOUT)
+            try:
+                await asyncio.wait_for(self._auth_event.wait(), timeout=AUTH_TIMEOUT)
+            except asyncio.TimeoutError:
+                _LOGGER.info("AUTH WAIT: notification-driven auth timed out after %.1fs", AUTH_TIMEOUT)
+                return False
+            return self._authenticated or self._auth_got_frame
+
         poll_interval = 0.15
         max_polls = int(AUTH_TIMEOUT / poll_interval)
         last_data = None
         poll_count = 0
         data_received_count = 0
 
-        _LOGGER.info("AUTH WAIT: starting, max_polls=%d, interval=%.2fs, timeout=%.1fs", max_polls, poll_interval, AUTH_TIMEOUT)
+        _LOGGER.info(
+            "AUTH WAIT: notification channel unavailable, using read polling (max_polls=%d, interval=%.2fs, timeout=%.1fs)",
+            max_polls,
+            poll_interval,
+            AUTH_TIMEOUT,
+        )
 
         for i in range(max_polls):
             if self._authenticated or self._auth_got_frame:
