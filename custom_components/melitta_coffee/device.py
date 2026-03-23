@@ -434,22 +434,11 @@ class MelittaDevice:
         self._dbus_cleanup_task = None
         await self._stop_dbus_notifications()
 
-        if self._hass is not None:
-            from .dbus_utils import dbus_cancel_pairing, dbus_check_paired
-
-            _LOGGER.info("CONNECT FLOW: cancelling any pending pairing operations")
-            await dbus_cancel_pairing(self._address)
-            _LOGGER.info("CONNECT FLOW: forcing BlueZ disconnect if still connected")
-            await self._force_bluez_disconnect()
-
-            pre_paired = await dbus_check_paired(self._address)
-            _LOGGER.info(
-                "CONNECT FLOW: pre-connect bond check: paired=%s, auth_failures=%d (no automatic bond removal)",
-                pre_paired,
-                self._auth_failure_count,
-            )
-
-        _LOGGER.info("CONNECT FLOW: establishing BLE connection to %s (attempt %d)", self._address, self._reconnect_attempts + 1)
+        _LOGGER.info(
+            "CONNECT FLOW: establishing BLE connection to %s (attempt %d, simplified APK-style flow)",
+            self._address,
+            self._reconnect_attempts + 1,
+        )
 
         try:
             self._status = "connecting"
@@ -467,47 +456,30 @@ class MelittaDevice:
             self._is_connected = True
             self._reconnect_attempts = 0
             self._last_error = None
-            _LOGGER.info("CONNECT FLOW: BLE connected to %s (MTU=%s)", self._address,
-                         self._client.mtu_size if self._client and hasattr(self._client, 'mtu_size') else "unknown")
+            _LOGGER.info(
+                "CONNECT FLOW: BLE connected to %s (MTU=%s)",
+                self._address,
+                self._client.mtu_size if self._client and hasattr(self._client, "mtu_size") else "unknown",
+            )
 
-            await asyncio.sleep(0.1)
+            # Match the Android app more closely: connect, let GATT settle, then notify/auth.
+            await asyncio.sleep(0.6)
             if not self._is_connected or self._shutting_down:
                 _LOGGER.info("CONNECT FLOW: lost connection immediately after connect or shutting down")
                 return False
 
-            if self._hass is not None:
-                _LOGGER.info("CONNECT FLOW: handling BLE pairing...")
-                freshly_paired = await self._handle_pairing()
-                _LOGGER.info("CONNECT FLOW: pairing result: freshly_paired=%s", freshly_paired)
-                if freshly_paired:
-                    _LOGGER.info("CONNECT FLOW: fresh pairing done, reconnecting once before app-layer auth")
-                    self._suppress_disconnect_callback = True
-                    try:
-                        await self._internal_disconnect()
-                    except Exception:
-                        pass
-                    self._suppress_disconnect_callback = False
-                    await asyncio.sleep(0.5)
-
-                    _LOGGER.info("CONNECT FLOW: reconnecting after fresh pairing (attempt 1)...")
-                    reconnected = await self._internal_reconnect_ble()
-                    if not reconnected:
-                        _LOGGER.info("CONNECT FLOW: reconnect attempt 1 failed, retrying after 1s...")
-                        await asyncio.sleep(1.0)
-                        reconnected = await self._internal_reconnect_ble()
-                    if not reconnected:
-                        _LOGGER.warning("CONNECT FLOW: reconnect after pairing failed (both attempts)")
-                        self._status = "offline"
-                        self._last_error = "Herverbinding na koppeling mislukt"
-                        self._notify_callbacks()
-                        return False
-
+            _LOGGER.info("CONNECT FLOW: skipping automatic BlueZ Pair()/force-disconnect logic")
             _LOGGER.info("CONNECT FLOW: moving to authentication phase for %s", self._address)
             self._status = "authenticating"
             self._notify_callbacks()
 
             auth_ok = await self._setup_notifications_and_auth()
-            _LOGGER.info("CONNECT FLOW: auth result=%s, authenticated=%s, connected=%s", auth_ok, self._authenticated, self._is_connected)
+            _LOGGER.info(
+                "CONNECT FLOW: auth result=%s, authenticated=%s, connected=%s",
+                auth_ok,
+                self._authenticated,
+                self._is_connected,
+            )
 
             if not self._is_connected:
                 _LOGGER.info("CONNECT FLOW: connection lost during auth for %s", self._address)
@@ -531,7 +503,7 @@ class MelittaDevice:
             self._status = "connected_not_auth"
             self._last_error = (
                 f"Authenticatie mislukt (poging {self._auth_failure_count}/{self._max_reconnect_attempts}). "
-                "Probeer eerst opnieuw verbinden op de machine. Oude Bluetooth-koppelingen worden niet automatisch verwijderd."
+                "APK-flow gebruikt nu direct connect -> notify -> HU auth, zonder automatische BlueZ pairing."
             )
             self._notify_callbacks()
             return False
@@ -593,7 +565,7 @@ class MelittaDevice:
             _LOGGER.info("NOTIFY SETUP: falling back to read polling during auth")
 
         if notifications_confirmed:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
 
         auth_ok = await self._do_authenticate()
         return auth_ok
@@ -602,86 +574,73 @@ class MelittaDevice:
         if not self._is_connected or self._client is None:
             return False
 
-        self._auth_challenge = os.urandom(4)
-        self._auth_got_frame = False
-        self._auth_event.clear()
-        self._authenticated = False
-        challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
-        auth_payload = self._auth_challenge + challenge_hash
+        async def _run_auth_attempt(*, encrypt: bool) -> bool:
+            self._auth_challenge = os.urandom(4)
+            self._auth_got_frame = False
+            self._auth_event.clear()
+            self._authenticated = False
+            challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
+            auth_payload = self._auth_challenge + challenge_hash
 
-        from .crypto import get_rc4_key, get_all_rc4_keys, _ACTIVE_KEY_INDEX
-        try:
-            active_key = get_rc4_key()
-            all_keys = get_all_rc4_keys()
-            active_idx = _ACTIVE_KEY_INDEX
-            active_name = all_keys[active_idx % len(all_keys)][0] if all_keys else "none"
+            from .crypto import get_rc4_key, get_all_rc4_keys, _ACTIVE_KEY_INDEX
+            try:
+                active_key = get_rc4_key()
+                all_keys = get_all_rc4_keys()
+                active_idx = _ACTIVE_KEY_INDEX
+                active_name = all_keys[active_idx % len(all_keys)][0] if all_keys else "none"
+                _LOGGER.info(
+                    "AUTH PREP: mode=%s challenge=%s sbox_hash=%s payload=%s rc4_key_path=%s (idx=%d/%d) rc4_first4=%s",
+                    "encrypted" if encrypt else "plaintext",
+                    self._auth_challenge.hex(),
+                    challenge_hash.hex(),
+                    auth_payload.hex(),
+                    active_name,
+                    active_idx + 1,
+                    len(all_keys),
+                    active_key[:4].hex() if len(active_key) >= 4 else "N/A",
+                )
+            except Exception as err:
+                _LOGGER.info("AUTH PREP: challenge=%s, rc4 key info error: %s", self._auth_challenge.hex(), err)
+
+            frame = build_frame(CMD_AUTH, None, auth_payload, encrypt=encrypt)
             _LOGGER.info(
-                "AUTH PREP: challenge=%s, sbox_hash=%s, payload=%s, "
-                "rc4_key_path=%s (idx=%d/%d), rc4_key_first4=%s",
-                self._auth_challenge.hex(), challenge_hash.hex(), auth_payload.hex(),
-                active_name, active_idx + 1, len(all_keys),
-                active_key[:4].hex() if len(active_key) >= 4 else "N/A",
+                "Sending %s auth frame (%d bytes), frame_hex=%s",
+                "encrypted" if encrypt else "plaintext",
+                len(frame),
+                frame.hex(),
             )
-        except Exception as e:
-            _LOGGER.info("AUTH PREP: challenge=%s, rc4 key info error: %s", self._auth_challenge.hex(), e)
 
-        auth_encrypted = build_frame(CMD_AUTH, None, auth_payload, encrypt=True)
-        _LOGGER.info(
-            "Sending encrypted auth frame (%d bytes), frame_hex=%s",
-            len(auth_encrypted), auth_encrypted.hex(),
-        )
+            self._status = "authenticating"
+            self._last_error = "Bezig met authenticeren..."
+            self._notify_callbacks()
 
-        self._status = "authenticating"
-        self._last_error = "Bezig met authenticeren..."
-        self._notify_callbacks()
+            try:
+                await asyncio.wait_for(
+                    self._client.write_gatt_char(BLE_WRITE_UUID, frame, response=False),
+                    timeout=3.0,
+                )
+            except Exception as err:
+                _LOGGER.warning("%s auth write failed: %s", "Encrypted" if encrypt else "Plaintext", err)
+                return False
 
-        try:
-            await asyncio.wait_for(
-                self._client.write_gatt_char(BLE_WRITE_UUID, auth_encrypted, response=False),
-                timeout=3.0,
-            )
-        except Exception as err:
-            _LOGGER.warning("Auth write failed: %s", err)
-            return False
+            await self._wait_for_auth()
+            return self._authenticated
 
-        auth_ok = await self._wait_for_auth()
-        if self._authenticated:
+        # APK analysis suggests a straight notify -> HU sequence, so try plain HU first.
+        if await _run_auth_attempt(encrypt=False):
+            _LOGGER.info("Auth succeeded with plaintext frame")
             return True
-
-        if self._auth_got_frame:
-            _LOGGER.info("Encrypted auth got response but failed validation, trying plaintext")
-        elif self._is_connected:
-            _LOGGER.info("No response to encrypted auth, trying plaintext fallback")
-        else:
-            return False
 
         if not self._is_connected or self._client is None:
             return False
 
-        self._auth_challenge = os.urandom(4)
-        self._auth_got_frame = False
-        self._auth_event.clear()
-        self._authenticated = False
-        challenge_hash = sbox_hash(self._auth_challenge, len(self._auth_challenge))
-        auth_payload = self._auth_challenge + challenge_hash
-        auth_plaintext = build_frame(CMD_AUTH, None, auth_payload, encrypt=False)
+        if self._auth_got_frame:
+            _LOGGER.info("Plaintext auth got response but failed validation, trying encrypted fallback")
+        else:
+            _LOGGER.info("No response to plaintext auth, trying encrypted fallback")
 
-        _LOGGER.info(
-            "Sending plaintext auth frame (%d bytes), challenge=%s, frame_hex=%s",
-            len(auth_plaintext), self._auth_challenge.hex(), auth_plaintext.hex(),
-        )
-        try:
-            await asyncio.wait_for(
-                self._client.write_gatt_char(BLE_WRITE_UUID, auth_plaintext, response=False),
-                timeout=3.0,
-            )
-        except Exception as err:
-            _LOGGER.warning("Plaintext auth write failed: %s", err)
-            return False
-
-        await self._wait_for_auth()
-        if self._authenticated:
-            _LOGGER.info("Auth succeeded with plaintext frame")
+        if await _run_auth_attempt(encrypt=True):
+            _LOGGER.info("Auth succeeded with encrypted frame")
             return True
 
         if self._auth_got_frame and not self._authenticated:
@@ -789,25 +748,85 @@ class MelittaDevice:
             return self._address
 
     async def _establish_ble_connection(self, ble_device):
+        last_error = None
+
+        # The APK path is a plain GATT connect/discover/notify sequence. Try the least opinionated
+        # connection strategy first before falling back to Home Assistant's retry wrapper.
+        strategies: list[tuple[str, str]] = []
         if self._hass is not None and not isinstance(ble_device, str):
-            _LOGGER.info("BLE CONNECT: using establish_connection (HA mode, max_attempts=3)")
-            self._client = await establish_connection(
-                BleakClientWithServiceCache,
-                ble_device,
-                self._name,
-                disconnected_callback=self._on_disconnect,
-                max_attempts=3,
-            )
-            _LOGGER.info("BLE CONNECT: establish_connection succeeded, client=%s", type(self._client).__name__)
+            strategies.append(("direct_ble_device", "direct"))
+            strategies.append(("ha_establish_connection", "ha"))
+            strategies.append(("direct_address", "direct_address"))
         else:
-            _LOGGER.info("BLE CONNECT: using BleakClient direct (timeout=%ds)", CONNECT_TIMEOUT)
-            self._client = BleakClient(
-                ble_device,
-                timeout=CONNECT_TIMEOUT,
-                disconnected_callback=self._on_disconnect,
-            )
-            await self._client.connect()
-            _LOGGER.info("BLE CONNECT: BleakClient.connect() succeeded")
+            strategies.append(("direct", "direct"))
+
+        for strategy_name, strategy_kind in strategies:
+            try:
+                await self._close_client_quietly()
+                if strategy_kind == "ha":
+                    _LOGGER.info("BLE CONNECT: strategy=%s via establish_connection (max_attempts=1)", strategy_name)
+                    self._client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        ble_device,
+                        self._name,
+                        disconnected_callback=self._on_disconnect,
+                        max_attempts=1,
+                    )
+                else:
+                    target = self._address if strategy_kind == "direct_address" else ble_device
+                    _LOGGER.info(
+                        "BLE CONNECT: strategy=%s via BleakClient.connect(timeout=%ss)",
+                        strategy_name,
+                        CONNECT_TIMEOUT,
+                    )
+                    self._client = BleakClient(
+                        target,
+                        timeout=CONNECT_TIMEOUT,
+                        disconnected_callback=self._on_disconnect,
+                    )
+                    await self._client.connect()
+
+                await asyncio.sleep(0.4)
+                services = getattr(self._client, "services", None)
+                try:
+                    service_count = len(list(services)) if services is not None else 0
+                except Exception:
+                    service_count = 0
+                _LOGGER.info(
+                    "BLE CONNECT: strategy=%s succeeded (services=%s, mtu=%s)",
+                    strategy_name,
+                    service_count if service_count else "unknown",
+                    self._client.mtu_size if self._client and hasattr(self._client, "mtu_size") else "unknown",
+                )
+                return
+            except Exception as err:
+                last_error = err
+                _LOGGER.warning(
+                    "BLE CONNECT: strategy=%s failed for %s: %s (%s)",
+                    strategy_name,
+                    self._address,
+                    err,
+                    type(err).__name__,
+                )
+                await self._close_client_quietly()
+                await asyncio.sleep(0.8)
+
+        if last_error is not None:
+            raise last_error
+
+    async def _close_client_quietly(self):
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        try:
+            try:
+                await client.stop_notify(BLE_READ_UUID)
+            except Exception:
+                pass
+            await client.disconnect()
+        except Exception:
+            pass
 
     async def _internal_disconnect(self):
         _LOGGER.info("INTERNAL DISCONNECT: starting (has_client=%s, connected=%s)", self._client is not None, self._is_connected)
