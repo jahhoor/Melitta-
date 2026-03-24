@@ -29,6 +29,11 @@ RECONNECT_MAX_ATTEMPTS = 3
 CONNECT_COOLDOWN_SECONDS = 12.0
 CONNECT_COOLDOWN_BUSY_SECONDS = 20.0
 POST_CONNECT_SETTLE_DELAY = 1.2
+BLUEZ_RECOVERY_THRESHOLD = 2
+BLUEZ_REMOVE_THRESHOLD = 3
+BLUEZ_RECOVERY_PAUSE = 8.0
+PAIR_AFTER_FAILURE_THRESHOLD = 2
+PAIR_RETRY_COOLDOWN_SECONDS = 8.0
 
 
 class MelittaDevice:
@@ -77,6 +82,9 @@ class MelittaDevice:
         self._drip_tray_full: bool = False
         self._brew_progress: int | None = None
         self._error_code: int | None = None
+        self._consecutive_connect_failures = 0
+        self._last_connect_error_kind: str | None = None
+        self._pairing_attempted_since_start = False
 
     @property
     def address(self) -> str:
@@ -273,6 +281,8 @@ class MelittaDevice:
         delay = min(RECONNECT_BASE_DELAY * (2 ** capped), RECONNECT_MAX_DELAY)
         if since_last < 8.0:
             delay = max(delay, 8.0 - since_last)
+        if self._last_connect_error_kind in {"bluez_busy", "service_discovery"} and self._consecutive_connect_failures >= 2:
+            delay = max(delay, 30.0)
 
         self._reconnect_attempts += 1
         _LOGGER.info(
@@ -488,6 +498,8 @@ class MelittaDevice:
             await self._establish_ble_connection(ble_device)
             self._is_connected = True
             self._reconnect_attempts = 0
+            self._consecutive_connect_failures = 0
+            self._last_connect_error_kind = None
             self._last_error = None
             _LOGGER.info(
                 "CONNECT FLOW: BLE connected to %s (MTU=%s)",
@@ -542,11 +554,25 @@ class MelittaDevice:
             return False
 
         except (BleakError, asyncio.TimeoutError, OSError, EOFError) as err:
+            kind = self._classify_connect_error(err)
+            self._consecutive_connect_failures += 1
+            self._last_connect_error_kind = kind
             self._apply_connect_cooldown(err)
-            _LOGGER.error("Connect failed to %s: %s", self._address, err)
-            self._status = "offline"
-            self._last_error = f"Verbinding mislukt: {err}"
-            self._notify_callbacks()
+            pairing_handled = await self._maybe_handle_pairing_requirement(kind)
+            if not pairing_handled:
+                await self._attempt_bluez_recovery(kind)
+            _LOGGER.error(
+                "Connect failed to %s: %s (kind=%s, consecutive_failures=%d, pairing_handled=%s)",
+                self._address,
+                err,
+                kind,
+                self._consecutive_connect_failures,
+                pairing_handled,
+            )
+            if not pairing_handled:
+                self._status = "offline"
+                self._last_error = f"Verbinding mislukt: {err}"
+                self._notify_callbacks()
             return False
 
     async def _handle_pairing(self) -> bool:
@@ -557,7 +583,7 @@ class MelittaDevice:
         _LOGGER.info("PAIRING: is_paired=%s for %s", is_paired, self._address)
         if is_paired:
             _LOGGER.info("PAIRING: existing bond detected, skipping extra Pair()/bond validation")
-            return False
+            return True
 
         _LOGGER.info(
             "PAIRING: device not paired, initiating BLE pairing (machine MUST be in Verbinden mode with blue blinking)"
@@ -577,6 +603,63 @@ class MelittaDevice:
 
         _LOGGER.warning("PAIRING: failed - is the machine in Verbinden mode? (blue blinking display, 60s window)")
         return False
+
+    async def _maybe_handle_pairing_requirement(self, kind: str) -> bool:
+        if kind not in {"service_discovery", "bluez_busy"}:
+            return False
+        if self._consecutive_connect_failures < PAIR_AFTER_FAILURE_THRESHOLD:
+            return False
+
+        from .dbus_utils import dbus_check_paired
+
+        is_paired = await dbus_check_paired(self._address)
+        _LOGGER.info(
+            "PAIRING DECISION: kind=%s consecutive_failures=%d paired=%s attempted_before=%s",
+            kind,
+            self._consecutive_connect_failures,
+            is_paired,
+            self._pairing_attempted_since_start,
+        )
+
+        if is_paired:
+            return False
+
+        if self._pairing_attempted_since_start:
+            self._status = "pairing_required"
+            self._last_error = (
+                "Bluetooth-koppeling ontbreekt. Zet de machine op 'Verbinden' (blauw knipperend), "
+                "sluit de Melitta-app volledig af en probeer opnieuw."
+            )
+            self._notify_callbacks()
+            return True
+
+        self._pairing_attempted_since_start = True
+        self._status = "pairing"
+        self._last_error = (
+            "Bluetooth-koppeling ontbreekt. Probeer nu automatisch te koppelen; "
+            "zorg dat de machine op 'Verbinden' staat."
+        )
+        self._notify_callbacks()
+
+        pair_ok = await self._handle_pairing()
+        if pair_ok:
+            self._consecutive_connect_failures = 0
+            self._last_connect_error_kind = None
+            self._status = "paired"
+            self._last_error = "Bluetooth-koppeling gelukt. Nieuwe verbindingspoging volgt zo."
+            self._connect_cooldown_until = max(
+                self._connect_cooldown_until,
+                time.monotonic() + PAIR_RETRY_COOLDOWN_SECONDS,
+            )
+            self._notify_callbacks()
+        else:
+            self._status = "pairing_required"
+            self._last_error = (
+                "Bluetooth-koppeling nodig. Zet de machine op 'Verbinden' (blauw knipperend), "
+                "verwijder zo nodig oude koppelingen en probeer opnieuw."
+            )
+            self._notify_callbacks()
+        return True
 
     async def _setup_notifications_and_auth(self) -> bool:
         if not self._client or not self._is_connected:
@@ -827,6 +910,40 @@ class MelittaDevice:
             )
             await self._close_client_quietly()
             raise
+
+    async def _attempt_bluez_recovery(self, kind: str) -> None:
+        if kind not in {"bluez_busy", "service_discovery"}:
+            return
+        if self._consecutive_connect_failures < BLUEZ_RECOVERY_THRESHOLD:
+            return
+
+        _LOGGER.warning(
+            "BLUEZ RECOVERY: starting for %s after %d consecutive %s failures",
+            self._address,
+            self._consecutive_connect_failures,
+            kind,
+        )
+        self._status = "clearing_bluez"
+        self._last_error = "Bluetooth-stack herstellen na verbindingsfout..."
+        self._notify_callbacks()
+
+        try:
+            from .dbus_utils import dbus_force_disconnect, dbus_remove_device
+
+            await dbus_force_disconnect(self._address)
+            await asyncio.sleep(2.0)
+
+            if kind == "bluez_busy" and self._consecutive_connect_failures >= BLUEZ_REMOVE_THRESHOLD:
+                removed = await dbus_remove_device(self._address)
+                _LOGGER.warning("BLUEZ RECOVERY: RemoveDevice for %s returned %s", self._address, removed)
+                await asyncio.sleep(3.0)
+
+            until = time.monotonic() + BLUEZ_RECOVERY_PAUSE
+            if until > self._connect_cooldown_until:
+                self._connect_cooldown_until = until
+            _LOGGER.warning("BLUEZ RECOVERY: cooldown extended by %.0fs for %s", BLUEZ_RECOVERY_PAUSE, self._address)
+        except Exception as err:
+            _LOGGER.warning("BLUEZ RECOVERY: failed for %s: %s (%s)", self._address, err, type(err).__name__)
 
     async def _close_client_quietly(self):
         client = self._client

@@ -10,7 +10,7 @@ from .device import MelittaDevice
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["sensor", "binary_sensor", "button", "select"]
-INITIAL_CONNECT_DELAY = 12.0
+INITIAL_CONNECT_DELAY = 15.0
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
