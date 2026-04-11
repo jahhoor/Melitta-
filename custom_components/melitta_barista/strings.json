@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Melitta Barista Smart",
+        "description": "Enter the MAC address of your Melitta coffee machine, or select a discovered device.",
+        "data": {
+          "address": "MAC Address"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Confirm Melitta Barista Smart",
+        "description": "Do you want to set up {name}?"
+      }
+    },
+    "abort": {
+      "already_configured": "Device already configured",
+      "not_supported": "This Bluetooth device is not supported"
+    }
+  }
+}

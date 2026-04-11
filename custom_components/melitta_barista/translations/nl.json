@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Melitta Barista Smart instellen",
+        "description": "Voer het MAC-adres in van uw Melitta koffiemachine, of selecteer een gevonden apparaat.",
+        "data": {
+          "address": "MAC-adres"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Bevestig Melitta Barista Smart",
+        "description": "Wilt u {name} instellen?"
+      }
+    },
+    "abort": {
+      "already_configured": "Apparaat is al geconfigureerd",
+      "not_supported": "Dit Bluetooth-apparaat wordt niet ondersteund"
+    }
+  }
+}
