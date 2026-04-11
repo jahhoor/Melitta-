@@ -1,11 +1,14 @@
 """BLE client for Melitta Barista Smart coffee machine.
 
-Architecture follows the switchbot/led_ble pattern proven by dzerik/melitta-barista-ha:
-- Store and update BLEDevice reference from HA bluetooth advertisements
-- Use BleakClientWithServiceCache + establish_connection() for reliable connections
-- ble_device_callback provides fresh device reference on each retry
-- Force StartNotify to avoid bleak 2.0 AcquireNotify issues
-- 3-phase pairing strategy: pair=False → pair=True → unpair + pair=True
+Connection flow (matching dzerik/melitta-barista-ha proven architecture):
+1. BLE connect via establish_connection(pair=False)
+2. D-Bus: check if already paired
+3. If not paired: D-Bus pair_device() with Agent1
+4. Disconnect → stabilization delay → reconnect
+5. D-Bus: force_encryption (Pair with AlreadyExists expected)
+6. Dual-channel notifications: Bleak start_notify + D-Bus CCCD write
+7. Verify Notifying=True (with retry)
+8. HU handshake (EfCom protocol auth)
 """
 
 from __future__ import annotations
@@ -44,6 +47,11 @@ from .protocol import MachineRecipe, MachineStatus, MelittaProtocol
 _LOGGER = logging.getLogger("melitta_barista")
 
 MELITTA_SERVICE_UUID = "0000ad00-b35c-11e4-9813-0002a5d5c51b"
+
+_STABILIZATION_DELAY = 0.8
+_NOTIFY_RETRY_DELAY = 0.5
+_NOTIFY_MAX_RETRIES = 3
+_RECONNECT_AFTER_PAIR_RETRIES = 2
 
 
 class MelittaBleClient:
@@ -96,6 +104,7 @@ class MelittaBleClient:
         self._disconnecting = False
 
         self._paired = False
+        self._has_bluez = True
 
         self._selected_intensity: int = 2
         self._selected_two_cups: bool = False
@@ -150,7 +159,7 @@ class MelittaBleClient:
         """Update BLEDevice reference from HA bluetooth advertisements."""
         self._ble_device = ble_device
         if not self._connected and self._auto_reconnect:
-            _LOGGER.info(
+            _LOGGER.debug(
                 "BLE advertisement from %s while disconnected, triggering reconnect",
                 self._address,
             )
@@ -213,19 +222,15 @@ class MelittaBleClient:
             try:
                 await client.write_gatt_char(CHAR_WRITE, data, response=False)
             except AssertionError:
-                _LOGGER.error("D-Bus connection lost during write (assert self._bus)")
+                _LOGGER.debug("D-Bus connection lost during write (assert self._bus)")
                 raise BleakError("D-Bus connection lost")
 
     # ------------------------------------------------------------------
-    # BLE connection: 3-phase pairing strategy
+    # BLE connection helpers
     # ------------------------------------------------------------------
 
-    async def _establish_connection(self, *, pair: bool = False) -> BleakClient:
-        """Establish BLE connection using bleak_retry_connector when available.
-
-        Falls back to raw BleakClient if bleak_retry_connector is not installed
-        or if establish_connection raises a BLE/OS error.
-        """
+    async def _establish_connection(self) -> BleakClient:
+        """Establish BLE connection using bleak_retry_connector when available."""
         if self._ble_device is not None:
             try:
                 from bleak_retry_connector import (
@@ -234,8 +239,7 @@ class MelittaBleClient:
                 )
 
                 _LOGGER.debug(
-                    "Using establish_connection for %s (pair=%s)",
-                    self._address, pair,
+                    "Using establish_connection for %s", self._address,
                 )
                 client = await establish_connection(
                     BleakClientWithServiceCache,
@@ -245,11 +249,10 @@ class MelittaBleClient:
                     use_services_cache=True,
                     ble_device_callback=lambda: self._ble_device,
                     max_attempts=3,
-                    pair=pair,
                 )
                 return client
             except ImportError:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "bleak_retry_connector not available, using raw BleakClient"
                 )
             except (BleakError, OSError, asyncio.TimeoutError):
@@ -258,7 +261,7 @@ class MelittaBleClient:
                     exc_info=True,
                 )
 
-        _LOGGER.debug("Using raw BleakClient for %s (pair=%s)", self._address, pair)
+        _LOGGER.debug("Using raw BleakClient for %s", self._address)
         client = BleakClient(
             self._ble_device or self._address,
             disconnected_callback=self._on_disconnect,
@@ -268,11 +271,10 @@ class MelittaBleClient:
         return client
 
     async def _start_notify(self, client: BleakClient) -> None:
-        """Subscribe to BLE notifications.
+        """Subscribe to BLE notifications via Bleak.
 
-        Handles two known issues:
-        1. "Notify acquired" (stale BlueZ D-Bus state) — treat as success
-        2. bleak 2.0 AcquireNotify regression — force StartNotify via bluez param
+        Handles "Notify acquired" (stale BlueZ D-Bus state) as success.
+        Uses BlueZStartNotifyArgs when available (bleak 2.0+).
         """
         try:
             try:
@@ -290,13 +292,49 @@ class MelittaBleClient:
 
         except BleakDBusError as err:
             if "Notify acquired" in str(err):
-                _LOGGER.info(
-                    "BlueZ reports notifications already acquired for %s — "
-                    "treating as success",
+                _LOGGER.debug(
+                    "BlueZ notifications already acquired for %s — treating as success",
                     CHAR_NOTIFY,
                 )
             else:
                 raise
+
+    async def _setup_notifications(self, client: BleakClient) -> bool:
+        """Set up dual-channel notifications: Bleak + D-Bus CCCD write.
+
+        Returns True if notifications are confirmed active.
+        """
+        try:
+            await self._start_notify(client)
+        except (BleakError, OSError, asyncio.TimeoutError) as err:
+            _LOGGER.debug("Bleak start_notify failed: %s", err)
+            return False
+
+        if not self._has_bluez:
+            return True
+
+        from . import dbus_utils
+
+        char_uuid = str(CHAR_NOTIFY)
+        await dbus_utils.write_cccd(self._address, char_uuid, enable=True)
+
+        for attempt in range(_NOTIFY_MAX_RETRIES):
+            notifying = await dbus_utils.check_notifying(self._address, char_uuid)
+            if notifying:
+                _LOGGER.debug("Notifications confirmed active (attempt %d)", attempt + 1)
+                return True
+            _LOGGER.debug(
+                "Notifying=False (attempt %d/%d), retrying...",
+                attempt + 1, _NOTIFY_MAX_RETRIES,
+            )
+            await asyncio.sleep(_NOTIFY_RETRY_DELAY)
+            await dbus_utils.write_cccd(self._address, char_uuid, enable=True)
+
+        _LOGGER.warning(
+            "Could not confirm Notifying=True for %s after %d attempts",
+            self._address, _NOTIFY_MAX_RETRIES,
+        )
+        return False
 
     async def _safe_disconnect(self) -> None:
         """Disconnect current client, suppressing errors."""
@@ -309,29 +347,40 @@ class MelittaBleClient:
                 pass
 
     async def _try_unpair(self) -> None:
-        """Clear stale bond by connecting without pair and calling unpair.
-
-        Needed when pair=True fails because the proxy holds a stale bond
-        that the machine rejects.
-        """
-        try:
-            _LOGGER.info("Clearing stale bond for %s", self._address)
-            client = await self._establish_connection(pair=False)
+        """Clear stale bond via D-Bus RemoveDevice or Bleak unpair."""
+        if self._has_bluez:
+            from . import dbus_utils
+            await dbus_utils.unpair_device(self._address)
+        else:
             try:
-                await client.unpair()
-                _LOGGER.info("Unpaired %s successfully", self._address)
-            except (BleakError, OSError, NotImplementedError, AttributeError):
-                _LOGGER.debug("unpair() failed or not supported", exc_info=True)
-            finally:
+                _LOGGER.debug("Clearing stale bond for %s via Bleak unpair", self._address)
+                client = await self._establish_connection()
                 try:
-                    await client.disconnect()
-                except (BleakError, OSError):
-                    pass
-        except (BleakError, OSError, asyncio.TimeoutError):
-            _LOGGER.debug("Could not connect for unpair", exc_info=True)
+                    await client.unpair()
+                except (BleakError, OSError, NotImplementedError, AttributeError):
+                    _LOGGER.debug("unpair() failed or not supported", exc_info=True)
+                finally:
+                    try:
+                        await client.disconnect()
+                    except (BleakError, OSError):
+                        pass
+            except (BleakError, OSError, asyncio.TimeoutError):
+                _LOGGER.debug("Could not connect for unpair", exc_info=True)
 
-    async def _try_connect_and_handshake(self, *, pair: bool) -> bool:
-        """Try to establish BLE connection and perform HU handshake.
+    # ------------------------------------------------------------------
+    # Main connection flow
+    # ------------------------------------------------------------------
+
+    async def _try_connect_and_handshake(self) -> bool:
+        """Full connection flow with D-Bus pairing integration.
+
+        Flow:
+        1. BLE connect (establish_connection, no pair flag)
+        2. D-Bus: check paired → pair if needed → disconnect/reconnect
+        3. D-Bus: force encryption
+        4. Dual-channel notifications (Bleak + D-Bus CCCD)
+        5. Verify Notifying=True
+        6. HU handshake
 
         Returns True on success, False on failure (cleans up client).
         """
@@ -339,28 +388,94 @@ class MelittaBleClient:
         self._protocol.set_status_callback(self._on_status)
 
         try:
-            self._client = await self._establish_connection(pair=pair)
+            self._client = await self._establish_connection()
         except (BleakError, OSError, asyncio.TimeoutError):
-            _LOGGER.debug("BLE connect failed (pair=%s)", pair, exc_info=True)
+            _LOGGER.debug("BLE connect failed", exc_info=True)
             self._client = None
             return False
 
-        if not self._client.is_connected:
-            _LOGGER.debug("BLE client not connected after establish (pair=%s)", pair)
+        if not self._client or not self._client.is_connected:
+            _LOGGER.debug("BLE client not connected after establish")
             self._client = None
             return False
 
-        _LOGGER.debug("BLE connected to %s (pair=%s)", self._address, pair)
+        _LOGGER.debug("BLE connected to %s", self._address)
 
-        try:
-            await self._start_notify(self._client)
-        except (BleakError, OSError, asyncio.TimeoutError):
-            _LOGGER.debug("start_notify failed (pair=%s)", pair, exc_info=True)
+        if self._has_bluez:
+            from . import dbus_utils
+
+            paired = await dbus_utils.check_paired(self._address)
+
+            if paired is None or paired is False:
+                _LOGGER.info("Device %s not paired, initiating D-Bus pairing", self._address)
+                pair_result = await dbus_utils.pair_device(self._address)
+                if pair_result not in ("ok",):
+                    _LOGGER.info(
+                        "D-Bus pairing returned %s for %s", pair_result, self._address
+                    )
+                    if pair_result in ("pairing_failed", "pairing_timeout", "not_found"):
+                        await self._safe_disconnect()
+                        return False
+
+                _LOGGER.debug("Disconnecting after fresh pair for reconnect cycle")
+                self._disconnecting = True
+                await self._safe_disconnect()
+                self._disconnecting = False
+
+                await asyncio.sleep(_STABILIZATION_DELAY)
+
+                for reconnect_attempt in range(_RECONNECT_AFTER_PAIR_RETRIES):
+                    try:
+                        self._client = await self._establish_connection()
+                        if self._client and self._client.is_connected:
+                            _LOGGER.debug(
+                                "Reconnected after pair (attempt %d)",
+                                reconnect_attempt + 1,
+                            )
+                            break
+                    except (BleakError, OSError, asyncio.TimeoutError):
+                        _LOGGER.debug(
+                            "Reconnect after pair attempt %d failed",
+                            reconnect_attempt + 1,
+                            exc_info=True,
+                        )
+                        self._client = None
+                    await asyncio.sleep(_STABILIZATION_DELAY)
+                else:
+                    _LOGGER.debug("All reconnect attempts after pair failed")
+                    return False
+
+                if not self._client or not self._client.is_connected:
+                    _LOGGER.debug("Not connected after pair reconnect cycle")
+                    return False
+
+                self._paired = True
+
+            await asyncio.sleep(_STABILIZATION_DELAY)
+
+            enc_ok = await dbus_utils.force_encryption(self._address)
+            if not enc_ok:
+                _LOGGER.debug("force_encryption failed (non-fatal, continuing)")
+
+            if not self._client or not self._client.is_connected:
+                _LOGGER.debug("Connection lost after force_encryption")
+                await self._safe_disconnect()
+                return False
+
+            await asyncio.sleep(0.5)
+
+        if not await self._setup_notifications(self._client):
+            _LOGGER.debug("Notification setup failed")
+            await self._safe_disconnect()
+            return False
+
+        if not self._client or not self._client.is_connected:
+            _LOGGER.debug("Connection lost after notification setup")
             await self._safe_disconnect()
             return False
 
         if not await self._protocol.perform_handshake(self._write_ble):
-            _LOGGER.debug("HU handshake failed (pair=%s)", pair)
+            _LOGGER.debug("HU handshake failed")
             await self._safe_disconnect()
             return False
 
@@ -369,10 +484,9 @@ class MelittaBleClient:
     async def connect(self) -> bool:
         """Connect to the coffee machine.
 
-        3-phase pairing strategy (matching dzerik/melitta-barista-ha):
-        1. pair=False — reuse existing bond (fast reconnect)
-        2. pair=True  — create new bond (first-ever or bond lost)
-        3. unpair + pair=True — clear stale bond then fresh pair
+        Strategy:
+        1. Try normal connect with D-Bus pairing integration
+        2. If fail: unpair stale bond, retry
         """
         async with self._connect_lock:
             return await self._connect_impl()
@@ -388,22 +502,26 @@ class MelittaBleClient:
                 self._reconnect_task = None
 
         try:
+            if self._has_bluez:
+                from . import dbus_utils
+                self._has_bluez = await dbus_utils.has_bluez_adapter()
+                if not self._has_bluez:
+                    _LOGGER.info(
+                        "No BlueZ adapter found (ESPHome proxy?), skipping D-Bus operations"
+                    )
+
             _LOGGER.info("Connecting to Melitta at %s", self._address)
 
-            if await self._try_connect_and_handshake(pair=False):
+            if await self._try_connect_and_handshake():
                 self._paired = True
             else:
-                _LOGGER.info(
-                    "Retrying connection to %s with pairing", self._address,
-                )
-                if not await self._try_connect_and_handshake(pair=True):
-                    await self._try_unpair()
-                    _LOGGER.info(
-                        "Retrying connection to %s after unpair", self._address,
-                    )
-                    if not await self._try_connect_and_handshake(pair=True):
-                        _LOGGER.error("Connection failed for %s", self._address)
-                        return False
+                _LOGGER.info("First attempt failed, clearing bond and retrying for %s", self._address)
+                await self._try_unpair()
+                await asyncio.sleep(_STABILIZATION_DELAY)
+
+                if not await self._try_connect_and_handshake():
+                    _LOGGER.info("Connection failed for %s after unpair+retry", self._address)
+                    return False
                 self._paired = True
 
             self._connected = True
@@ -419,7 +537,7 @@ class MelittaBleClient:
                 try:
                     self._machine_type = MachineType(type_id)
                 except ValueError:
-                    _LOGGER.warning("Unknown machine type ID: %d", type_id)
+                    _LOGGER.debug("Unknown machine type ID: %d", type_id)
             _LOGGER.debug("Machine type: %s", self._machine_type)
 
             for cb in self._connection_callbacks:
@@ -539,14 +657,10 @@ class MelittaBleClient:
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
-        """Try to reconnect with exponential backoff.
-
-        The loop can be woken up early by setting _reconnect_event (e.g. when
-        a BLE advertisement arrives, indicating the machine is back online).
-        """
+        """Try to reconnect with exponential backoff."""
         delay = self._reconnect_delay
         while self._auto_reconnect and not self.connected:
-            _LOGGER.info("Reconnecting to %s in %.0fs...", self._address, delay)
+            _LOGGER.debug("Reconnecting to %s in %.0fs...", self._address, delay)
             self._reconnect_event.clear()
             try:
                 await asyncio.wait_for(self._reconnect_event.wait(), timeout=delay)
@@ -616,7 +730,7 @@ class MelittaBleClient:
                     await asyncio.sleep(0.3)
 
                 if not recipe:
-                    _LOGGER.error("Failed to read recipe %d", recipe_id)
+                    _LOGGER.warning("Failed to read recipe %d", recipe_id)
                     return False
 
                 from dataclasses import replace
@@ -631,7 +745,7 @@ class MelittaBleClient:
                     comp2,
                     recipe_key=get_recipe_key(recipe.recipe_type),
                 ):
-                    _LOGGER.error("Failed to write recipe to temp slot")
+                    _LOGGER.warning("Failed to write recipe to temp slot")
                     return False
 
                 await asyncio.sleep(0.2)
@@ -640,7 +754,7 @@ class MelittaBleClient:
                 if not await self._protocol.write_alphanumeric(
                     self._write_ble, FREESTYLE_NAME_ID, name,
                 ):
-                    _LOGGER.error("Failed to write recipe name")
+                    _LOGGER.warning("Failed to write recipe name")
                     return False
 
                 await asyncio.sleep(0.2)
@@ -656,7 +770,7 @@ class MelittaBleClient:
                         name, use_intensity, use_two_cups,
                     )
                 else:
-                    _LOGGER.error("start_process returned False for %s", name)
+                    _LOGGER.warning("start_process returned False for %s", name)
                 return result
 
             finally:
