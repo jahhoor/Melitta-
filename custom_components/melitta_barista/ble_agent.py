@@ -17,38 +17,54 @@ _LOGGER = logging.getLogger("melitta_barista")
 async def async_pair_device(address: str, timeout: float = 30.0) -> str:
     """Pair a BLE device via D-Bus BlueZ API with a registered Agent1.
 
+    When no local BlueZ adapter is available (e.g. using ESPHome BLE proxy),
+    pairing is skipped — the proxy handles BLE bonding at the ESP32 level.
+
     Returns: "ok", "pairing_failed", "pairing_timeout", or "cannot_connect".
     """
-    has_adapter = await dbus_utils.has_bluez_adapter()
-    if not has_adapter:
-        _LOGGER.info(
-            "No functional BlueZ adapter found. "
-            "Assuming ESPHome BLE proxy — skipping D-Bus pairing for %s",
-            address,
-        )
-        return "ok"
+    bus = None
+    discovery_started = False
+    adapter = None
 
-    paired = await dbus_utils.check_paired(address)
-    if paired is True:
-        _LOGGER.info("Device %s is already paired", address)
-        return "ok"
+    try:
+        bus = await dbus_utils.connect_bus()
 
-    if paired is None:
-        device_found = await dbus_utils.wait_for_device(address, timeout=15.0)
-        if not device_found:
+        adapter = await dbus_utils.get_adapter(bus)
+        if adapter is None:
             _LOGGER.info(
-                "Device %s not found after discovery. "
-                "Make sure it is powered on and in range.",
+                "No functional BlueZ adapter (hci0) found. "
+                "Assuming ESPHome BLE proxy — skipping D-Bus pairing for %s",
                 address,
             )
-            return "cannot_connect"
+            return "ok"
 
-    _LOGGER.info("Initiating D-Bus pairing with %s", address)
-    result = await dbus_utils.pair_device(address, timeout=timeout)
+        await dbus_utils.register_agent(bus)
 
-    if result == "ok":
-        return "ok"
-    elif result == "pairing_timeout":
-        return "pairing_timeout"
-    else:
+        paired = await dbus_utils.check_paired(bus, address)
+        if paired is True:
+            return "ok"
+
+        if paired is None:
+            _LOGGER.debug("Device %s not known to BlueZ, starting discovery", address)
+            discovery_started = await dbus_utils.start_discovery(adapter)
+
+            if not await dbus_utils.wait_for_device(bus, address, timeout=15.0):
+                _LOGGER.error(
+                    "Device %s not found after discovery. "
+                    "Make sure it is powered on and in range.",
+                    address,
+                )
+                return "cannot_connect"
+
+        _LOGGER.info("Initiating D-Bus pairing with %s", address)
+        return await dbus_utils.pair_and_trust(bus, address, timeout=timeout)
+
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("D-Bus pairing error for %s", address)
         return "pairing_failed"
+    finally:
+        if bus:
+            if discovery_started and adapter:
+                await dbus_utils.stop_discovery(adapter)
+            await dbus_utils.unregister_agent(bus)
+            dbus_utils.disconnect_bus(bus)
